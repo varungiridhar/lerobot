@@ -30,6 +30,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act_awm.configuration_act_awm import ACTAWMConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -66,7 +67,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     at once, improving startup time and reducing dependencies.
 
     Args:
-        name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
+        name: The name of the policy. Supported names are "tdmpc", "diffusion", "act", "act_awm",
               "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
 
     Returns:
@@ -87,6 +88,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "act_awm":
+        from lerobot.policies.act_awm.modeling_act_awm import ACTAWMPolicy
+
+        return ACTAWMPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -147,7 +152,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
 
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
-                     "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "smolvla",
+                     "diffusion", "act", "act_awm", "vqbet", "pi0", "pi05", "sac", "smolvla",
                      "reward_classifier", "wall_x".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
@@ -163,6 +168,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "act_awm":
+        return ACTAWMConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
@@ -305,6 +312,14 @@ def make_pre_post_processors(
         from lerobot.policies.act.processor_act import make_act_pre_post_processors
 
         processors = make_act_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACTAWMConfig):
+        from lerobot.policies.act_awm.processor_act_awm import make_act_awm_pre_post_processors
+
+        processors = make_act_awm_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
