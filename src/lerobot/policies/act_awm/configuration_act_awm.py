@@ -124,6 +124,7 @@ class ACTAWMConfig(PreTrainedConfig):
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
     n_decoder_layers: int = 1
+    n_awm_decoder_layers: int = 1
     # VAE.
     use_vae: bool = True
     latent_dim: int = 32
@@ -132,11 +133,17 @@ class ACTAWMConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    gradient_based_planning: bool = False
+    expert_trajectory_path: str | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
-    future_state_weight: float = 0.2
+    future_state_weight: float = 1.0 # assuming we are doing pi and awm training seperately
+    
+    # Training control flags
+    train_policy: bool = True  # Train policy components (encoder, decoder, VAE)
+    train_awm: bool = False    # Train AWM components (action encoder, AWM decoder)
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -178,8 +185,9 @@ class ACTAWMConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
-        if not self.siglip2_model_path:
-            raise ValueError("siglip2_model_path must be provided for ACT_AWM policy.")
+        # Note: siglip2_model_path no longer required since AWM uses encoder outputs directly
+        # if not self.siglip2_model_path:
+        #     raise ValueError("siglip2_model_path must be provided for ACT_AWM policy.")
 
     @property
     def observation_delta_indices(self) -> list:

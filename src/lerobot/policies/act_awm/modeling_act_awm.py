@@ -66,6 +66,20 @@ class ACTAWMPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        self.expert_trajectories = None
+        if config.expert_trajectory_path:
+            import pickle
+            with open(config.expert_trajectory_path, "rb") as f:
+                traj_data = pickle.load(f)
+            self.expert_trajectories = {
+                seed: (traj, done_idx) 
+                for seed, traj, done_idx in zip(
+                    traj_data["seeds"], 
+                    traj_data["trajectories"], 
+                    traj_data["done_indices"]
+                )
+            }
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -114,6 +128,20 @@ class ACTAWMPolicy(PreTrainedPolicy):
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
+            if self.expert_trajectories is not None and "seed" in batch:
+                seeds = batch["seed"].cpu().tolist()
+                policy_device = next(self.parameters()).device
+                goal_observations = []
+                for seed in seeds:
+                    if seed not in self.expert_trajectories:
+                        raise ValueError(f"Seed {seed} not found in expert trajectories")
+                    trajectory, done_idx = self.expert_trajectories[seed]
+                    goal_obs = {k: v[done_idx].to(policy_device) for k, v in trajectory.items()}
+                    goal_observations.append(goal_obs)
+                self._goal_observations = goal_observations
+            else:
+                self._goal_observations = None
+            
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
@@ -131,6 +159,14 @@ class ACTAWMPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
+        
+        if self.config.gradient_based_planning and self._goal_observations is not None:
+            # TODO: Implement gradient-based planning here
+            # self._goal_observations contains goal observations for each env in the batch
+            # Each goal_obs is a dict with keys like 'observation.image', 'observation.state'
+            # Optimize actions to minimize delta between predicted future state and goal state
+            pass
+        
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -141,35 +177,45 @@ class ACTAWMPolicy(PreTrainedPolicy):
 
         actions_hat, future_state_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-
-        loss_dict = {"l1_loss": l1_loss.item()}
+        loss_dict = {}
+        total_loss = 0.0
         
-        if self.config.use_vae:
-            # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
-            # each dimension independently, we sum over the latent dimension to get the total
-            # KL-divergence per batch element, then take the mean over the batch.
-            # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
-            mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
-            )
-            loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
-        else:
-            loss = l1_loss
-
-        # Future state prediction loss.
-        future_images = batch[OBS_IMAGES][0][:, 1]
-        pool_size = self.config.siglip2_pool_size if self.config.siglip2_pool_size > 1 else None
-        future_state_target = self.model.get_siglip2_embeddings(future_images, pool_size=pool_size).detach()
+        # ============================================
+        # POLICY LOSS (Phase 1 or Joint Training)
+        # ============================================
+        if self.config.train_policy:
+            l1_loss = (
+                F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+            ).mean()
+            loss_dict["l1_loss"] = l1_loss.item()
+            total_loss = total_loss + l1_loss
+            
+            if self.config.use_vae:
+                # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
+                # each dimension independently, we sum over the latent dimension to get the total
+                # KL-divergence per batch element, then take the mean over the batch.
+                # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
+                mean_kld = (
+                    (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+                )
+                loss_dict["kld_loss"] = mean_kld.item()
+                total_loss = total_loss + mean_kld * self.config.kl_weight
         
-        future_state_loss = F.mse_loss(future_state_hat, future_state_target)
-        loss_dict["future_state_loss"] = future_state_loss.item()
-        loss = loss + future_state_loss * self.config.future_state_weight
+        # ============================================
+        # AWM LOSS (Phase 2 or Joint Training)
+        # ============================================
+        if self.config.train_awm and future_state_hat is not None:
+            # Get target: encoder output for final observation (t+H)
+            # observation_delta_indices = [0, chunk_size] gives us observations at t and t+H
+            future_state_target = self.model._get_future_state_target(batch, batch_size=actions_hat.shape[0])
+            
+            # future_state_hat: (encoder_seq_len, B, D)
+            # future_state_target: (encoder_seq_len, B, D)
+            awm_loss = F.mse_loss(future_state_hat, future_state_target)
+            loss_dict["awm_loss"] = awm_loss.item()
+            total_loss = total_loss + awm_loss * self.config.future_state_weight
 
-        return loss, loss_dict
+        return total_loss, loss_dict
 
 
 class ACTTemporalEnsembler:
@@ -341,15 +387,9 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
-        # Frozen SigLIP2 encoder for future state prediction.
-        self.siglip2_model = AutoModel.from_pretrained(
-            self.config.siglip2_model_path
-        ).eval()
-        self.siglip2_processor = AutoProcessor.from_pretrained(
-            self.config.siglip2_model_path
-        )
-        for param in self.siglip2_model.parameters():
-            param.requires_grad = False
+        # Note: SigLIP2 is no longer used for AWM.
+        # self.siglip2_model = AutoModel.from_pretrained(self.config.siglip2_model_path).eval()
+        # self.siglip2_processor = AutoProcessor.from_pretrained(self.config.siglip2_model_path)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -380,22 +420,162 @@ class ACT(nn.Module):
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
-        # Transformer decoder embeddings.
-        # Action tokens use positional embeddings, future tokens use learned queries (FLARE-style)
-        self.decoder_action_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
-        self.decoder_future_embed = nn.Embedding(config.num_future_tokens, config.dim_model)
+        self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+
+        self.action_encoder = nn.Sequential(
+            nn.Linear(self.config.action_feature.shape[0], config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.dim_model)
+        )
+
+        from copy import copy
+        awm_config = copy(config)
+        awm_config.n_decoder_layers = config.n_awm_decoder_layers
+        self.awm_decoder = ACTDecoder(awm_config)
+        
+        self.future_queries_base = nn.Parameter(torch.randn(1, 1, config.dim_model)) # TODO: is this the right way to do stuff
+        
+        self.awm_action_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)        
+        max_encoder_len = 2000
+        self.awm_query_pos_embed = nn.Embedding(max_encoder_len, config.dim_model) # TODO: is this the right way to do stuff
 
         # Output heads.
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
-        self.future_state_head = nn.Linear(config.dim_model, config.siglip2_embedding_dim)
 
         self._reset_parameters()
+        self._freeze_parameters()  # Freeze components based on training flags
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
-        for p in chain(self.encoder.parameters(), self.decoder.parameters()):
+        for p in chain(self.encoder.parameters(), self.decoder.parameters(), self.awm_decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+    
+    def _freeze_parameters(self):
+        """Freeze parameters based on training flags."""
+        if not self.config.train_policy:
+            # Freeze all policy components
+            components_to_freeze = [
+                self.encoder,
+                self.decoder,
+                self.action_head,
+            ]
+            if self.config.use_vae:
+                components_to_freeze.extend([
+                    self.vae_encoder,
+                    self.vae_encoder_cls_embed,
+                    self.vae_encoder_robot_state_input_proj,
+                    self.vae_encoder_action_input_proj,
+                    self.vae_encoder_latent_output_proj,
+                ])
+            if self.config.image_features:
+                components_to_freeze.append(self.backbone)
+            if self.config.robot_state_feature:
+                components_to_freeze.append(self.encoder_robot_state_input_proj)
+            if self.config.env_state_feature:
+                components_to_freeze.append(self.encoder_env_state_input_proj)
+            
+            components_to_freeze.extend([
+                self.encoder_latent_input_proj,
+                self.encoder_1d_feature_pos_embed,
+            ])
+            if self.config.image_features:
+                components_to_freeze.extend([
+                    self.encoder_img_feat_input_proj,
+                    self.encoder_cam_feat_pos_embed,
+                ])
+            components_to_freeze.append(self.decoder_pos_embed)
+            
+            for component in components_to_freeze:
+                for param in component.parameters():
+                    param.requires_grad = False
+            
+            print("[INFO] Frozen policy components for AWM training")
+        
+        if not self.config.train_awm:
+            # Freeze all AWM components
+            awm_components = [
+                self.action_encoder,
+                self.awm_decoder,
+                self.awm_action_pos_embed,
+                self.awm_query_pos_embed,
+            ]
+            
+            for component in awm_components:
+                for param in component.parameters():
+                    param.requires_grad = False
+            
+            # Also freeze the future_queries_base parameter
+            self.future_queries_base.requires_grad = False
+            
+            print("[INFO] Frozen AWM components for policy training")
+
+    def _get_future_state_target(self, batch: dict[str, Tensor], batch_size: int) -> Tensor:
+        """Extract encoder output for final observation (t+H) with zero latent.
+        
+        This creates the supervision target for AWM training.
+        
+        Args:
+            batch: Training batch containing observations
+            batch_size: Batch size
+            
+        Returns:
+            Tensor of shape (encoder_seq_len, B, D) representing the encoded future state
+        """
+        with torch.no_grad():
+            # Extract final observations (t+H)
+            final_obs_images = None
+            if OBS_IMAGES in batch:
+                final_obs_images = [img[:, 1] for img in batch[OBS_IMAGES]]
+            
+            final_obs_state = None
+            if OBS_STATE in batch:
+                final_obs_state = batch[OBS_STATE][:, 1]
+            
+            final_obs_env_state = None
+            if OBS_ENV_STATE in batch:
+                final_obs_env_state = batch[OBS_ENV_STATE][:, 1]
+            
+            # Zero latent (no VAE at test time)
+            device = final_obs_images[0].device if final_obs_images else (
+                final_obs_state.device if final_obs_state is not None else batch[OBS_ENV_STATE].device
+            )
+            latent_zero = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(device)
+            
+            # Prepare encoder input for final observation
+            final_encoder_in_tokens = [self.encoder_latent_input_proj(latent_zero)]
+            final_encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            
+            # Robot state token
+            if self.config.robot_state_feature:
+                final_encoder_in_tokens.append(self.encoder_robot_state_input_proj(final_obs_state))
+            
+            # Environment state token
+            if self.config.env_state_feature:
+                final_encoder_in_tokens.append(self.encoder_env_state_input_proj(final_obs_env_state))
+            
+            # Image tokens
+            if self.config.image_features:
+                for img in final_obs_images:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    
+                    # Rearrange features to (sequence, batch, dim)
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    
+                    final_encoder_in_tokens.extend(list(cam_features))
+                    final_encoder_in_pos_embed.extend(list(cam_pos_embed))
+            
+            # Stack all tokens
+            final_encoder_in_tokens = torch.stack(final_encoder_in_tokens, axis=0)
+            final_encoder_in_pos_embed = torch.stack(final_encoder_in_pos_embed, axis=0)
+            
+            # Encode future observation
+            final_encoder_out = self.encoder(final_encoder_in_tokens, pos_embed=final_encoder_in_pos_embed)
+            
+        return final_encoder_out  # (encoder_seq_len, B, D)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
@@ -443,7 +623,8 @@ class ACT(nn.Module):
         batch_size = current_obs_images[0].shape[0] if current_obs_images else batch[OBS_ENV_STATE].shape[0]
 
         # Prepare the latent for input to the transformer encoder.
-        if self.config.use_vae and ACTION in batch and self.training:
+        # Only run VAE encoder during policy training (Phase 1)
+        if self.config.use_vae and ACTION in batch and self.training and self.config.train_policy:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
             cls_embed = einops.repeat(
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
@@ -529,38 +710,80 @@ class ACT(nn.Module):
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
 
-        # Forward pass through the transformer modules.
+        # ============================================
+        # STAGE 1: TRANSFORMER ENCODER (Always needed)
+        # ============================================
+        # Encoder is always needed (for policy actions in Phase 1, and AWM targets in Phase 2)
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
-        # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
-        decoder_in = torch.zeros(
-            (self.config.chunk_size + self.config.num_future_tokens, batch_size, self.config.dim_model),
-            dtype=encoder_in_pos_embed.dtype,
-            device=encoder_in_pos_embed.device,
-        )
         
-        # Combine action positional embeddings and future learned embeddings.
-        action_pos = self.decoder_action_pos_embed.weight.unsqueeze(1).expand(-1, batch_size, -1)
-        future_embed = self.decoder_future_embed.weight.unsqueeze(1).expand(-1, batch_size, -1)
-        decoder_pos_embed = torch.cat([action_pos, future_embed], dim=0)
+        # ============================================
+        # STAGE 2: POLICY DECODER (Actions Only)
+        # ============================================
+        # Only run policy decoder during policy training or inference (Phase 1)
+        if self.config.train_policy or not self.training:
+            # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+            decoder_in = torch.zeros(
+                (self.config.chunk_size, batch_size, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            decoder_out = self.decoder(
+                decoder_in,
+                encoder_out,
+                encoder_pos_embed=encoder_in_pos_embed,
+                decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            )
+            decoder_out = decoder_out.transpose(0, 1)
+            actions = self.action_head(decoder_out)
+        else:
+            # During AWM-only training, return dummy actions (not used for loss)
+            actions = torch.zeros(
+                (batch_size, self.config.chunk_size, self.config.action_feature.shape[0]),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+
+        # ============================================
+        # STAGE 3: AWM DECODER (Future State Prediction)
+        # ============================================
+        # AWM predicts the full encoder output sequence for t+H observation
+        # Uses cross-attention decoder: [actions + future_queries] attend to encoder_out
         
-        decoder_out = self.decoder(
-            decoder_in,
-            encoder_out,
-            encoder_pos_embed=encoder_in_pos_embed,
-            decoder_pos_embed=decoder_pos_embed,
-        )
-
-        decoder_out = decoder_out.transpose(0, 1)
-
-        # Extract actions and future state predictions.
-        actions = self.action_head(decoder_out[:, :self.config.chunk_size, :])
-        future_tokens = decoder_out[:, self.config.chunk_size:, :]
-        future_state_pred = self.future_state_head(future_tokens)
+        future_state_pred = None
+        if self.config.train_awm:
+            # Encode actions for AWM
+            if self.training and ACTION in batch:
+                actions_for_awm = batch[ACTION]
+            else:
+                actions_for_awm = actions
+            
+            action_embeddings = self.action_encoder(actions_for_awm)  # (B, chunk_size, D)
+            
+            encoder_seq_len = encoder_out.shape[0]
+            
+            future_queries = self.future_queries_base.expand(encoder_seq_len, batch_size, self.config.dim_model) # (encoder_seq_len, B, D): dynamic queries to match encoder sequence length
+            
+            action_embeddings_seq = action_embeddings.transpose(0, 1) # (chunk_size, B, D)
+            
+            awm_decoder_in = torch.cat([action_embeddings_seq, future_queries], dim=0) # (chunk_size + encoder_seq_len, B, D)
+            
+            action_pos = self.awm_action_pos_embed.weight[:self.config.chunk_size].unsqueeze(1)  # (chunk_size, 1, D)
+            query_pos = self.awm_query_pos_embed.weight[:encoder_seq_len].unsqueeze(1)  # (encoder_seq_len, 1, D)
+            awm_pos = torch.cat([action_pos, query_pos], dim=0)  # (chunk_size + encoder_seq_len, 1, D)
+            
+            awm_decoder_out = self.awm_decoder(
+                awm_decoder_in,
+                encoder_out.detach(),
+                decoder_pos_embed=awm_pos,
+                encoder_pos_embed=encoder_in_pos_embed.detach(),
+            ) # (chunk_size + encoder_seq_len, B, D)
+            
+            future_state_pred = awm_decoder_out[self.config.chunk_size:] # (encoder_seq_len, B, D)
 
         return actions, future_state_pred, (mu, log_sigma_x2)
 
     @torch.no_grad()
-    def get_siglip2_embeddings(self, images, pool_size=None):
+    def get_siglip2_embeddings(self, images, pool_size=None, use_cls_token=False):
         """Extract raw patch tokens from SigLIP-2 (FLARE-style, excluding [CLS] token)."""
         # Denormalize from ImageNet stats.
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(images.device)
@@ -570,18 +793,25 @@ class ACT(nn.Module):
         image_list = [denormalized_images[i] for i in range(denormalized_images.shape[0])]
         inputs = self.siglip2_processor(images=image_list, return_tensors="pt", do_rescale=False).to(images.device)
         vision_outputs = self.siglip2_model.vision_model(**inputs)
-        patch_tokens = vision_outputs.last_hidden_state
-
-        # Optional spatial pooling to reduce token count.
-        if pool_size is not None and pool_size > 1:
-            B, N, D = patch_tokens.shape
-            H = W = int(N ** 0.5)
-            tokens_spatial = patch_tokens.reshape(B, H, W, D).permute(0, 3, 1, 2)
-            pooled = torch.nn.functional.avg_pool2d(tokens_spatial, kernel_size=pool_size)
-            _, _, H_new, W_new = pooled.shape
-            patch_tokens = pooled.permute(0, 2, 3, 1).reshape(B, H_new * W_new, D)
         
-        return patch_tokens
+        if use_cls_token:
+            # Return pooled representation (single vector per image)
+            # Shape: (B, D) where D is siglip2_embedding_dim (typically 768 or 1152)
+            return vision_outputs.pooler_output
+        else:
+            # Return patch tokens
+            patch_tokens = vision_outputs.last_hidden_state
+            
+            # Optional spatial pooling to reduce token count.
+            if pool_size is not None and pool_size > 1:
+                B, N, D = patch_tokens.shape
+                H = W = int(N ** 0.5)
+                tokens_spatial = patch_tokens.reshape(B, H, W, D).permute(0, 3, 1, 2)
+                pooled = torch.nn.functional.avg_pool2d(tokens_spatial, kernel_size=pool_size)
+                _, _, H_new, W_new = pooled.shape
+                patch_tokens = pooled.permute(0, 2, 3, 1).reshape(B, H_new * W_new, D)
+            
+            return patch_tokens
 
 
 class ACTEncoder(nn.Module):
@@ -621,12 +851,18 @@ class ACTEncoderLayer(nn.Module):
         self.activation = get_activation_fn(config.feedforward_activation)
         self.pre_norm = config.pre_norm
 
-    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x,
+        pos_embed: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
         q = k = x if pos_embed is None else x + pos_embed
-        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
+        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask, attn_mask=attn_mask)
         x = x[0]  # note: [0] to select just the output, not the attention weights
         x = skip + self.dropout1(x)
         if self.pre_norm:

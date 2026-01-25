@@ -173,6 +173,11 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
+        
+        if seeds is not None:
+            policy_device = next(policy.parameters()).device
+            observation["seed"] = torch.tensor(seeds, dtype=torch.long, device=policy_device)
+        
         with torch.inference_mode():
             action = policy.select_action(observation)
         action = postprocessor(action)
@@ -259,6 +264,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    save_trajectories: bool = False,
 ) -> dict:
     """
     Args:
@@ -322,6 +328,9 @@ def eval_policy(
     if return_episode_data:
         episode_data: dict | None = None
 
+    if save_trajectories:
+        trajectory_data = {"seeds": [], "trajectories": [], "done_indices": []}
+
     # we dont want progress bar when we use slurm, since it clutters the logs
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
@@ -344,7 +353,7 @@ def eval_policy(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             seeds=list(seeds) if seeds else None,
-            return_observations=return_episode_data,
+            return_observations=return_episode_data or save_trajectories,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
         )
 
@@ -368,6 +377,13 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        if save_trajectories and OBS_STR in rollout_data:
+            for env_idx, done_idx in enumerate(done_indices):
+                trajectory = {k: v[env_idx, :done_idx+1].cpu() for k, v in rollout_data[OBS_STR].items()}
+                trajectory_data["trajectories"].append(trajectory)
+                trajectory_data["seeds"].append(seeds[env_idx] if seeds else None)
+                trajectory_data["done_indices"].append(done_idx.item())
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -453,6 +469,17 @@ def eval_policy(
 
     if max_episodes_rendered > 0:
         info["video_paths"] = video_paths
+
+    if save_trajectories:
+        import pickle
+        if videos_dir:
+            trajectory_path = videos_dir / "expert_trajectories.pkl"
+        else:
+            trajectory_path = Path("expert_trajectories.pkl")
+        trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(trajectory_path, "wb") as f:
+            pickle.dump(trajectory_data, f)
+        info["trajectory_path"] = str(trajectory_path)
 
     return info
 
@@ -561,6 +588,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            save_trajectories=cfg.save_trajectories,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -603,6 +631,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    save_trajectories: bool = False,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -620,6 +649,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        save_trajectories=save_trajectories,
     )
 
     per_episode = task_result["per_episode"]
@@ -646,6 +676,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    save_trajectories: bool = False,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -670,6 +701,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        save_trajectories=save_trajectories,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -691,6 +723,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    save_trajectories: bool = False,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -746,6 +779,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        save_trajectories=save_trajectories,
     )
 
     if max_parallel_tasks <= 1:
