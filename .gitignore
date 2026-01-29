@@ -155,6 +155,11 @@ dmypy.json
 nautilus/*.yaml
 *.key
 sbatch*.sh
+compute_ddp.sh
+compute.sh
+experiments.sh
+auto_resume_training.py
+slurm_out
 
 ### Miscellaneous ###
 # W&B
@@ -165,7 +170,7 @@ wandb/
 
 # Data folders
 data/
-outputs/
+outputs
 
 # Translations
 *.mo
