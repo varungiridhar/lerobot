@@ -453,6 +453,13 @@ class ACT(nn.Module):
     
     def _freeze_parameters(self):
         """Freeze parameters based on training flags."""
+        # Co-training mode: both policy and AWM train together
+        if self.config.train_policy and self.config.train_awm:
+            print("[INFO] Co-training mode: Both policy and AWM components active")
+            if self.config.detach_encoder_for_awm:
+                print("[WARNING] detach_encoder_for_awm=True in co-training mode - AWM won't improve encoder!")
+            return
+        
         if not self.config.train_policy:
             # Freeze all policy components
             components_to_freeze = [
@@ -771,11 +778,16 @@ class ACT(nn.Module):
             query_pos = self.awm_query_pos_embed.weight[:encoder_seq_len].unsqueeze(1)  # (encoder_seq_len, 1, D)
             awm_pos = torch.cat([action_pos, query_pos], dim=0)  # (chunk_size + encoder_seq_len, 1, D)
             
+            # - Co-training (train_policy=True, train_awm=True, detach=False): AWM loss helps refine encoder
+            # - Two-stage (train_policy=False, train_awm=True, detach=True): AWM trains on frozen encoder
+            encoder_for_awm = encoder_out.detach() if self.config.detach_encoder_for_awm else encoder_out
+            encoder_pos_for_awm = encoder_in_pos_embed.detach() if self.config.detach_encoder_for_awm else encoder_in_pos_embed
+            
             awm_decoder_out = self.awm_decoder(
                 awm_decoder_in,
-                encoder_out.detach(),
+                encoder_for_awm,
                 decoder_pos_embed=awm_pos,
-                encoder_pos_embed=encoder_in_pos_embed.detach(),
+                encoder_pos_embed=encoder_pos_for_awm,
             ) # (chunk_size + encoder_seq_len, B, D)
             
             future_state_pred = awm_decoder_out[self.config.chunk_size:] # (encoder_seq_len, B, D)

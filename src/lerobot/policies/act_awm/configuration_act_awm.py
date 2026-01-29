@@ -142,8 +142,10 @@ class ACTAWMConfig(PreTrainedConfig):
     future_state_weight: float = 1.0 # assuming we are doing pi and awm training seperately
     
     # Training control flags
-    train_policy: bool = True  # Train policy components (encoder, decoder, VAE)
-    train_awm: bool = False    # Train AWM components (action encoder, AWM decoder)
+    train_policy: bool = True # Train policy components (encoder, decoder, VAE)
+    train_awm: bool = True # Train AWM components (action encoder, AWM decoder)
+    detach_encoder_for_awm: bool = True # If True, AWM doesn't backprop to encoder (for 2-stage training)
+
 
     # Training preset
     optimizer_lr: float = 1e-5
