@@ -73,6 +73,25 @@ class PI0FastConfig(PreTrainedConfig):
         }
     )
 
+    # Auxiliary state-prediction (predict z_{t+H} from action chunk with [EOA]/[BOS] and causal state tokens)
+    use_state_prediction: bool = True
+    state_pred_loss_weight: float = 0.1
+
+    # Action World Model (AWM) — co-training objective that predicts future SigLIP
+    # image embeddings: p(i_{t+H} | a_{t:t+H}, c).
+    # A separate transformer decoder cross-attends to VLM context
+    # [image, language, FAST action embeddings] to produce future image embeddings,
+    # supervised via cosine similarity with frozen SigLIP targets.
+    use_awm: bool = False  # Enable the world-model decoder head
+    awm_loss_weight: float = 0.1  # Weight of the AWM cosine similarity loss
+    awm_n_decoder_layers: int = 4  # Number of self-attn + cross-attn decoder layers
+    awm_n_heads: int = 8  # Number of attention heads in AWM decoder
+    awm_dim_feedforward: int = 2048  # FFN intermediate dimension in AWM decoder
+    awm_dropout: float = 0.1  # Dropout rate inside AWM decoder
+    awm_num_queries: int = 256  # Learnable query tokens (default matches SigLIP 224x224 / 14x14 patches)
+    awm_hidden_dim: int | None = None  # If None, inherits from paligemma width (e.g. 2048 for gemma_2b)
+    freeze_vision_tower: bool = False  # Freeze the SigLIP ViT (recommended when use_awm=True)
+
     # Training settings
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     compile_model: bool = False  # Whether to use torch.compile for model optimization
@@ -150,8 +169,9 @@ class PI0FastConfig(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int]:
+        # [0, chunk_size]: current observation (t) and future observation (t+H) for auxiliary state-prediction
+        return [0, self.chunk_size]
 
     @property
     def action_delta_indices(self) -> list:

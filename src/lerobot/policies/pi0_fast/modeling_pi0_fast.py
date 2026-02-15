@@ -275,6 +275,222 @@ class PI0FastPaliGemma(nn.Module):
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
+# ---------------------------------------------------------------------------
+# Action World Model (AWM) Decoder
+# ---------------------------------------------------------------------------
+# Predicts future SigLIP image embeddings p(i_{t+H} | a_{t:t+H}, c) using a
+# transformer decoder inspired by ACT (Learning Fine-Grained Bimanual
+# Manipulation with Low-Cost Hardware).
+#
+# Architecture:
+#   1. Learnable "future image embedding" query tokens.
+#   2. Full bidirectional self-attention among queries.
+#   3. Cross-attention: queries attend to VLM context
+#      [image_embs, language_embs, FAST_action_embs].
+#   4. Projection + L2-normalisation → cosine-similarity loss with
+#      frozen SigLIP target embeddings of the image at t+H.
+# ---------------------------------------------------------------------------
+
+
+class AWMDecoderLayer(nn.Module):
+    """Single layer of the Action World Model decoder.
+
+    Each layer performs:
+        1. Bidirectional self-attention among future image query tokens.
+        2. Cross-attention to the VLM context sequence
+           [image embeddings, language embeddings, FAST action embeddings].
+        3. Position-wise feed-forward network.
+
+    Pre-norm (Pre-LN) is used throughout for training stability.
+    """
+
+    def __init__(self, hidden_dim: int, n_heads: int, dim_feedforward: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
+
+        # Feed-forward network.
+        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
+        self.dropout_ff = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
+
+        # Layer norms (pre-norm style).
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm3 = nn.LayerNorm(hidden_dim)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+
+    def forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        context_key_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Args:
+            x: (B, Q, D) future image query tokens.
+            context: (B, S, D) VLM context [image, language, action embeddings].
+            context_key_padding_mask: (B, S) bool mask — True for padded positions.
+        Returns:
+            (B, Q, D) updated query tokens.
+        """
+        # 1. Self-attention (bidirectional among queries) — pre-norm.
+        residual = x
+        x = self.norm1(x)
+        x, _ = self.self_attn(x, x, x)
+        x = residual + self.dropout1(x)
+
+        # 2. Cross-attention (queries attend to VLM context) — pre-norm.
+        residual = x
+        x = self.norm2(x)
+        x, _ = self.cross_attn(x, context, context, key_padding_mask=context_key_padding_mask)
+        x = residual + self.dropout2(x)
+
+        # 3. Feed-forward — pre-norm.
+        residual = x
+        x = self.norm3(x)
+        x = self.linear2(self.dropout_ff(self.activation(self.linear1(x))))
+        x = residual + self.dropout3(x)
+
+        return x
+
+
+class AWMDecoder(nn.Module):
+    """Action World Model decoder: predicts future SigLIP image embeddings.
+
+    Learnable query tokens are iteratively refined through *L* decoder layers,
+    each comprising bidirectional self-attention and cross-attention to the VLM
+    context.  A final linear projection maps to the SigLIP embedding dimension,
+    followed by L2 normalisation (SigLIP embeddings live on a hypersphere).
+    """
+
+    def __init__(self, config: PI0FastConfig):
+        super().__init__()
+
+        # Resolve hidden dim from the VLM width if not explicitly set.
+        paligemma_config = get_gemma_config(config.paligemma_variant)
+        self.hidden_dim = config.awm_hidden_dim or paligemma_config.width  # e.g. 2048
+        self.num_queries = config.awm_num_queries  # default 256 (= SigLIP patches for 224×224)
+
+        # Learnable query embeddings (the "future image embedding tokens").
+        self.query_embed = nn.Parameter(torch.randn(1, self.num_queries, self.hidden_dim) * 0.02)
+
+        # Positional embedding for queries (learnable). # TODO is fixed positional embeddings better here; I believe in ACT, they do not used fixed (ie it is DETR styled learnable pos emb). Consider implications here.
+        self.query_pos_embed = nn.Parameter(torch.randn(1, self.num_queries, self.hidden_dim) * 0.02)
+
+        # Decoder layers.
+        self.layers = nn.ModuleList(
+            [
+                AWMDecoderLayer(
+                    hidden_dim=self.hidden_dim,
+                    n_heads=config.awm_n_heads,
+                    dim_feedforward=config.awm_dim_feedforward,
+                    dropout=config.awm_dropout,
+                )
+                for _ in range(config.awm_n_decoder_layers)
+            ]
+        )
+
+        self.final_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Projection to SigLIP target space (target dim = hidden_dim after multi-modal
+        # projector, i.e. same as paligemma width).  If target dim differs from
+        # hidden_dim in the future, swap in the correct value here.
+        self.target_dim = self.hidden_dim
+        self.output_proj = nn.Linear(self.hidden_dim, self.target_dim)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Xavier-uniform init for linear / attention parameters."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(
+        self,
+        context: Tensor,
+        context_key_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Args:
+            context: (B, S, D) — concatenated VLM hidden states
+                     [image tokens, language tokens, FAST action tokens].
+            context_key_padding_mask: (B, S) — True where context is padding.
+        Returns:
+            predicted_future_embs: (B, num_queries, target_dim), **L2-normalised**.
+        """
+        bsize = context.shape[0]
+
+        # Broadcast learnable queries to batch.
+        queries = self.query_embed.expand(bsize, -1, -1) + self.query_pos_embed.expand(bsize, -1, -1)
+
+        for layer in self.layers:
+            queries = layer(queries, context, context_key_padding_mask=context_key_padding_mask)
+
+        queries = self.final_norm(queries)
+
+        # Project to target space & L2-normalise (SigLIP lives on a hypersphere).
+        predicted = self.output_proj(queries)
+        predicted = F.normalize(predicted, p=2, dim=-1)
+
+        return predicted
+
+    @staticmethod
+    def cosine_similarity_loss(
+        predicted: Tensor,
+        target: Tensor,
+        target_padding_mask: Tensor | None = None,
+    ) -> tuple[Tensor, dict]:
+        """Compute mean negative cosine similarity and embedding diagnostics.
+
+        Both ``predicted`` and ``target`` are expected to be L2-normalised so that
+        ``(predicted * target).sum(-1)`` equals cosine similarity.
+
+        Args:
+            predicted: (B, Q, D) — L2-normalised AWM output.
+            target:    (B, Q, D) — L2-normalised frozen SigLIP embeddings.
+            target_padding_mask: (B,) bool — True if the future image is *padded*
+                (i.e. beyond episode boundary); those samples are excluded from
+                the loss.
+        Returns:
+            loss: Scalar loss (mean 1 - cos_sim).
+            diagnostics: Dict with embedding-level metrics.
+        """
+        # Per-token cosine similarity → average over tokens to get per-sample score.
+        cos_sim = (predicted * target).sum(dim=-1).mean(dim=-1)  # (B,)
+        loss_per_sample = 1.0 - cos_sim  # (B,)
+
+        # Compute diagnostics
+        mean_cosine = float(cos_sim.mean().item())
+        pred_norm_mean = float(predicted.norm(dim=-1).mean().item())
+        target_norm_mean = float(target.norm(dim=-1).mean().item())
+        embedding_norm_ratio = float(target_norm_mean / (pred_norm_mean + 1e-12))
+        flat_pred = predicted.view(predicted.shape[0], -1)
+        feature_collapse_variance = float(flat_pred.var(dim=0).mean().item())
+
+        diagnostics = {
+            "awm/cosine_similarity": mean_cosine,
+            "awm/embedding_norm_ratio": embedding_norm_ratio,
+            "awm/feature_collapse_variance": feature_collapse_variance,
+        }
+
+        if target_padding_mask is not None:
+            # Exclude padded (invalid) future frames.
+            valid = ~target_padding_mask  # True where valid
+            if valid.any():
+                return loss_per_sample[valid].mean(), diagnostics
+            else:
+                # All samples are padded — return zero loss (no gradient).
+                return loss_per_sample.sum() * 0.0, diagnostics
+        return loss_per_sample.mean(), diagnostics
+
+
 class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI0Fast PyTorch model."""
 
@@ -299,6 +515,18 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+
+        # Action World Model (AWM) decoder — predicts future image embeddings.
+        if config.use_awm:
+            self.awm_decoder = AWMDecoder(config)
+            # Convert AWM decoder to match the configured dtype (must match VLM context dtype).
+            if config.dtype == "bfloat16":
+                self.awm_decoder = self.awm_decoder.to(dtype=torch.bfloat16)
+            logging.info(
+                f"AWM decoder initialised: {config.awm_n_decoder_layers} layers, "
+                f"{config.awm_num_queries} queries, hidden_dim={self.awm_decoder.hidden_dim}, "
+                f"dtype={config.dtype}"
+            )
 
         # Compile model if requested
         if config.compile_model:
@@ -351,6 +579,20 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         if dtype is not None:
             result = result.to(dtype=dtype)
         return result
+
+    @torch.no_grad()
+    def encode_image_for_awm_target(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode an image through the frozen SigLIP vision tower + multi-modal
+        projector to obtain L2-normalised target embeddings for the AWM.
+
+        Args:
+            image: (B, C, H, W) preprocessed image tensor (in [-1, 1]).
+        Returns:
+            (B, num_patches, target_dim) L2-normalised SigLIP embeddings.
+        """
+        target_embs = self.paligemma_with_expert.embed_image(image)  # (B, num_patches, D)
+        target_embs = F.normalize(target_embs.float(), p=2, dim=-1)
+        return target_embs
 
     def embed_prefix_fast(
         self,
@@ -493,7 +735,9 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Forward pass for PI0Fast.
 
         This implements the Pi0FAST training objective: predict next action token
-        using cross-entropy loss.
+        using cross-entropy loss.  When ``config.use_awm`` is True the VLM hidden
+        states are also passed through the AWM decoder to predict future image
+        embeddings (returned under ``"awm_predicted"``).
 
         Args:
             images: List of image tensors
@@ -504,7 +748,7 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
             fast_action_masks: Padding masks for fast action tokens [B, max_action_tokens]
 
         Returns:
-            Dictionary with 'fast_loss' and 'loss' keys
+            Dictionary with 'ce_loss', 'loss', and optionally 'awm_predicted' keys.
         """
         if fast_action_tokens is None or fast_action_masks is None:
             raise ValueError("fast_action_tokens and fast_action_masks are required for FAST-only mode")
@@ -575,10 +819,30 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         masked_fast_loss = fast_loss_per_token * fast_action_masks.float()
         fast_loss = masked_fast_loss.sum() / fast_action_masks.sum().clamp(min=1)
 
-        return {
+        result = {
             "ce_loss": fast_loss,
             "loss": fast_loss,
         }
+
+        # ---- AWM: predict future image embeddings ----
+        if self.config.use_awm and hasattr(self, "awm_decoder"):
+            # Context for AWM = VLM hidden states (already contextualised by the
+            # full transformer).  Use prefix_out which contains hidden states for
+            # [image, language, FAST action] tokens.
+            # prefix_pad_masks tells which positions are valid.
+            awm_context = prefix_out  # (B, total_seq_len, D)
+            # Note: prefix_pad_masks was computed before shifting; use the
+            # un-shifted mask as context mask (True = valid token).
+            # The AWMDecoder's cross-attention expects True = *padded*, so invert.
+            awm_context_key_padding_mask = ~prefix_pad_masks  # True = padded
+
+            awm_predicted = self.awm_decoder(
+                context=awm_context,
+                context_key_padding_mask=awm_context_key_padding_mask,
+            )  # (B, num_queries, target_dim), L2-normalised
+            result["awm_predicted"] = awm_predicted
+
+        return result
 
     @torch.no_grad()
     def sample_actions_fast(
@@ -846,6 +1110,19 @@ class PI0FastPolicy(PreTrainedPolicy):
             config, rtc_processor=self.rtc_processor, paligemma_tokenizer=self._paligemma_tokenizer
         )
 
+        # Freeze the SigLIP vision tower when requested (recommended with AWM so
+        # the target embeddings remain stable during training).
+        # TODO: consider polyak averaging, representations seems to collapse based on initial results: finetune_libero_pi0fast_3B_awm_cotraining_frozen_vision_tower, repid: finetune_libero_pi0fast_3B_awm_cotraining_frozen_vision_tower_seg0
+        if config.freeze_vision_tower:
+            vision_tower = self.model.paligemma_with_expert.paligemma.vision_tower
+            for param in vision_tower.parameters():
+                param.requires_grad = False
+            vision_tower.eval()
+            logging.info(
+                "Froze SigLIP vision tower (%d params)",
+                sum(p.numel() for p in vision_tower.parameters()),
+            )
+
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -1005,6 +1282,14 @@ class PI0FastPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    # Override to ensure that the vision tower is always frozen (note: this may affect finetuning performance from the actual pi0fast results, but unaware by how much...)
+    def train(self, mode: bool = True):
+        """Override to keep the frozen ViT in eval mode at all times."""
+        super().train(mode)
+        if self.config.freeze_vision_tower:
+            self.model.paligemma_with_expert.paligemma.vision_tower.eval()
+        return self
+
     def reset(self):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
@@ -1028,11 +1313,39 @@ class PI0FastPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def _preprocess_single_image(self, img: Tensor) -> Tensor:
+        """Preprocess a single image tensor from [B, C, H, W] (in [0, 1]) to
+        [B, C, H, W] (in [-1, 1]) with resizing/padding if necessary.
+        """
+        device = next(self.parameters()).device
+        if img.device != device:
+            img = img.to(device)
+        if img.dtype != torch.float32:
+            img = img.to(torch.float32)
+
+        is_channels_first = img.shape[1] == 3
+        if is_channels_first:
+            img = img.permute(0, 2, 3, 1)  # -> [B, H, W, C]
+
+        if img.shape[1:3] != self.config.image_resolution:
+            img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+        img = img * 2.0 - 1.0  # [0,1] -> [-1,1]
+
+        if is_channels_first:
+            img = img.permute(0, 3, 1, 2)  # -> [B, C, H, W]
+        return img
+
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+
+        When ``observation_delta_indices`` yields a temporal dimension the batch
+        contains images shaped ``(B, T, C, H, W)``.  Only the **current** frame
+        (``[:, 0]``) is used here; the future frame is handled separately by
+        ``_get_awm_future_images``.
         """
         images = []
         img_masks = []
@@ -1053,31 +1366,11 @@ class PI0FastPolicy(PreTrainedPolicy):
         for key in present_img_keys:
             img = batch[key]
 
-            # Ensure tensor is on the same device as the model
-            if img.device != device:
-                img = img.to(device)
+            # Handle temporal dimension (B, T, C, H, W) → take current frame.
+            if img.dim() == 5:
+                img = img[:, 0]  # (B, C, H, W)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
-
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            img = self._preprocess_single_image(img)
 
             images.append(img)
             # Create mask (all ones for real images)
@@ -1093,6 +1386,39 @@ class PI0FastPolicy(PreTrainedPolicy):
             img_masks.append(mask)
 
         return images, img_masks
+
+    def _get_awm_future_images(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Extract and preprocess the future image at t+H for AWM supervision.
+
+        Returns:
+            future_img: (B, C, H, W) preprocessed future image, or None.
+            future_img_is_pad: (B,) bool mask — True where the future frame is
+                beyond the episode boundary (padded), or None.
+        """
+        device = next(self.parameters()).device
+
+        # Look for any image feature that has a temporal dimension.
+        for key in self.config.image_features:
+            if key not in batch:
+                continue
+            img = batch[key]
+            if img.dim() == 5 and img.shape[1] >= 2:
+                future_img = img[:, 1]  # (B, C, H, W)
+                future_img = self._preprocess_single_image(future_img)
+
+                # Check for the _is_pad companion key.
+                pad_key = f"{key}_is_pad"
+                if pad_key in batch:
+                    future_img_is_pad = batch[pad_key][:, 1].to(device=device, dtype=torch.bool)
+                else:
+                    future_img_is_pad = torch.zeros(
+                        future_img.shape[0], dtype=torch.bool, device=device
+                    )
+                return future_img, future_img_is_pad
+
+        return None, None
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1318,7 +1644,15 @@ class PI0FastPolicy(PreTrainedPolicy):
         return continuous_actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training."""
+        """Run the batch through the model and compute the loss for training.
+
+        When ``config.use_awm`` is True the forward pass additionally:
+        1. Encodes the future image at t+H through the (frozen) SigLIP ViT to
+           obtain L2-normalised target embeddings.
+        2. Runs the AWM decoder on the VLM hidden states to predict future image
+           embeddings.
+        3. Computes a cosine-similarity loss and adds it (weighted) to the total.
+        """
 
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
@@ -1350,4 +1684,80 @@ class PI0FastPolicy(PreTrainedPolicy):
             "loss": loss.item(),
             "ce_loss": loss_dict["ce_loss"].item(),
         }
+
+        # ---- AWM loss + diagnostics ----
+        if self.config.use_awm and "awm_predicted" in loss_dict:
+            future_img, future_img_is_pad = self._get_awm_future_images(batch)
+            if future_img is not None:
+                # Encode future image through frozen SigLIP → target embeddings.
+                awm_target = self.model.encode_image_for_awm_target(future_img)  # (B, Q, D), L2-normed
+
+                awm_predicted = loss_dict["awm_predicted"]  # (B, Q, D), L2-normed
+
+                # Ensure matching shapes (trim queries if num_queries != num_patches).
+                min_q = min(awm_predicted.shape[1], awm_target.shape[1])
+                awm_predicted = awm_predicted[:, :min_q]
+                awm_target = awm_target[:, :min_q]
+
+                # AWM loss (cosine-based) and diagnostics
+                awm_loss, awm_diags = AWMDecoder.cosine_similarity_loss(
+                    awm_predicted, awm_target, target_padding_mask=future_img_is_pad
+                )
+
+                # Add weighted AWM loss to total
+                loss = loss + self.config.awm_loss_weight * awm_loss
+                detailed_loss_dict["awm_loss"] = awm_loss.item()
+                detailed_loss_dict["loss"] = loss.item()
+
+                # Add embedding-level diagnostics (gradient diagnostics come from
+                # compute_grad_diagnostics() called after loss.backward())
+                detailed_loss_dict.update(awm_diags)
+
         return loss, detailed_loss_dict
+
+    def compute_grad_diagnostics(self) -> dict:
+        """Compute gradient diagnostics from model parameter `.grad`.
+
+        Call after `loss.backward()` and before `optimizer.step()`.
+
+        Returns:
+            Dict with gradient norms for AWM decoder, PI0Fast (non-AWM), and backbone.
+        """
+        try:
+            diagnostics = {}
+
+            # AWM decoder gradient norm (if AWM is enabled)
+            if self.config.use_awm and hasattr(self.model, "awm_decoder"):
+                awm_params = [p for p in self.model.awm_decoder.parameters() if p.requires_grad and p.grad is not None]
+                if awm_params:
+                    awm_norm = float(sum((p.grad ** 2).sum().item() for p in awm_params) ** 0.5)
+                    diagnostics["grads/awm_norm"] = awm_norm
+
+            # PI0Fast (non-AWM) gradient norm: all parameters except AWM decoder
+            if self.config.use_awm and hasattr(self.model, "awm_decoder"):
+                awm_param_ids = {id(p) for p in self.model.awm_decoder.parameters()}
+                pi_params = [
+                    p for p in self.model.parameters()
+                    if p.requires_grad and p.grad is not None and id(p) not in awm_param_ids
+                ]
+            else:
+                # No AWM, so all parameters are PI0Fast
+                pi_params = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
+
+            if pi_params:
+                pi_norm = float(sum((p.grad ** 2).sum().item() for p in pi_params) ** 0.5)
+                diagnostics["grads/pi_norm"] = pi_norm
+
+            # Backbone (vision tower) gradient norm
+            backbone_params = [
+                p for p in self.model.paligemma_with_expert.paligemma.vision_tower.parameters()
+                if p.requires_grad and p.grad is not None
+            ]
+            if backbone_params:
+                backbone_norm = float(sum((p.grad ** 2).sum().item() for p in backbone_params) ** 0.5)
+                diagnostics["grads/backbone_norm"] = backbone_norm
+
+            return diagnostics
+        except Exception as exc:
+            logging.warning(f"compute_grad_diagnostics failed: {exc}")
+            return {}
