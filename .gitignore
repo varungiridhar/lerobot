@@ -155,8 +155,7 @@ dmypy.json
 nautilus/*.yaml
 *.key
 sbatch*.sh
-compute_ddp.sh
-compute.sh
+compute*.sh
 experiments.sh
 slurm_out
 auto_resume_training.py
