@@ -76,8 +76,6 @@ class ACTSimpleConfig(PreTrainedConfig):
         feedforward_activation: The activation to use in the transformer block's feed-forward layers.
         n_encoder_layers: The number of transformer layers to use for the transformer encoder.
         n_decoder_layers: The number of transformer layers to use for the transformer decoder.
-        use_learned_pos_embed_encoder_2d: Whether to use learned 2D positional embeddings in the encoder
-            for camera features. If False, uses sinusoidal positional embeddings.
         dropout: Dropout to use in the transformer layers (see code for details).
     """
 
@@ -107,7 +105,6 @@ class ACTSimpleConfig(PreTrainedConfig):
     feedforward_activation: str = "relu"
     n_encoder_layers: int = 4
     n_decoder_layers: int = 4
-    use_learned_pos_embed_encoder_2d: bool = False
 
     # Training and loss computation.
     dropout: float = 0.1
