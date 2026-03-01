@@ -31,6 +31,7 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act_simple.configuration_act_simple import ACTSimpleConfig
+from lerobot.policies.awm.configuration_awm import AWMConfig
 from lerobot.policies.act_awm.configuration_act_awm import ACTAWMConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
@@ -324,6 +325,15 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
+
+    elif isinstance(policy_cfg, AWMConfig):
+        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+        processors = make_act_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
 
     elif isinstance(policy_cfg, ACTAWMConfig):
         from lerobot.policies.act_awm.processor_act_awm import make_act_awm_pre_post_processors
