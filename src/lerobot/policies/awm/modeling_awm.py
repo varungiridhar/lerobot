@@ -131,9 +131,9 @@ class AWMPolicy(PreTrainedPolicy):
             reduction="none",
         )  # (B*T,)
 
-        # Zero out padded timesteps.
+        # Zero out padded timesteps; divide only by valid (non-padding) count.
         valid = ~batch["action_is_pad"].reshape(-1)  # (B*T,)
-        loss = (loss_per_tok * valid).mean()
+        loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
 
         return loss, {"loss": loss.item()}
 
@@ -320,7 +320,9 @@ class AWM(nn.Module):
         decoder_in = torch.cat([bos, prev_embeds], dim=0)                   # (T, B, dim_model)
 
         causal_mask = _make_causal_mask(T, device=decoder_in.device)
-        decoder_out = self.decoder(decoder_in, cross_kv, cross_pos, causal_mask)
+        decoder_pos_embed = self.decoder_pos_embed.weight[:T].unsqueeze(1)  # (T, 1, dim_model)
+        decoder_out = self.decoder(decoder_in, cross_kv, cross_pos, causal_mask,
+                                   decoder_pos_embed=decoder_pos_embed)
 
         logits = self.action_head(decoder_out.transpose(0, 1))  # (B, T, total_vocab_size)
         return logits, token_ids
