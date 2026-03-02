@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
 @PreTrainedConfig.register_subclass("awm")
@@ -116,6 +117,14 @@ class AWMConfig(PreTrainedConfig):
     optimizer_lr: float = 2e-4
     optimizer_weight_decay: float = 0.0
     optimizer_lr_backbone: float = 1e-5
+    optimizer_grad_clip_norm: float = 1.0
+
+    # LR schedule: cosine decay with linear warmup.
+    # Set use_lr_schedule=True to enable; constant lr is used by default.
+    use_lr_schedule: bool = False
+    scheduler_warmup_steps: int = 5000
+    scheduler_decay_steps: int = 100_000
+    scheduler_decay_lr: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -141,10 +150,18 @@ class AWMConfig(PreTrainedConfig):
         return AdamWConfig(
             lr=self.optimizer_lr,
             weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig | None:
+        if not self.use_lr_schedule:
+            return None
+        return CosineDecayWithWarmupSchedulerConfig(
+            num_warmup_steps=self.scheduler_warmup_steps,
+            num_decay_steps=self.scheduler_decay_steps,
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
+        )
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
