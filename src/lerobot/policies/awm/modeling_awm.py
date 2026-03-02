@@ -129,6 +129,7 @@ class AWMPolicy(PreTrainedPolicy):
             logits.reshape(-1, total_V),
             token_ids.reshape(-1),
             reduction="none",
+            label_smoothing=0.1,
         )  # (B*T,)
 
         # Zero out padded timesteps; divide only by valid (non-padding) count.
