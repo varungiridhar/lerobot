@@ -29,6 +29,7 @@ Optional:
 """
 
 from collections import deque
+from copy import copy
 from itertools import chain
 
 import einops
@@ -48,6 +49,22 @@ from lerobot.policies.awm.configuration_awm import AWMConfig
 from lerobot.policies.awm.tokenizer_awm import UniformActionTokenizer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+
+def _slice_obs_batch(batch: dict[str, Tensor], idx: int) -> dict[str, Tensor]:
+    """Return a batch dict with observation tensors sliced to a single temporal index.
+
+    When observation_delta_indices loads multiple time steps, obs tensors gain an extra
+    leading temporal dimension: (B, num_steps, ...). This helper extracts one step.
+    Non-observation keys (action, action_is_pad, etc.) are passed through unchanged.
+    """
+    result = {}
+    for key, val in batch.items():
+        if key.startswith("observation.") and isinstance(val, Tensor) and val.ndim >= 2:
+            result[key] = val[:, idx]
+        else:
+            result[key] = val
+    return result
 
 
 class AWMPolicy(PreTrainedPolicy):
@@ -115,12 +132,31 @@ class AWMPolicy(PreTrainedPolicy):
         return self.model.predict_ar(batch)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Teacher-forced training forward pass; returns cross-entropy loss."""
-        if self.config.image_features:
-            batch = dict(batch)
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        """Teacher-forced training forward pass; returns combined action + world model loss."""
+        # Split the temporally-stacked obs (B, 2, ...) into current (t) and next (t+H).
+        curr_batch = _slice_obs_batch(batch, 0)
+        next_batch = _slice_obs_batch(batch, 1)
 
-        logits, token_ids = self.model(batch)
+        # OBS_IMAGES is a list, not a Tensor — assemble it after slicing so images are (B, C, H, W).
+        if self.config.image_features:
+            curr_batch = dict(curr_batch)
+            curr_batch[OBS_IMAGES] = [curr_batch[key] for key in self.config.image_features]
+            next_batch = dict(next_batch)
+            next_batch[OBS_IMAGES] = [next_batch[key] for key in self.config.image_features]
+
+        # Episode-boundary mask: True where t+H is beyond the episode end.
+        next_obs_is_pad = batch.get(
+            "observation.state_is_pad",
+            batch.get("observation.environment_state_is_pad"),
+        )
+        if next_obs_is_pad is not None:
+            next_obs_is_pad = next_obs_is_pad[:, 1]  # (B,) bool
+        else:
+            next_obs_is_pad = torch.zeros(
+                batch["action"].shape[0], dtype=torch.bool, device=batch["action"].device
+            )
+
+        logits, token_ids, wm_tensors = self.model(curr_batch, next_batch)
         # logits:    (B, T, total_vocab_size)
         # token_ids: (B, T)
 
@@ -133,10 +169,22 @@ class AWMPolicy(PreTrainedPolicy):
         )  # (B*T,)
 
         # Zero out padded timesteps; divide only by valid (non-padding) count.
-        valid = ~batch["action_is_pad"].reshape(-1)  # (B*T,)
-        loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
+        valid = ~curr_batch["action_is_pad"].reshape(-1)  # (B*T,)
+        action_loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
 
-        return loss, {"loss": loss.item()}
+        # World model cosine similarity loss — masked at episode boundaries.
+        z_pred, z_target = wm_tensors
+        valid_wm = ~next_obs_is_pad  # (B,)
+        cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1)  # (B,)
+        wm_loss = 1 - (cos_sim * valid_wm).sum() / valid_wm.sum().clamp(min=1)
+
+        loss = action_loss + self.config.wm_loss_weight * wm_loss
+
+        return loss, {
+            "loss": loss.item(),
+            "action_loss": action_loss.item(),
+            "wm_loss": wm_loss.item(),
+        }
 
 
 class AWM(nn.Module):
@@ -230,6 +278,28 @@ class AWM(nn.Module):
         # ------------------------------------------------------------------
         self.action_head = nn.Linear(config.dim_model, total_V)
 
+        # ------------------------------------------------------------------
+        # World model decoder — non-causal (bidirectional self-attention),
+        # shallower than the action decoder.
+        # ------------------------------------------------------------------
+        wm_cfg = copy(config)
+        wm_cfg.n_decoder_layers = config.n_wm_decoder_layers
+        self.wm_decoder = AWMDecoder(wm_cfg)
+
+        # Separate positional embeddings for WM decoder action-token inputs.
+        self.wm_decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+
+        # Learnable CLS token — aggregates the action sequence into a single vector.
+        self.wm_cls_token = nn.Parameter(torch.zeros(1, 1, config.dim_model))
+        nn.init.trunc_normal_(self.wm_cls_token, std=0.02)
+
+        # 2-layer MLP projection head: maps CLS output → predicted next-state latent.
+        self.wm_proj_head = nn.Sequential(
+            nn.Linear(config.dim_model, config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.dim_model),
+        )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -237,6 +307,8 @@ class AWM(nn.Module):
         for p in chain(
             self.encoder.parameters(),
             self.decoder.parameters(),
+            self.wm_decoder.parameters(),
+            self.wm_proj_head.parameters(),
             self.cross_attn_proj.parameters(),
             self.cross_attn_pos_proj.parameters(),
         ):
@@ -297,15 +369,22 @@ class AWM(nn.Module):
     # Forward passes
     # ------------------------------------------------------------------
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        next_batch: dict[str, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]:
         """Teacher-forced training forward pass.
 
         Args:
-            batch: Must contain ``ACTION`` with shape ``(B, chunk_size, action_dim)``.
+            batch:      Must contain ``ACTION`` with shape ``(B, chunk_size, action_dim)``.
+            next_batch: Batch dict for the next observation (t+H). When provided, the world
+                        model head is computed and WM tensors are returned.
 
         Returns:
-            logits:    ``(B, T, total_vocab_size)`` — unnormalised log-probabilities.
-            token_ids: ``(B, T)`` — ground-truth joint token indices (for cross-entropy).
+            logits:     ``(B, T, total_vocab_size)`` — unnormalised log-probabilities.
+            token_ids:  ``(B, T)`` — ground-truth joint token indices (for cross-entropy).
+            wm_tensors: ``(z_pred, z_target)`` pair or ``None`` if no next_batch.
         """
         batch_size, _, cross_kv, cross_pos = self._encode(batch)
 
@@ -326,7 +405,28 @@ class AWM(nn.Module):
                                    decoder_pos_embed=decoder_pos_embed)
 
         logits = self.action_head(decoder_out.transpose(0, 1))  # (B, T, total_vocab_size)
-        return logits, token_ids
+
+        # ------------------------------------------------------------------
+        # World model forward — only during training (next_batch provided).
+        # ------------------------------------------------------------------
+        # Target: first encoder token of the next observation (stop-gradient).
+        _, next_encoder_out, _, _ = self._encode(next_batch)
+        z_target = next_encoder_out[0].detach()  # (B, dim_model)
+
+        # WM decoder input: [CLS, action_0, ..., action_{T-1}].
+        # CLS token aggregates the full action sequence; action tokens carry pos embeds.
+        action_embeds = self.token_embed(token_ids).transpose(0, 1)        # (T, B, dim_model)
+        wm_pos = self.wm_decoder_pos_embed.weight[:T].unsqueeze(1)         # (T, 1, dim_model)
+        cls = self.wm_cls_token.expand(1, batch_size, -1)                  # (1, B, dim_model)
+        wm_in = torch.cat([cls, action_embeds + wm_pos], dim=0)            # (T+1, B, dim_model)
+
+        # Non-causal (bidirectional) self-attention: causal_mask=None.
+        wm_out = self.wm_decoder(wm_in, cross_kv, cross_pos, None)        # (T+1, B, dim_model)
+        z_pred = self.wm_proj_head(wm_out[0])                              # (B, dim_model)
+
+        wm_tensors = (z_pred, z_target)
+
+        return logits, token_ids, wm_tensors
 
     def predict_ar(self, batch: dict[str, Tensor]) -> Tensor:
         """Autoregressive greedy inference.
@@ -395,7 +495,7 @@ class AWMDecoder(nn.Module):
         x: Tensor,
         cross_kv: Tensor,
         cross_pos: Tensor,
-        causal_mask: Tensor,
+        causal_mask: Tensor | None,
         decoder_pos_embed: Tensor | None = None,
     ) -> Tensor:
         """
@@ -403,7 +503,7 @@ class AWMDecoder(nn.Module):
             x:                (T, B, dim_model)
             cross_kv:         (S, B, cross_attn_dim)
             cross_pos:        (S, 1, cross_attn_dim)
-            causal_mask:      (T, T) bool — True = ignored
+            causal_mask:      (T, T) bool — True = ignored; None = bidirectional (no masking)
             decoder_pos_embed:(T, 1, dim_model) or None
 
         Returns:
@@ -451,7 +551,7 @@ class AWMDecoderLayer(nn.Module):
         x: Tensor,
         cross_kv: Tensor,
         cross_pos: Tensor,
-        causal_mask: Tensor,
+        causal_mask: Tensor | None,
         decoder_pos_embed: Tensor | None = None,
     ) -> Tensor:
         """
@@ -459,7 +559,7 @@ class AWMDecoderLayer(nn.Module):
             x:                (T, B, dim_model)
             cross_kv:         (S, B, cross_attn_dim)
             cross_pos:        (S, 1, cross_attn_dim)
-            causal_mask:      (T, T) bool
+            causal_mask:      (T, T) bool or None — None gives bidirectional self-attention
             decoder_pos_embed:(T, 1, dim_model) or None
 
         Returns:

@@ -113,6 +113,10 @@ class AWMConfig(PreTrainedConfig):
     # Training and loss computation.
     dropout: float = 0.1
 
+    # World model
+    wm_loss_weight: float = 0.2     # Weight on world model loss relative to action prediction loss
+    n_wm_decoder_layers: int = 4    # Number of layers in the world model decoder
+
     # Training preset
     optimizer_lr: float = 2e-4
     optimizer_weight_decay: float = 0.0
@@ -168,8 +172,8 @@ class AWMConfig(PreTrainedConfig):
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int]:
+        return [0, self.chunk_size]  # Load obs at t (idx=0) and t+H (idx=1) for world model
 
     @property
     def action_delta_indices(self) -> list:
