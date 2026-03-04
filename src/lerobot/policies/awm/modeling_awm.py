@@ -51,6 +51,44 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
+class WMImageDecoder(nn.Module):
+    """Lightweight debug image decoder: (B, dim_model) → (B, C, H, W).
+
+    Architecture: Linear projection → reshape → 5 × stride-2 ConvTranspose2d.
+    The spatial start size h0 = H // 32 matches the ResNet18 layer4 feature map
+    resolution, so 5 doublings exactly recover the original image resolution.
+
+    For 96×96 images (h0=3): ~160K parameters.
+    For 384×384 images (h0=12): ~160K parameters (same conv layers, larger proj).
+
+    Intended to be driven by a **detached** z_pred so gradients do not propagate
+    to the main model (encoder, WM decoder, action decoder).
+    """
+
+    def __init__(self, dim_model: int, image_shape: tuple[int, int, int]):
+        super().__init__()
+        C, H, W = image_shape
+        h0, w0 = H // 32, W // 32   # ResNet18 layer4 spatial resolution
+        base_ch = 32
+
+        self.h0 = h0
+        self.w0 = w0
+        self.base_ch = base_ch
+        self.proj = nn.Linear(dim_model, base_ch * h0 * w0)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(base_ch, 16, 4, stride=2, padding=1), nn.ReLU(),  # ×2
+            nn.ConvTranspose2d(16,       8, 4, stride=2, padding=1), nn.ReLU(),  # ×2
+            nn.ConvTranspose2d( 8,       4, 4, stride=2, padding=1), nn.ReLU(),  # ×2
+            nn.ConvTranspose2d( 4,       2, 4, stride=2, padding=1), nn.ReLU(),  # ×2
+            nn.ConvTranspose2d( 2,       C, 4, stride=2, padding=1), nn.Tanh(),  # ×2 → H×W
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        B = z.shape[0]
+        x = self.proj(z).view(B, self.base_ch, self.h0, self.w0)
+        return self.decoder(x)
+
+
 def _slice_obs_batch(batch: dict[str, Tensor], idx: int) -> dict[str, Tensor]:
     """Return a batch dict with observation tensors sliced to a single temporal index.
 
@@ -173,18 +211,82 @@ class AWMPolicy(PreTrainedPolicy):
         action_loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
 
         # World model cosine similarity loss — masked at episode boundaries.
-        z_pred, z_target = wm_tensors
+        z_pred, z_target, decoded_img, gt_next_img = wm_tensors
         valid_wm = ~next_obs_is_pad  # (B,)
         cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1)  # (B,)
         wm_loss = 1 - (cos_sim * valid_wm).sum() / valid_wm.sum().clamp(min=1)
 
         loss = action_loss + self.config.wm_loss_weight * wm_loss
-
-        return loss, {
-            "loss": loss.item(),
+        info = {
             "action_loss": action_loss.item(),
             "wm_loss": wm_loss.item(),
         }
+
+        # Image reconstruction loss — MSE in normalised pixel space.
+        # z_pred is already detached inside wm_image_decoder, so no gradients
+        # propagate back to the encoder or WM decoder from this term.
+        if decoded_img is not None and gt_next_img is not None:
+            decoder_loss = F.mse_loss(decoded_img, gt_next_img)
+            loss = loss + self.config.decoder_loss_weight * decoder_loss
+            info["decoder_loss"] = decoder_loss.item()
+
+        info["loss"] = loss.item()
+        return loss, info
+
+
+    @torch.no_grad()
+    def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
+        """Generate WM image reconstruction pairs for debugging.
+
+        Returns a dict with keys ``"ground_truth"`` and ``"decoded"``, each a
+        ``(N, C, H, W)`` float tensor in ``[0, 1]`` suitable for saving/logging.
+        Returns ``None`` when no image features are configured.
+        """
+        if not self.config.image_features or not hasattr(self.model, "wm_image_decoder"):
+            return None
+
+        was_training = self.training
+        self.eval()
+
+        n = min(n_pairs, batch["action"].shape[0])
+
+        def _prep(raw_batch: dict, idx: int) -> dict:
+            sliced = _slice_obs_batch(raw_batch, idx)
+            d = {k: v[:n] if isinstance(v, Tensor) else v for k, v in sliced.items()}
+            d = dict(d)
+            d[OBS_IMAGES] = [d[k][:n] for k in self.config.image_features]
+            return d
+
+        curr_batch = _prep(batch, 0)
+        next_batch = _prep(batch, 1)
+
+        # Encode current obs and run WM forward.
+        batch_size, _, cross_kv, cross_pos = self.model._encode(curr_batch)
+        token_ids = self.model.tokenizer.encode(batch[ACTION][:n])
+        T = token_ids.shape[1]
+
+        action_embeds = self.model.token_embed(token_ids).transpose(0, 1)
+        wm_pos = self.model.wm_decoder_pos_embed.weight[:T].unsqueeze(1)
+        cls = self.model.wm_cls_token.expand(1, batch_size, -1)
+        wm_in = torch.cat([cls, action_embeds + wm_pos], dim=0)
+        wm_out = self.model.wm_decoder(wm_in, cross_kv, cross_pos, None)
+        z_pred = self.model.wm_proj_head(wm_out[0])
+
+        decoded = self.model.wm_image_decoder(z_pred)   # (N, C, H, W)
+        gt = next_batch[OBS_IMAGES][0]                  # (N, C, H, W) normalised
+
+        def _to_01(t: Tensor) -> Tensor:
+            """Per-sample min-max normalise to [0, 1] for display."""
+            B = t.shape[0]
+            t_flat = t.view(B, -1)
+            lo = t_flat.min(dim=1).values.view(B, 1, 1, 1)
+            hi = t_flat.max(dim=1).values.view(B, 1, 1, 1)
+            return ((t - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+
+        if was_training:
+            self.train()
+
+        return {"ground_truth": _to_01(gt).cpu(), "decoded": _to_01(decoded).cpu()}
 
 
 class AWM(nn.Module):
@@ -300,18 +402,29 @@ class AWM(nn.Module):
             nn.Linear(config.dim_model, config.dim_model),
         )
 
+        # ------------------------------------------------------------------
+        # Image decoder (debug only) — driven by detached z_pred so no
+        # gradients flow to the encoder or WM decoder.
+        # ------------------------------------------------------------------
+        if config.image_features:
+            first_feat = next(iter(config.image_features.values()))
+            self.wm_image_decoder = WMImageDecoder(config.dim_model, tuple(first_feat.shape))
+
         self._reset_parameters()
 
     def _reset_parameters(self):
         """Xavier-uniform initialisation for transformer and projection weights."""
-        for p in chain(
+        modules = [
             self.encoder.parameters(),
             self.decoder.parameters(),
             self.wm_decoder.parameters(),
             self.wm_proj_head.parameters(),
             self.cross_attn_proj.parameters(),
             self.cross_attn_pos_proj.parameters(),
-        ):
+        ]
+        if hasattr(self, "wm_image_decoder"):
+            modules.append(self.wm_image_decoder.parameters())
+        for p in chain(*modules):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
@@ -424,7 +537,13 @@ class AWM(nn.Module):
         wm_out = self.wm_decoder(wm_in, cross_kv, cross_pos, None)        # (T+1, B, dim_model)
         z_pred = self.wm_proj_head(wm_out[0])                              # (B, dim_model)
 
-        wm_tensors = (z_pred, z_target)
+        # Image decoder — detached z_pred so no gradients reach the main model.
+        decoded_img, gt_next_img = None, None
+        if hasattr(self, "wm_image_decoder") and OBS_IMAGES in next_batch:
+            decoded_img = self.wm_image_decoder(z_pred.detach())   # (B, C, H, W)
+            gt_next_img = next_batch[OBS_IMAGES][0].detach()       # (B, C, H, W)
+
+        wm_tensors = (z_pred, z_target, decoded_img, gt_next_img)
 
         return logits, token_ids, wm_tensors
 
