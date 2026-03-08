@@ -298,10 +298,11 @@ class AWMPolicy(PreTrainedPolicy):
         # Run WM decoder to get future state prediction.
         token_ids = self.model.tokenizer.encode(batch[ACTION][:n])
         T = token_ids.shape[1]
-        action_embeds = self.model.token_embed(token_ids).transpose(0, 1)
+        action_embeds = self.model.wm_token_embed(token_ids).transpose(0, 1)
         wm_pos = self.model.wm_decoder_pos_embed.weight[:T].unsqueeze(1)
         S = self.model.n_encoder_tokens
-        queries = self.model.wm_query_tokens.expand(-1, batch_size, -1)
+        query_pos = self.model.wm_query_pos_embed.weight.unsqueeze(1)
+        queries = (self.model.wm_query_tokens + query_pos).expand(-1, batch_size, -1)
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)
         wm_out = self.model.wm_decoder(wm_in, cross_kv, cross_pos, None)
         z_pred = self.model.wm_proj_head(wm_out[:S])
@@ -409,6 +410,10 @@ class AWM(nn.Module):
         self.bos_embed = nn.Embedding(1, config.dim_model)
         # Embed the previous step's discrete token as the decoder input for the next step.
         self.token_embed = nn.Embedding(total_V, config.dim_model)
+        # Separate embedding table for WM action conditioning — prevents competing gradients with
+        # the action decoder's token_embed (which needs discriminative per-token representations
+        # while the WM needs compositional sequence representations).
+        self.wm_token_embed = nn.Embedding(total_V, config.dim_model)
 
         # ------------------------------------------------------------------
         # Decoder positional embeddings (used during AR inference)
@@ -436,6 +441,9 @@ class AWM(nn.Module):
         self.n_encoder_tokens = n_enc
         self.wm_query_tokens = nn.Parameter(torch.zeros(n_enc, 1, config.dim_model))
         nn.init.trunc_normal_(self.wm_query_tokens, std=0.02)
+        # Positional embeddings for WM query tokens — gives each query a unique spatial identity
+        # so the WM can learn query[s] → predict encoder token s without positional ambiguity.
+        self.wm_query_pos_embed = nn.Embedding(n_enc, config.dim_model)
         if config.image_features:
             stride = 16 if config.replace_final_stride_with_dilation else 32
             C, H, W = next(iter(config.image_features.values())).shape
@@ -469,6 +477,7 @@ class AWM(nn.Module):
             self.wm_proj_head.parameters(),
             self.cross_attn_proj.parameters(),
             self.cross_attn_pos_proj.parameters(),
+            self.wm_query_pos_embed.parameters(),
         ]
         if hasattr(self, "wm_image_decoder"):
             modules.append(self.wm_image_decoder.parameters())
@@ -578,9 +587,12 @@ class AWM(nn.Module):
 
         # WM decoder input: [S query tokens, T action tokens].
         # Query tokens attend to the action sequence to predict the next-state encoder outputs.
-        action_embeds = self.token_embed(token_ids).transpose(0, 1)          # (T, B, dim_model)
+        # wm_token_embed is separate from token_embed to avoid gradient conflicts with the action decoder.
+        action_embeds = self.wm_token_embed(token_ids).transpose(0, 1)       # (T, B, dim_model)
         wm_pos = self.wm_decoder_pos_embed.weight[:T].unsqueeze(1)           # (T, 1, dim_model)
-        queries = self.wm_query_tokens.expand(-1, batch_size, -1)            # (S, B, dim_model)
+        # wm_query_pos_embed gives each query a unique spatial identity, preventing positional ambiguity.
+        query_pos = self.wm_query_pos_embed.weight.unsqueeze(1)              # (S, 1, dim_model)
+        queries = (self.wm_query_tokens + query_pos).expand(-1, batch_size, -1)  # (S, B, dim_model)
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)          # (S+T, B, dim_model)
 
         # Non-causal (bidirectional) self-attention: causal_mask=None.
