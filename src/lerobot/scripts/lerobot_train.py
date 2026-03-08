@@ -59,9 +59,9 @@ from lerobot.utils.utils import (
 def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
     """Log world model image reconstruction pairs if the policy supports it.
 
-    Saves a PNG grid locally (GT images on top row, decoded on bottom) and
-    optionally logs to wandb. No-op when the policy has no ``visualize`` method
-    or when image features are not configured.
+    Saves a PNG grid locally with 2 rows (current obs on top, future obs on bottom).
+    Each cell is GT (left half) | decoded (right half) side-by-side for easy comparison.
+    No-op when the policy has no ``visualize`` method or image features are not configured.
     """
     if not hasattr(policy, "visualize"):
         return
@@ -70,12 +70,13 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
     if viz is None:
         return
 
-    # Save locally as a side-by-side grid (GT on top, decoded on bottom).
+    # Save locally: 2 rows — current obs pairs (top), future obs pairs (bottom).
     vis_dir = Path(output_dir) / "wm_viz"
     vis_dir.mkdir(exist_ok=True)
+    n = len(viz["curr"])
     grid = torchvision.utils.make_grid(
-        torch.cat([viz["ground_truth"], viz["decoded"]], dim=0),
-        nrow=len(viz["ground_truth"]),
+        torch.cat([viz["curr"], viz["next"]], dim=0),
+        nrow=n,
     )
     torchvision.utils.save_image(grid, vis_dir / f"step_{step:06d}.png")
 

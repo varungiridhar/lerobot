@@ -118,6 +118,8 @@ class AWMConfig(PreTrainedConfig):
     n_wm_decoder_layers: int = 4      # Number of layers in the world model decoder
     decoder_loss_weight: float = 0.1  # Weight on image reconstruction loss (detached from main model)
     n_image_viz_pairs: int = 12       # Number of GT/decoded image pairs to log at each log step
+    wm_target_encoder_input: bool = False  # If True, target the encoder *input* tokens (pre-transformer)
+                                           # instead of encoder output tokens (post-transformer).
 
     # Training preset
     optimizer_lr: float = 2e-4
