@@ -17,10 +17,12 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
 import torch
+import torchvision
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -52,6 +54,33 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
+
+
+def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
+    """Log world model image reconstruction pairs if the policy supports it.
+
+    Saves a PNG grid locally (GT images on top row, decoded on bottom) and
+    optionally logs to wandb. No-op when the policy has no ``visualize`` method
+    or when image features are not configured.
+    """
+    if not hasattr(policy, "visualize"):
+        return
+    n_pairs = getattr(policy.config, "n_image_viz_pairs", 12)
+    viz = policy.visualize(batch, n_pairs=n_pairs)
+    if viz is None:
+        return
+
+    # Save locally as a side-by-side grid (GT on top, decoded on bottom).
+    vis_dir = Path(output_dir) / "wm_viz"
+    vis_dir.mkdir(exist_ok=True)
+    grid = torchvision.utils.make_grid(
+        torch.cat([viz["ground_truth"], viz["decoded"]], dim=0),
+        nrow=len(viz["ground_truth"]),
+    )
+    torchvision.utils.save_image(grid, vis_dir / f"step_{step:06d}.png")
+
+    if wandb_logger is not None:
+        wandb_logger.log_images(viz, step)
 
 
 def update_policy(
@@ -207,7 +236,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Use accelerator's device
     device = accelerator.device
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
+    # settings below are for determinism experiments
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
@@ -437,6 +469,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if is_eval_step and is_main_process:
+            # Log WM image reconstructions at eval frequency (no-op for non-AWM policies or state-only configs).
+            _log_wm_visualizations(
+                accelerator.unwrap_model(policy), batch, step, cfg.output_dir, wandb_logger
+            )
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
