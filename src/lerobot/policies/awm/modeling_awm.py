@@ -286,8 +286,8 @@ class AWMPolicy(PreTrainedPolicy):
         n_1d = self.model.n_1d_tokens
         s_img = self.model.img_tokens_per_cam
 
-        # Encode current obs — used for both cross-attention and current decoded image.
-        batch_size, curr_encoder_out, cross_kv, cross_pos, curr_encoder_in = self.model._encode(curr_batch)
+        # Encode current obs — used for cross-attention and current decoded image.
+        batch_size, cross_kv, cross_pos, curr_encoder_in = self.model._encode(curr_batch)
 
         # Current observation: decode from pre-transformer encoder input tokens (same signal
         # used for decoder training), not encoder output (post-attention mixed tokens).
@@ -489,12 +489,11 @@ class AWM(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _encode(self, batch: dict[str, Tensor]) -> tuple[int, Tensor, Tensor, Tensor, Tensor]:
+    def _encode(self, batch: dict[str, Tensor]) -> tuple[int, Tensor, Tensor, Tensor]:
         """Run the encoder and project its output for decoder cross-attention.
 
         Returns:
             batch_size:    int
-            encoder_out:   (S, B, dim_model)  — transformer encoder output
             cross_kv:      (S, B, cross_attn_dim)  — keys/values for cross-attention
             cross_pos:     (S, 1, cross_attn_dim)  — positional bias added to cross-attn keys
             encoder_in:    (S, B, dim_model)  — projected input tokens (pre-transformer)
@@ -534,7 +533,7 @@ class AWM(nn.Module):
         cross_kv = self.cross_attn_proj(encoder_out)            # (S, B, cross_attn_dim)
         cross_pos = self.cross_attn_pos_proj(encoder_in_pos_embed)  # (S, 1, cross_attn_dim)
 
-        return batch_size, encoder_out, cross_kv, cross_pos, encoder_in_tokens
+        return batch_size, cross_kv, cross_pos, encoder_in_tokens
 
     # ------------------------------------------------------------------
     # Forward passes
@@ -557,7 +556,7 @@ class AWM(nn.Module):
             token_ids:  ``(B, T)`` — ground-truth joint token indices (for cross-entropy).
             wm_tensors: ``(z_pred, z_target)`` pair or ``None`` if no next_batch.
         """
-        batch_size, encoder_out, cross_kv, cross_pos, encoder_in = self._encode(batch)
+        batch_size, cross_kv, cross_pos, encoder_in = self._encode(batch)
 
         actions = batch[ACTION]  # (B, T, action_dim)
         T = actions.shape[1]
@@ -580,10 +579,9 @@ class AWM(nn.Module):
         # ------------------------------------------------------------------
         # World model forward — only during training (next_batch provided).
         # ------------------------------------------------------------------
-        # Target: encoder output or input tokens of the next observation (stop-gradient).
-        _, next_encoder_out, _, _, next_encoder_in = self._encode(next_batch)
-        next_target = next_encoder_in if self.config.wm_target_encoder_input else next_encoder_out
-        z_target = next_target.detach()  # (S, B, dim_model)
+        # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
+        _, _, _, next_encoder_in = self._encode(next_batch)
+        z_target = next_encoder_in.detach()  # (S, B, dim_model)
 
         # WM decoder input: [S query tokens, T action tokens].
         # Query tokens attend to the action sequence to predict the next-state encoder outputs.
@@ -624,7 +622,7 @@ class AWM(nn.Module):
         Returns:
             ``(B, chunk_size, action_dim)`` continuous action chunk.
         """
-        batch_size, _, cross_kv, cross_pos, _ = self._encode(batch)
+        batch_size, cross_kv, cross_pos, _ = self._encode(batch)
 
         decoder_seq = self.bos_embed.weight.unsqueeze(1).expand(1, batch_size, -1).contiguous()
 
