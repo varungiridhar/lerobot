@@ -206,12 +206,6 @@ class AWMPolicy(PreTrainedPolicy):
             "observation.state_is_pad",
             batch.get("observation.environment_state_is_pad"),
         )
-        if next_obs_is_pad is not None:
-            next_obs_is_pad = next_obs_is_pad[:, 1]  # (B,) bool
-        else:
-            next_obs_is_pad = torch.zeros(
-                batch["action"].shape[0], dtype=torch.bool, device=batch["action"].device
-            )
 
         logits, token_ids, wm_tensors = self.model(curr_batch, next_batch)
         # logits:    (B, T, total_vocab_size)
@@ -231,7 +225,7 @@ class AWMPolicy(PreTrainedPolicy):
 
         # World model cosine similarity loss — masked at episode boundaries.
         z_pred, z_target, decoded_curr, gt_curr_img = wm_tensors
-        valid_wm = ~next_obs_is_pad  # (B,)
+        valid_wm = ~next_obs_is_pad[:, 1]  # (B,)
         cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)  # mean over S → (B,)
         wm_loss = 1 - (cos_sim * valid_wm).sum() / valid_wm.sum().clamp(min=1)
 
@@ -304,7 +298,8 @@ class AWMPolicy(PreTrainedPolicy):
         query_pos = self.model.wm_query_pos_embed.weight.unsqueeze(1)
         queries = (self.model.wm_query_tokens + query_pos).expand(-1, batch_size, -1)
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)
-        wm_out = self.model.wm_decoder(wm_in, cross_kv, cross_pos, None)
+        wm_cross_kv = self.model.wm_cross_attn_proj(curr_encoder_in)
+        wm_out = self.model.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)
         z_pred = self.model.wm_proj_head(wm_out[:S])
 
         # Future observation: decode from WM predicted tokens.
@@ -403,6 +398,13 @@ class AWM(nn.Module):
             nn.Linear(config.cross_attn_dim, config.cross_attn_dim),
         )
         self.cross_attn_pos_proj = nn.Linear(config.dim_model, config.cross_attn_dim)
+        # Separate projection for WM decoder cross-attention — operates on encoder INPUT tokens
+        # (pre-transformer) to match the representation the WM is trained to predict.
+        self.wm_cross_attn_proj = nn.Sequential(
+            nn.Linear(config.dim_model, config.cross_attn_dim),
+            nn.ReLU(),
+            nn.Linear(config.cross_attn_dim, config.cross_attn_dim),
+        )
 
         # ------------------------------------------------------------------
         # Decoder inputs: BOS token + discrete token embedding table
@@ -477,6 +479,7 @@ class AWM(nn.Module):
             self.wm_proj_head.parameters(),
             self.cross_attn_proj.parameters(),
             self.cross_attn_pos_proj.parameters(),
+            self.wm_cross_attn_proj.parameters(),
             self.wm_query_pos_embed.parameters(),
         ]
         if hasattr(self, "wm_image_decoder"):
@@ -594,8 +597,10 @@ class AWM(nn.Module):
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)          # (S+T, B, dim_model)
 
         # Non-causal (bidirectional) self-attention: causal_mask=None.
+        # WM cross-attends to encoder INPUT tokens (pre-transformer) — same space as the target.
         S = self.n_encoder_tokens
-        wm_out = self.wm_decoder(wm_in, cross_kv, cross_pos, None)           # (S+T, B, dim_model)
+        wm_cross_kv = self.wm_cross_attn_proj(encoder_in)                    # (S, B, cross_attn_dim)
+        wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)        # (S+T, B, dim_model)
         z_pred = self.wm_proj_head(wm_out[:S])                               # (S, B, dim_model)
 
         # Image decoder — trained on pre-transformer encoder input tokens (direct ResNet spatial
