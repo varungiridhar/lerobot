@@ -115,6 +115,13 @@ class AWMConfig(PreTrainedConfig):
 
     # World model
     wm_loss_weight: float = 0.2       # Weight on world model loss relative to action prediction loss
+    detach_encoder_from_wm: bool = False  # Detach encoder outputs before WM cross-attention
+    use_normalized_mse_wm_loss: bool = False  # Replace cosine WM loss with normalized-MSE + variance regularization
+    wm_variance_loss_weight: float = 0.1  # Weight on VICReg-style variance regularization when normalized MSE loss is enabled
+    use_ema_target: bool = False      # Use an EMA copy of the encoder to compute z_target
+    ema_momentum: float = 0.996       # EMA decay coefficient (higher = slower target evolution)
+    ema_momentum_end: float = 0.999   # Final EMA momentum after annealing
+    ema_anneal_steps: int = 50_000    # Steps over which to anneal EMA momentum
     n_wm_decoder_layers: int = 4      # Number of layers in the world model decoder
     decoder_loss_weight: float = 0.1  # Weight on image reconstruction loss (detached from main model)
     n_image_viz_pairs: int = 12       # Number of GT/decoded image pairs to log at each log step

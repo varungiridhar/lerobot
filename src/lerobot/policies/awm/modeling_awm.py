@@ -29,7 +29,7 @@ Optional:
 """
 
 from collections import deque
-from copy import copy
+from copy import copy, deepcopy
 from itertools import chain
 
 import einops
@@ -124,6 +124,41 @@ def _slice_obs_batch(batch: dict[str, Tensor], idx: int) -> dict[str, Tensor]:
     return result
 
 
+def _compute_wm_loss(
+    z_pred: Tensor,
+    z_target: Tensor,
+    valid_wm: Tensor,
+    config: AWMConfig,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Compute the configured world-model loss and auxiliary metrics."""
+    valid_wm_f = valid_wm.to(dtype=z_pred.dtype)
+    valid_count = valid_wm_f.sum()
+
+    if config.use_normalized_mse_wm_loss:
+        z_pred_norm = F.normalize(z_pred, dim=-1)
+        z_target_norm = F.normalize(z_target, dim=-1)
+
+        mse_per_batch = F.mse_loss(z_pred_norm, z_target_norm, reduction="none").mean(dim=(0, 2))
+        wm_reconstruction_loss = (mse_per_batch * valid_wm_f).sum() / valid_count.clamp(min=1.0)
+
+        if valid_wm.sum() > 1:
+            std_pred = z_pred_norm[:, valid_wm, :].std(dim=1, correction=0)
+            wm_variance_loss = F.relu(1.0 - std_pred).mean()
+        else:
+            wm_variance_loss = z_pred.new_zeros(())
+
+        wm_loss = wm_reconstruction_loss + config.wm_variance_loss_weight * wm_variance_loss
+        metrics = {
+            "wm_reconstruction_loss": wm_reconstruction_loss,
+            "wm_variance_loss": wm_variance_loss,
+        }
+        return wm_loss, metrics
+
+    cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)
+    wm_loss = 1 - (cos_sim * valid_wm_f).sum() / valid_count.clamp(min=1.0)
+    return wm_loss, {}
+
+
 class AWMPolicy(PreTrainedPolicy):
     """AWM: Autoregressive Action Chunking Transformer with discrete token prediction.
 
@@ -141,6 +176,8 @@ class AWMPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = AWM(config)
+        self._ema_step = 0
+        self._pending_ema_momentum = None
 
         self.reset()
 
@@ -166,6 +203,12 @@ class AWMPolicy(PreTrainedPolicy):
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def update(self):
+        if self._pending_ema_momentum is not None:
+            self.model.update_ema(self._pending_ema_momentum)
+            self._ema_step += 1
+            self._pending_ema_momentum = None
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -223,17 +266,19 @@ class AWMPolicy(PreTrainedPolicy):
         valid = ~curr_batch["action_is_pad"].reshape(-1)  # (B*T,)
         action_loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
 
-        # World model cosine similarity loss — masked at episode boundaries.
+        # World model loss — masked at episode boundaries.
         z_pred, z_target, decoded_curr, gt_curr_img = wm_tensors
         valid_wm = ~next_obs_is_pad[:, 1]  # (B,)
-        cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)  # mean over S → (B,)
-        wm_loss = 1 - (cos_sim * valid_wm).sum() / valid_wm.sum().clamp(min=1)
+        wm_loss, wm_metrics = _compute_wm_loss(z_pred, z_target, valid_wm, self.config)
 
         loss = action_loss + self.config.wm_loss_weight * wm_loss
         info = {
             "action_loss": action_loss.item(),
             "wm_loss": wm_loss.item(),
+            "z_target_norm": z_target.norm(dim=-1).mean().item(),
+            "z_pred_norm": z_pred.norm(dim=-1).mean().item(),
         }
+        info.update({key: value.item() for key, value in wm_metrics.items()})
 
         # Image reconstruction loss on current obs — MSE in normalised pixel space.
         # Decoder is trained on current encoder tokens (stable signal). The decoder is used
@@ -242,6 +287,14 @@ class AWMPolicy(PreTrainedPolicy):
             decoder_loss = F.mse_loss(decoded_curr, gt_curr_img)
             loss = loss + self.config.decoder_loss_weight * decoder_loss
             info["decoder_loss"] = decoder_loss.item()
+
+        if self.config.use_ema_target and self.training:
+            t = min(self._ema_step / max(self.config.ema_anneal_steps, 1), 1.0)
+            momentum = self.config.ema_momentum + t * (
+                self.config.ema_momentum_end - self.config.ema_momentum
+            )
+            self._pending_ema_momentum = momentum
+            info["ema_momentum"] = momentum
 
         info["loss"] = loss.item()
         return loss, info
@@ -298,9 +351,15 @@ class AWMPolicy(PreTrainedPolicy):
         query_pos = self.model.wm_query_pos_embed.weight.unsqueeze(1)
         queries = (self.model.wm_query_tokens + query_pos).expand(-1, batch_size, -1)
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)
-        wm_cross_kv = self.model.wm_cross_attn_proj(curr_encoder_in)
+        wm_encoder_in = curr_encoder_in.detach() if self.config.detach_encoder_from_wm else curr_encoder_in
+        wm_cross_kv = self.model.wm_cross_attn_proj(wm_encoder_in)
         wm_out = self.model.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)
         z_pred = self.model.wm_proj_head(wm_out[:S])
+
+        if self.config.use_ema_target:
+            _ = self.model._encode_ema(next_batch)
+        else:
+            _, _, _, _ = self.model._encode(next_batch)
 
         # Future observation: decode from WM predicted tokens.
         next_img_z = z_pred[n_1d : n_1d + s_img]                    # (S_img, N, D)
@@ -470,6 +529,15 @@ class AWM(nn.Module):
 
         self._reset_parameters()
 
+        if config.use_ema_target:
+            self._build_ema_encoder()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.config.use_ema_target:
+            self._set_ema_eval_mode()
+        return self
+
     def _reset_parameters(self):
         """Xavier-uniform initialisation for transformer and projection weights."""
         modules = [
@@ -487,6 +555,32 @@ class AWM(nn.Module):
         for p in chain(*modules):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _build_ema_encoder(self):
+        """Create EMA copies of encoder-side modules used to build WM targets."""
+        if hasattr(self, "backbone"):
+            self.ema_backbone = deepcopy(self.backbone)
+        self.ema_encoder = deepcopy(self.encoder)
+        if hasattr(self, "encoder_robot_state_input_proj"):
+            self.ema_encoder_robot_state_input_proj = deepcopy(self.encoder_robot_state_input_proj)
+        if hasattr(self, "encoder_env_state_input_proj"):
+            self.ema_encoder_env_state_input_proj = deepcopy(self.encoder_env_state_input_proj)
+        if hasattr(self, "encoder_img_feat_input_proj"):
+            self.ema_encoder_img_feat_input_proj = deepcopy(self.encoder_img_feat_input_proj)
+        self.ema_encoder_1d_feature_pos_embed = deepcopy(self.encoder_1d_feature_pos_embed)
+        if hasattr(self, "encoder_cam_feat_pos_embed"):
+            self.ema_encoder_cam_feat_pos_embed = deepcopy(self.encoder_cam_feat_pos_embed)
+
+        for name, param in self.named_parameters():
+            if name.startswith("ema_"):
+                param.requires_grad = False
+
+        self._set_ema_eval_mode()
+
+    def _set_ema_eval_mode(self):
+        for name, module in self.named_children():
+            if name.startswith("ema_"):
+                module.eval()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -538,6 +632,89 @@ class AWM(nn.Module):
 
         return batch_size, cross_kv, cross_pos, encoder_in_tokens
 
+    @torch.no_grad()
+    def _encode_ema(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode observations with EMA modules and return pre-transformer encoder tokens."""
+        if OBS_IMAGES in batch:
+            encoder_in_tokens: list[Tensor] = []
+        elif OBS_ENV_STATE in batch:
+            encoder_in_tokens = []
+        else:
+            encoder_in_tokens = []
+
+        encoder_in_pos_embed: list[Tensor] = list(self.ema_encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+
+        if self.config.robot_state_feature:
+            encoder_in_tokens.append(self.ema_encoder_robot_state_input_proj(batch[OBS_STATE]))
+        if self.config.env_state_feature:
+            encoder_in_tokens.append(self.ema_encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+        if self.config.image_features:
+            for img in batch[OBS_IMAGES]:
+                cam_features = self.ema_backbone(img)["feature_map"]
+                cam_pos_embed = self.ema_encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                cam_features = self.ema_encoder_img_feat_input_proj(cam_features)
+
+                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                encoder_in_tokens.extend(list(cam_features))
+                encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, dim=0)
+
+        _ = self.ema_encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+        return encoder_in_tokens
+
+    @torch.no_grad()
+    def update_ema(self, momentum: float):
+        """Update EMA encoder parameters from the online encoder."""
+        if not self.config.use_ema_target:
+            return
+
+        ema_pairs = []
+        if hasattr(self, "ema_backbone"):
+            ema_pairs.extend(zip(self.backbone.parameters(), self.ema_backbone.parameters()))
+        ema_pairs.extend(zip(self.encoder.parameters(), self.ema_encoder.parameters()))
+        if hasattr(self, "ema_encoder_robot_state_input_proj"):
+            ema_pairs.extend(
+                zip(
+                    self.encoder_robot_state_input_proj.parameters(),
+                    self.ema_encoder_robot_state_input_proj.parameters(),
+                )
+            )
+        if hasattr(self, "ema_encoder_env_state_input_proj"):
+            ema_pairs.extend(
+                zip(
+                    self.encoder_env_state_input_proj.parameters(),
+                    self.ema_encoder_env_state_input_proj.parameters(),
+                )
+            )
+        if hasattr(self, "ema_encoder_img_feat_input_proj"):
+            ema_pairs.extend(
+                zip(
+                    self.encoder_img_feat_input_proj.parameters(),
+                    self.ema_encoder_img_feat_input_proj.parameters(),
+                )
+            )
+        ema_pairs.extend(
+            zip(
+                self.encoder_1d_feature_pos_embed.parameters(),
+                self.ema_encoder_1d_feature_pos_embed.parameters(),
+            )
+        )
+        if hasattr(self, "ema_encoder_cam_feat_pos_embed"):
+            ema_pairs.extend(
+                zip(
+                    self.encoder_cam_feat_pos_embed.parameters(),
+                    self.ema_encoder_cam_feat_pos_embed.parameters(),
+                )
+            )
+
+        for online_p, ema_p in ema_pairs:
+            ema_p.data.mul_(momentum).add_(online_p.data, alpha=1.0 - momentum)
+
     # ------------------------------------------------------------------
     # Forward passes
     # ------------------------------------------------------------------
@@ -583,8 +760,11 @@ class AWM(nn.Module):
         # World model forward — only during training (next_batch provided).
         # ------------------------------------------------------------------
         # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
-        _, _, _, next_encoder_in = self._encode(next_batch)
-        z_target = next_encoder_in.detach()  # (S, B, dim_model)
+        if self.config.use_ema_target:
+            z_target = self._encode_ema(next_batch)
+        else:
+            _, _, _, next_encoder_in = self._encode(next_batch)
+            z_target = next_encoder_in.detach()  # (S, B, dim_model)
 
         # WM decoder input: [S query tokens, T action tokens].
         # Query tokens attend to the action sequence to predict the next-state encoder outputs.
@@ -599,7 +779,8 @@ class AWM(nn.Module):
         # Non-causal (bidirectional) self-attention: causal_mask=None.
         # WM cross-attends to encoder INPUT tokens (pre-transformer) — same space as the target.
         S = self.n_encoder_tokens
-        wm_cross_kv = self.wm_cross_attn_proj(encoder_in)                    # (S, B, cross_attn_dim)
+        wm_encoder_in = encoder_in.detach() if self.config.detach_encoder_from_wm else encoder_in
+        wm_cross_kv = self.wm_cross_attn_proj(wm_encoder_in)                 # (S, B, cross_attn_dim)
         wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)        # (S+T, B, dim_model)
         z_pred = self.wm_proj_head(wm_out[:S])                               # (S, B, dim_model)
 
