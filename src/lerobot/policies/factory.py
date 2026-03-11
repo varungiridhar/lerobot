@@ -32,6 +32,7 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act_simple.configuration_act_simple import ACTSimpleConfig
 from lerobot.policies.awm.configuration_awm import AWMConfig
+from lerobot.policies.awm_diffusion.configuration_awm_diffusion import AWMDiffusionConfig
 from lerobot.policies.act_awm.configuration_act_awm import ACTAWMConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
@@ -94,6 +95,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.act_awm.modeling_act_awm import ACTAWMPolicy
 
         return ACTAWMPolicy
+    elif name == "awm_diffusion":
+        from lerobot.policies.awm_diffusion.modeling_awm_diffusion import AWMDiffusionPolicy
+
+        return AWMDiffusionPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -172,6 +177,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "act_awm":
         return ACTAWMConfig(**kwargs)
+    elif policy_type =="awm_diffusion":
+        return AWMDiffusionConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
@@ -336,6 +343,14 @@ def make_pre_post_processors(
 
 
     elif isinstance(policy_cfg, ACTAWMConfig):
+        from lerobot.policies.act_awm.processor_act_awm import make_act_awm_pre_post_processors
+
+        processors = make_act_awm_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+    
+    elif isinstance(policy_cfg, AWMDiffusionConfig):
         from lerobot.policies.act_awm.processor_act_awm import make_act_awm_pre_post_processors
 
         processors = make_act_awm_pre_post_processors(
