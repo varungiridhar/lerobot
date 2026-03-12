@@ -125,7 +125,10 @@ class AWMDiffusionConfig(PreTrainedConfig):
     wm_diffusion_timesteps: int = 20  # Number of DDPM steps in latent-space WM diffusion
     wm_diffusion_beta_start: float = 1e-4
     wm_diffusion_beta_end: float = 2e-2
-    wm_diffusion_hidden_dim: int = 512  # Channel width of latent U-Net denoiser
+    wm_diffusion_hidden_dim: int = 512  # Hidden width of the latent DiT denoiser
+    wm_diffusion_n_heads: int = 8
+    wm_diffusion_dit_depth: int = 6
+    wm_diffusion_dit_mlp_ratio: float = 3.0
 
     # Training preset
     optimizer_lr: float = 2e-4
@@ -172,6 +175,19 @@ class AWMDiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`wm_diffusion_beta_start` must be < `wm_diffusion_beta_end`. Got "
                 f"{self.wm_diffusion_beta_start} >= {self.wm_diffusion_beta_end}."
+            )
+        if self.wm_diffusion_hidden_dim % self.wm_diffusion_n_heads != 0:
+            raise ValueError(
+                f"`wm_diffusion_hidden_dim` must be divisible by `wm_diffusion_n_heads`. Got "
+                f"{self.wm_diffusion_hidden_dim} and {self.wm_diffusion_n_heads}."
+            )
+        if self.wm_diffusion_dit_depth <= 0:
+            raise ValueError(
+                f"`wm_diffusion_dit_depth` must be > 0. Got {self.wm_diffusion_dit_depth}."
+            )
+        if self.wm_diffusion_dit_mlp_ratio <= 0:
+            raise ValueError(
+                f"`wm_diffusion_dit_mlp_ratio` must be > 0. Got {self.wm_diffusion_dit_mlp_ratio}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:

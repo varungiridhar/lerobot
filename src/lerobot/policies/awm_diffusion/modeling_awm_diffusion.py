@@ -51,13 +51,6 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
-def _group_count(channels: int) -> int:
-    for groups in (32, 16, 8, 4, 2, 1):
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
 def _extract_per_batch(buffer: Tensor, t: Tensor) -> Tensor:
     # Shapes:
     #   buffer: (n_timesteps,)
@@ -84,27 +77,55 @@ class SinusoidalTimeEmbedding(nn.Module):
         return emb
 
 
-class ResBlock1D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, t_dim: int):
+def _sequence_sincos_pos_embed(seq_len: int, dim: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+    half = dim // 2
+    freq = torch.exp(
+        torch.arange(half, device=device, dtype=torch.float32)
+        * (-torch.log(torch.tensor(10000.0, device=device)) / max(half - 1, 1))
+    )
+    args = pos.unsqueeze(1) * freq.unsqueeze(0)
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb.unsqueeze(1).to(dtype=dtype)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, hidden_dim: int, n_heads: int, mlp_ratio: float, dropout: float):
         super().__init__()
-        self.norm1 = nn.GroupNorm(_group_count(in_ch), in_ch)
-        self.norm2 = nn.GroupNorm(_group_count(out_ch), out_ch)
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.time_proj = nn.Linear(t_dim, out_ch)
-        self.skip = nn.Conv1d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        mlp_dim = int(hidden_dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, hidden_dim),
+        )
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, t_emb: Tensor) -> Tensor:
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.time_proj(t_emb).unsqueeze(-1)
-        h = self.conv2(F.silu(self.norm2(h)))
-        return h + self.skip(x)
+    def forward(self, x: Tensor) -> Tensor:
+        attn_in = self.norm1(x)
+        x = x + self.dropout1(self.attn(attn_in, attn_in, attn_in, need_weights=False)[0])
+        x = x + self.dropout2(self.mlp(self.norm2(x)))
+        return x
 
 
-class WMConditionedLatentUNet(nn.Module):
-    """1D U-Net denoiser over latent token sequences in (S, B, dim_model) space."""
+class WMConditionedLatentDiT(nn.Module):
+    """Lightweight DiT-style denoiser over latent token sequences in (S, B, dim_model) space."""
 
-    def __init__(self, dim_model: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim_model: int,
+        hidden_dim: int,
+        n_heads: int,
+        depth: int,
+        mlp_ratio: float,
+        dropout: float,
+    ):
         super().__init__()
         t_dim = hidden_dim
         self.time_embed = SinusoidalTimeEmbedding(t_dim)
@@ -113,35 +134,24 @@ class WMConditionedLatentUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(t_dim, t_dim),
         )
-
-        self.in_proj = nn.Conv1d(2 * dim_model, hidden_dim, kernel_size=3, padding=1)
-        self.down1 = ResBlock1D(hidden_dim, hidden_dim, t_dim)
-        self.downsample = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1)
-        self.down2 = ResBlock1D(hidden_dim, hidden_dim * 2, t_dim)
-        self.mid = ResBlock1D(hidden_dim * 2, hidden_dim * 2, t_dim)
-        self.upsample = nn.ConvTranspose1d(hidden_dim * 2, hidden_dim, kernel_size=4, stride=2, padding=1)
-        self.up = ResBlock1D(hidden_dim * 2, hidden_dim, t_dim)
-        self.out_proj = nn.Conv1d(hidden_dim, dim_model, kernel_size=3, padding=1)
+        self.in_proj = nn.Linear(2 * dim_model, hidden_dim)
+        self.time_proj = nn.Linear(t_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            [DiTBlock(hidden_dim, n_heads, mlp_ratio, dropout) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, dim_model)
 
     def forward(self, z_noisy: Tensor, cond_tokens: Tensor, t: Tensor) -> Tensor:
         # z_noisy / cond_tokens: (S, B, D)
-        x = z_noisy.permute(1, 2, 0)      # (B, D, S)
-        cond = cond_tokens.permute(1, 2, 0)
+        x = torch.cat([z_noisy, cond_tokens], dim=-1)  # (S, B, 2D)
         t_emb = self.time_mlp(self.time_embed(t))  # (B, t_dim)
-
-        h0 = self.in_proj(torch.cat([x, cond], dim=1))
-        h1 = self.down1(h0, t_emb)
-        h2 = self.downsample(h1)
-        h2 = self.down2(h2, t_emb)
-        hmid = self.mid(h2, t_emb)
-
-        hu = self.upsample(hmid)
-        if hu.shape[-1] != h1.shape[-1]:
-            hu = F.interpolate(hu, size=h1.shape[-1], mode="linear", align_corners=False)
-        hu = torch.cat([hu, h1], dim=1)
-        hu = self.up(hu, t_emb)
-        out = self.out_proj(hu)
-        return out.permute(2, 0, 1)  # (S, B, D)
+        x = self.in_proj(x)
+        x = x + self.time_proj(t_emb).unsqueeze(0)
+        x = x + _sequence_sincos_pos_embed(x.shape[0], x.shape[-1], x.device, x.dtype)
+        for block in self.blocks:
+            x = block(x)
+        return self.out_proj(self.norm(x))  # (S, B, D)
 
 
 class WMImageDecoder(nn.Module):
@@ -557,7 +567,14 @@ class AWM(nn.Module):
             self.img_tokens_per_cam = (H // stride) * (W // stride)
 
         # 2-layer MLP projection head: maps each query output → predicted next-state latent token.
-        self.wm_diffusion_unet = WMConditionedLatentUNet(config.dim_model, config.wm_diffusion_hidden_dim)
+        self.wm_diffusion_denoiser = WMConditionedLatentDiT(
+            dim_model=config.dim_model,
+            hidden_dim=config.wm_diffusion_hidden_dim,
+            n_heads=config.wm_diffusion_n_heads,
+            depth=config.wm_diffusion_dit_depth,
+            mlp_ratio=config.wm_diffusion_dit_mlp_ratio,
+            dropout=config.dropout,
+        )
 
         self.n_diffusion_steps = config.wm_diffusion_timesteps
         betas = torch.linspace(
@@ -607,7 +624,7 @@ class AWM(nn.Module):
             self.encoder.parameters(),
             self.decoder.parameters(),
             self.wm_decoder.parameters(),
-            self.wm_diffusion_unet.parameters(),
+            self.wm_diffusion_denoiser.parameters(),
             self.cross_attn_proj.parameters(),
             self.cross_attn_pos_proj.parameters(),
             self.wm_cross_attn_proj.parameters(),
@@ -803,7 +820,7 @@ class AWM(nn.Module):
 
         for step in reversed(range(self.n_diffusion_steps)):
             t = torch.full((batch_size,), step, device=z_t.device, dtype=torch.long)
-            noise_pred = self.wm_diffusion_unet(z_t, wm_cond, t)
+            noise_pred = self.wm_diffusion_denoiser(z_t, wm_cond, t)
 
             beta_t = _extract_per_batch(self.diff_betas, t)
             sqrt_one_minus_alpha_bar_t = _extract_per_batch(self.diff_sqrt_one_minus_alphas_cumprod, t)
@@ -875,7 +892,7 @@ class AWM(nn.Module):
         t = torch.randint(0, self.n_diffusion_steps, (batch_size,), device=encoder_in.device, dtype=torch.long)
         noise = torch.randn_like(z_target)
         z_noisy = self._q_sample(z_target, t, noise)
-        noise_pred = self.wm_diffusion_unet(z_noisy, wm_cond, t)
+        noise_pred = self.wm_diffusion_denoiser(z_noisy, wm_cond, t)
         z_pred = self._predict_z0(z_noisy, t, noise_pred)                    # (S, B, dim_model)
 
         wm_diffusion_loss_per_sample = ((noise_pred - noise) ** 2).mean(dim=(0, 2))    # (B,)
