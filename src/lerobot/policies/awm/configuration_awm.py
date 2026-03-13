@@ -115,7 +115,9 @@ class AWMConfig(PreTrainedConfig):
 
     # World model
     wm_loss_weight: float = 0.2       # Weight on world model loss relative to action prediction loss
+    wm_warmup_steps: int = 0          # Number of steps to linearly ramp wm_loss_weight from 0 to target
     detach_encoder_from_wm: bool = False  # Detach encoder outputs before WM cross-attention
+    normalize_wm_representations: bool = False  # L2-normalize z_pred and z_target to unit sphere before WM loss and image decoding.
     use_normalized_mse_wm_loss: bool = False  # Replace cosine WM loss with normalized-MSE + variance regularization
     wm_variance_loss_weight: float = 0.1  # Weight on VICReg-style variance regularization when normalized MSE loss is enabled
     use_ema_target: bool = False      # Use an EMA copy of the encoder to compute z_target
