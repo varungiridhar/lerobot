@@ -159,6 +159,27 @@ def _compute_wm_loss(
     return wm_loss, {}
 
 
+def _compute_image_reconstruction_metrics(
+    pred: Tensor,
+    target: Tensor,
+    prefix: str,
+    valid_mask: Tensor | None = None,
+) -> dict[str, float]:
+    """Compute scalar image reconstruction metrics in normalized pixel space."""
+    if valid_mask is not None:
+        if not valid_mask.any():
+            return {}
+        pred = pred[valid_mask]
+        target = target[valid_mask]
+
+    mse = F.mse_loss(pred, target)
+    psnr = -10.0 * torch.log10(mse.clamp(min=1e-8))
+    return {
+        f"{prefix}/mse": float(mse.item()),
+        f"{prefix}/psnr": float(psnr.item()),
+    }
+
+
 class AWMPolicy(PreTrainedPolicy):
     """AWM: Autoregressive Action Chunking Transformer with discrete token prediction.
 
@@ -176,6 +197,7 @@ class AWMPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = AWM(config)
+        self._train_step = 0
         self._ema_step = 0
         self._pending_ema_momentum = None
 
@@ -271,14 +293,35 @@ class AWMPolicy(PreTrainedPolicy):
         valid_wm = ~next_obs_is_pad[:, 1]  # (B,)
         wm_loss, wm_metrics = _compute_wm_loss(z_pred, z_target, valid_wm, self.config)
 
-        loss = action_loss + self.config.wm_loss_weight * wm_loss
+        if self.config.wm_warmup_steps > 0 and self.training:
+            warmup_frac = min(self._train_step / self.config.wm_warmup_steps, 1.0)
+            effective_wm_weight = self.config.wm_loss_weight * warmup_frac
+        else:
+            effective_wm_weight = self.config.wm_loss_weight
+
+        loss = action_loss + effective_wm_weight * wm_loss
         info = {
             "action_loss": action_loss.item(),
             "wm_loss": wm_loss.item(),
+            "effective_wm_loss_weight": effective_wm_weight,
             "z_target_norm": z_target.norm(dim=-1).mean().item(),
             "z_pred_norm": z_pred.norm(dim=-1).mean().item(),
+            "z_pred_batch_std": z_pred.std(dim=1).mean().item(),
+            "z_target_batch_std": z_target.std(dim=1).mean().item(),
+            "wm_variance_loss": F.relu(1.0 - z_pred.std(dim=1, correction=0)).mean().item(),
         }
         info.update({key: value.item() for key, value in wm_metrics.items()})
+
+        with torch.no_grad():
+            info["wm_cosine_sim"] = F.cosine_similarity(z_pred, z_target, dim=-1).mean().item()
+            info["z_pred_target_norm_ratio"] = (
+                z_pred.norm(dim=-1).mean() / z_target.norm(dim=-1).mean().clamp(min=1e-8)
+            ).item()
+            predicted_tokens = logits.argmax(dim=-1)
+            token_correct = (predicted_tokens == token_ids) & ~curr_batch["action_is_pad"]
+            info["token_accuracy"] = (
+                token_correct.sum().float().item() / valid.sum().clamp(min=1).item()
+            )
 
         # Image reconstruction loss on current obs — MSE in normalised pixel space.
         # Decoder is trained on current encoder tokens (stable signal). The decoder is used
@@ -288,6 +331,29 @@ class AWMPolicy(PreTrainedPolicy):
             loss = loss + self.config.decoder_loss_weight * decoder_loss
             info["decoder_loss"] = decoder_loss.item()
 
+            with torch.no_grad():
+                info.update(
+                    _compute_image_reconstruction_metrics(
+                        decoded_curr.detach(),
+                        gt_curr_img.detach(),
+                        prefix="wm_curr",
+                    )
+                )
+
+                next_img_z = z_pred[
+                    self.model.n_1d_tokens : self.model.n_1d_tokens + self.model.img_tokens_per_cam
+                ]
+                decoded_next = self.model.wm_image_decoder(next_img_z.detach())
+                gt_next_img = next_batch[OBS_IMAGES][0].detach()
+                info.update(
+                    _compute_image_reconstruction_metrics(
+                        decoded_next,
+                        gt_next_img,
+                        prefix="wm_next",
+                        valid_mask=valid_wm,
+                    )
+                )
+
         if self.config.use_ema_target and self.training:
             t = min(self._ema_step / max(self.config.ema_anneal_steps, 1), 1.0)
             momentum = self.config.ema_momentum + t * (
@@ -295,6 +361,9 @@ class AWMPolicy(PreTrainedPolicy):
             )
             self._pending_ema_momentum = momentum
             info["ema_momentum"] = momentum
+
+        if self.training:
+            self._train_step += 1
 
         info["loss"] = loss.item()
         return loss, info
@@ -339,6 +408,8 @@ class AWMPolicy(PreTrainedPolicy):
         # Current observation: decode from pre-transformer encoder input tokens (same signal
         # used for decoder training), not encoder output (post-attention mixed tokens).
         curr_img_z = curr_encoder_in[n_1d : n_1d + s_img]           # (S_img, N, D)
+        if self.config.normalize_wm_representations:
+            curr_img_z = F.normalize(curr_img_z, dim=-1)
         decoded_curr = self.model.wm_image_decoder(curr_img_z)       # (N, C, H, W)
         gt_curr = curr_batch[OBS_IMAGES][0]                          # (N, C, H, W)
 
@@ -355,6 +426,8 @@ class AWMPolicy(PreTrainedPolicy):
         wm_cross_kv = self.model.wm_cross_attn_proj(wm_encoder_in)
         wm_out = self.model.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)
         z_pred = self.model.wm_proj_head(wm_out[:S])
+        if self.config.normalize_wm_representations:
+            z_pred = F.normalize(z_pred, dim=-1)
 
         if self.config.use_ema_target:
             _ = self.model._encode_ema(next_batch)
@@ -765,6 +838,8 @@ class AWM(nn.Module):
         else:
             _, _, _, next_encoder_in = self._encode(next_batch)
             z_target = next_encoder_in.detach()  # (S, B, dim_model)
+        if self.config.normalize_wm_representations:
+            z_target = F.normalize(z_target, dim=-1)
 
         # WM decoder input: [S query tokens, T action tokens].
         # Query tokens attend to the action sequence to predict the next-state encoder outputs.
@@ -783,6 +858,8 @@ class AWM(nn.Module):
         wm_cross_kv = self.wm_cross_attn_proj(wm_encoder_in)                 # (S, B, cross_attn_dim)
         wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)        # (S+T, B, dim_model)
         z_pred = self.wm_proj_head(wm_out[:S])                               # (S, B, dim_model)
+        if self.config.normalize_wm_representations:
+            z_pred = F.normalize(z_pred, dim=-1)
 
         # Image decoder — trained on pre-transformer encoder input tokens (direct ResNet spatial
         # projections with positional embeddings). These have clear per-patch spatial structure
@@ -791,6 +868,8 @@ class AWM(nn.Module):
         decoded_curr, gt_curr_img = None, None
         if hasattr(self, "wm_image_decoder") and OBS_IMAGES in batch:
             curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
+            if self.config.normalize_wm_representations:
+                curr_img_z = F.normalize(curr_img_z, dim=-1)
             decoded_curr = self.wm_image_decoder(curr_img_z.detach())        # (B, C, H, W)
             gt_curr_img = batch[OBS_IMAGES][0].detach()                      # (B, C, H, W)
 
