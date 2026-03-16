@@ -46,7 +46,7 @@ from lerobot.policies.act_simple.modeling_act_simple import (
     get_activation_fn,
 )
 from lerobot.policies.awm.configuration_awm import AWMConfig
-from lerobot.policies.awm.tokenizer_awm import UniformActionTokenizer
+from lerobot.policies.awm.tokenizer_awm import FactoredActionTokenizer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
@@ -208,8 +208,6 @@ class AWMPolicy(PreTrainedPolicy):
         )
 
         logits, token_ids, wm_tensors = self.model(curr_batch, next_batch)
-        # logits:    (B, T, total_vocab_size)
-        # token_ids: (B, T)
 
         total_V = self.model.tokenizer.total_vocab_size
         loss_per_tok = F.cross_entropy(
@@ -217,10 +215,17 @@ class AWMPolicy(PreTrainedPolicy):
             token_ids.reshape(-1),
             reduction="none",
             label_smoothing=0.1,
-        )  # (B*T,)
+        )  # (B*T*D,)
 
         # Zero out padded timesteps; divide only by valid (non-padding) count.
-        valid = ~curr_batch["action_is_pad"].reshape(-1)  # (B*T,)
+        # action_is_pad: (B, T) → expand to (B, T, D) → flatten to match (B*T*D,) logits
+        action_dim = self.config.action_feature.shape[0]
+        valid = ~(
+            curr_batch["action_is_pad"]
+            .unsqueeze(-1)
+            .expand(-1, -1, action_dim)
+            .reshape(-1)
+        )
         action_loss = (loss_per_tok * valid).sum() / valid.sum().clamp(min=1)
 
         # World model cosine similarity loss — masked at episode boundaries.
@@ -236,8 +241,6 @@ class AWMPolicy(PreTrainedPolicy):
         }
 
         # Image reconstruction loss on current obs — MSE in normalised pixel space.
-        # Decoder is trained on current encoder tokens (stable signal). The decoder is used
-        # at visualisation time to also decode WM future predictions for qualitative inspection.
         if decoded_curr is not None and gt_curr_img is not None:
             decoder_loss = F.mse_loss(decoded_curr, gt_curr_img)
             loss = loss + self.config.decoder_loss_weight * decoder_loss
@@ -246,16 +249,13 @@ class AWMPolicy(PreTrainedPolicy):
         info["loss"] = loss.item()
         return loss, info
 
-
     @torch.no_grad()
     def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
         """Generate WM image reconstruction pairs for debugging.
 
-        Returns a dict with four keys, each ``(N, C, H, W)`` float in ``[0, 1]``:
-          - ``"curr_gt"``      — ground truth current observation
-          - ``"curr_decoded"`` — image decoder applied to current encoder tokens
-          - ``"next_gt"``      — ground truth next observation
-          - ``"next_decoded"`` — image decoder applied to WM future prediction (z_pred)
+        Returns a dict with two keys, each ``(N, C, H, 2W)`` float in ``[0, 1]``:
+          - ``"curr"`` — GT current observation (left) | decoded from encoder tokens (right)
+          - ``"next"`` — GT next observation (left) | decoded from WM prediction (right)
 
         Returns ``None`` when no image features are configured.
         """
@@ -280,19 +280,20 @@ class AWMPolicy(PreTrainedPolicy):
         n_1d = self.model.n_1d_tokens
         s_img = self.model.img_tokens_per_cam
 
-        # Encode current obs — used for cross-attention and current decoded image.
+        # Encode current obs.
         batch_size, cross_kv, cross_pos, curr_encoder_in = self.model._encode(curr_batch)
 
-        # Current observation: decode from pre-transformer encoder input tokens (same signal
-        # used for decoder training), not encoder output (post-attention mixed tokens).
+        # Current decoded image — from pre-transformer encoder input tokens.
         curr_img_z = curr_encoder_in[n_1d : n_1d + s_img]           # (S_img, N, D)
         decoded_curr = self.model.wm_image_decoder(curr_img_z)       # (N, C, H, W)
         gt_curr = curr_batch[OBS_IMAGES][0]                          # (N, C, H, W)
 
-        # Run WM decoder to get future state prediction.
+        # WM-predicted future latent from ground-truth action tokens.
+        # token_ids: (N, T, D) — one token per action dim per step.
         token_ids = self.model.tokenizer.encode(batch[ACTION][:n])
         T = token_ids.shape[1]
-        action_embeds = self.model.wm_token_embed(token_ids).transpose(0, 1)
+        action_embeds = self.model.wm_token_embed(token_ids).mean(dim=2).transpose(0, 1)  # (T, N, d)
+
         wm_pos = self.model.wm_decoder_pos_embed.weight[:T].unsqueeze(1)
         S = self.model.n_encoder_tokens
         query_pos = self.model.wm_query_pos_embed.weight.unsqueeze(1)
@@ -302,13 +303,12 @@ class AWMPolicy(PreTrainedPolicy):
         wm_out = self.model.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)
         z_pred = self.model.wm_proj_head(wm_out[:S])
 
-        # Future observation: decode from WM predicted tokens.
+        # Decode WM prediction to image.
         next_img_z = z_pred[n_1d : n_1d + s_img]                    # (S_img, N, D)
         decoded_next = self.model.wm_image_decoder(next_img_z)       # (N, C, H, W)
         gt_next = next_batch[OBS_IMAGES][0]                          # (N, C, H, W)
 
         def _to_01(t: Tensor) -> Tensor:
-            """Per-sample min-max normalise to [0, 1] for display."""
             B = t.shape[0]
             t_flat = t.view(B, -1)
             lo = t_flat.min(dim=1).values.view(B, 1, 1, 1)
@@ -318,8 +318,7 @@ class AWMPolicy(PreTrainedPolicy):
         if was_training:
             self.train()
 
-        # Concatenate GT (left) and decoded (right) side-by-side for easy comparison.
-        curr = torch.cat([_to_01(gt_curr), _to_01(decoded_curr)], dim=3)  # (N, C, H, 2W)
+        curr = torch.cat([_to_01(gt_curr), _to_01(decoded_curr)], dim=3)   # (N, C, H, 2W)
         next_ = torch.cat([_to_01(gt_next), _to_01(decoded_next)], dim=3)  # (N, C, H, 2W)
         return {"curr": curr.cpu(), "next": next_.cpu()}
 
@@ -331,7 +330,9 @@ class AWM(nn.Module):
     Decoder: autoregressive transformer with
         * causal self-attention
         * cross-attention on (optionally compressed) encoder outputs
-        * discrete token prediction head (vocab = vocab_size^action_dim)
+        * discrete token prediction head
+    World model: bidirectional transformer that predicts next-state encoder tokens
+        given current encoder tokens and the action chunk.
     """
 
     def __init__(self, config: AWMConfig):
@@ -342,9 +343,13 @@ class AWM(nn.Module):
         # Action tokenizer
         # ------------------------------------------------------------------
         action_dim = config.action_feature.shape[0]
-        action_ranges = config.action_ranges if config.action_ranges is not None else [[-1.0, 1.0]] * action_dim
-        self.tokenizer = UniformActionTokenizer(action_ranges, config.action_token_vocab_size)
+        self.action_dim = action_dim
+        action_ranges = (
+            config.action_ranges if config.action_ranges is not None else [[-1.0, 1.0]] * action_dim
+        )
+        self.tokenizer = FactoredActionTokenizer(action_ranges, config.action_token_vocab_size)
         total_V = self.tokenizer.total_vocab_size
+        decoder_seq_len = config.chunk_size * action_dim  # T*D positions (one token per dim per step)
 
         # ------------------------------------------------------------------
         # Vision backbone (optional)
@@ -398,8 +403,7 @@ class AWM(nn.Module):
             nn.Linear(config.cross_attn_dim, config.cross_attn_dim),
         )
         self.cross_attn_pos_proj = nn.Linear(config.dim_model, config.cross_attn_dim)
-        # Separate projection for WM decoder cross-attention — operates on encoder INPUT tokens
-        # (pre-transformer) to match the representation the WM is trained to predict.
+        # Separate projection for WM decoder cross-attention (encoder INPUT tokens as KV).
         self.wm_cross_attn_proj = nn.Sequential(
             nn.Linear(config.dim_model, config.cross_attn_dim),
             nn.ReLU(),
@@ -410,32 +414,31 @@ class AWM(nn.Module):
         # Decoder inputs: BOS token + discrete token embedding table
         # ------------------------------------------------------------------
         self.bos_embed = nn.Embedding(1, config.dim_model)
-        # Embed the previous step's discrete token as the decoder input for the next step.
+        # Action decoder embedding table.
         self.token_embed = nn.Embedding(total_V, config.dim_model)
         # Separate embedding table for WM action conditioning — prevents competing gradients with
-        # the action decoder's token_embed (which needs discriminative per-token representations
-        # while the WM needs compositional sequence representations).
+        # the action decoder's token_embed.
         self.wm_token_embed = nn.Embedding(total_V, config.dim_model)
 
         # ------------------------------------------------------------------
-        # Decoder positional embeddings (used during AR inference)
+        # Decoder positional embeddings — chunk_size*action_dim positions (T*D).
         # ------------------------------------------------------------------
-        self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+        self.decoder_pos_embed = nn.Embedding(decoder_seq_len, config.dim_model)
 
         # ------------------------------------------------------------------
-        # Action head: predicts logits over the joint token vocabulary
+        # Action head: predicts logits over the token vocabulary
         # ------------------------------------------------------------------
         self.action_head = nn.Linear(config.dim_model, total_V)
 
         # ------------------------------------------------------------------
-        # World model decoder — non-causal (bidirectional self-attention),
-        # shallower than the action decoder.
+        # World model decoder — bidirectional (no causal mask), shallower.
         # ------------------------------------------------------------------
         wm_cfg = copy(config)
         wm_cfg.n_decoder_layers = config.n_wm_decoder_layers
         self.wm_decoder = AWMDecoder(wm_cfg)
 
-        # Separate positional embeddings for WM decoder action-token inputs.
+        # Positional embeddings for WM decoder action-token inputs (length T, not T*D,
+        # because WM uses per-timestep embeddings after mean-pooling over dims if factored).
         self.wm_decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # S learnable query tokens — one per encoder output token.
@@ -443,15 +446,13 @@ class AWM(nn.Module):
         self.n_encoder_tokens = n_enc
         self.wm_query_tokens = nn.Parameter(torch.zeros(n_enc, 1, config.dim_model))
         nn.init.trunc_normal_(self.wm_query_tokens, std=0.02)
-        # Positional embeddings for WM query tokens — gives each query a unique spatial identity
-        # so the WM can learn query[s] → predict encoder token s without positional ambiguity.
         self.wm_query_pos_embed = nn.Embedding(n_enc, config.dim_model)
         if config.image_features:
             stride = 16 if config.replace_final_stride_with_dilation else 32
             C, H, W = next(iter(config.image_features.values())).shape
             self.img_tokens_per_cam = (H // stride) * (W // stride)
 
-        # 2-layer MLP projection head: maps each query output → predicted next-state latent token.
+        # MLP projection head: query output → predicted next-state latent token.
         self.wm_proj_head = nn.Sequential(
             nn.Linear(config.dim_model, config.dim_model),
             nn.ReLU(),
@@ -459,8 +460,7 @@ class AWM(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # Image decoder (debug only) — driven by detached z_pred so no
-        # gradients flow to the encoder or WM decoder.
+        # Image decoder (debug only)
         # ------------------------------------------------------------------
         if config.image_features:
             first_feat = next(iter(config.image_features.values()))
@@ -533,8 +533,8 @@ class AWM(nn.Module):
 
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
 
-        cross_kv = self.cross_attn_proj(encoder_out)            # (S, B, cross_attn_dim)
-        cross_pos = self.cross_attn_pos_proj(encoder_in_pos_embed)  # (S, 1, cross_attn_dim)
+        cross_kv = self.cross_attn_proj(encoder_out)                    # (S, B, cross_attn_dim)
+        cross_pos = self.cross_attn_pos_proj(encoder_in_pos_embed)      # (S, 1, cross_attn_dim)
 
         return batch_size, cross_kv, cross_pos, encoder_in_tokens
 
@@ -555,67 +555,61 @@ class AWM(nn.Module):
                         model head is computed and WM tensors are returned.
 
         Returns:
-            logits:     ``(B, T, total_vocab_size)`` — unnormalised log-probabilities.
-            token_ids:  ``(B, T)`` — ground-truth joint token indices (for cross-entropy).
-            wm_tensors: ``(z_pred, z_target)`` pair or ``None`` if no next_batch.
+            logits:       joint:    ``(B, T, V^D)``
+                          factored: ``(B, T*D, V)``
+            token_ids:    joint:    ``(B, T)``
+                          factored: ``(B, T*D)``
+            wm_tensors:   ``(z_pred, z_target, decoded_curr, gt_curr_img)``
         """
         batch_size, cross_kv, cross_pos, encoder_in = self._encode(batch)
 
         actions = batch[ACTION]  # (B, T, action_dim)
         T = actions.shape[1]
 
-        # Tokenise ground-truth actions → joint token indices.
-        token_ids = self.tokenizer.encode(actions)  # (B, T)
+        # One token per action dimension → flat sequence of length T*D.
+        token_ids = self.tokenizer.encode(actions)              # (B, T, D)
+        D = self.action_dim
+        flat_ids = token_ids.reshape(batch_size, T * D)         # (B, T*D)
 
-        # Build shifted-right decoder input: [BOS, embed(tok_0), …, embed(tok_{T-2})].
-        bos = self.bos_embed.weight.unsqueeze(1).expand(1, batch_size, -1)  # (1, B, dim_model)
-        prev_embeds = self.token_embed(token_ids[:, :-1]).transpose(0, 1)   # (T-1, B, dim_model)
-        decoder_in = torch.cat([bos, prev_embeds], dim=0)                   # (T, B, dim_model)
+        bos = self.bos_embed.weight.unsqueeze(1).expand(1, batch_size, -1)  # (1, B, d)
+        prev_embeds = self.token_embed(flat_ids[:, :-1]).transpose(0, 1)    # (T*D-1, B, d)
+        decoder_in = torch.cat([bos, prev_embeds], dim=0)                   # (T*D, B, d)
 
-        causal_mask = _make_causal_mask(T, device=decoder_in.device)
-        decoder_pos_embed = self.decoder_pos_embed.weight[:T].unsqueeze(1)  # (T, 1, dim_model)
+        L = T * D
+        causal_mask = _make_causal_mask(L, device=decoder_in.device)
+        decoder_pos_embed = self.decoder_pos_embed.weight[:L].unsqueeze(1)
         decoder_out = self.decoder(decoder_in, cross_kv, cross_pos, causal_mask,
                                    decoder_pos_embed=decoder_pos_embed)
 
-        logits = self.action_head(decoder_out.transpose(0, 1))  # (B, T, total_vocab_size)
+        logits = self.action_head(decoder_out.transpose(0, 1))  # (B, T*D, V)
 
         # ------------------------------------------------------------------
-        # World model forward — only during training (next_batch provided).
+        # World model forward.
         # ------------------------------------------------------------------
-        # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
         _, _, _, next_encoder_in = self._encode(next_batch)
         z_target = next_encoder_in.detach()  # (S, B, dim_model)
 
-        # WM decoder input: [S query tokens, T action tokens].
-        # Query tokens attend to the action sequence to predict the next-state encoder outputs.
-        # wm_token_embed is separate from token_embed to avoid gradient conflicts with the action decoder.
-        action_embeds = self.wm_token_embed(token_ids).transpose(0, 1)       # (T, B, dim_model)
-        wm_pos = self.wm_decoder_pos_embed.weight[:T].unsqueeze(1)           # (T, 1, dim_model)
-        # wm_query_pos_embed gives each query a unique spatial identity, preventing positional ambiguity.
-        query_pos = self.wm_query_pos_embed.weight.unsqueeze(1)              # (S, 1, dim_model)
-        queries = (self.wm_query_tokens + query_pos).expand(-1, batch_size, -1)  # (S, B, dim_model)
-        wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)          # (S+T, B, dim_model)
+        # WM action conditioning: embed per-dim tokens, mean-pool over D → (T, B, d).
+        action_embeds = self.wm_token_embed(token_ids).mean(dim=2).transpose(0, 1)  # (T, B, d)
 
-        # Non-causal (bidirectional) self-attention: causal_mask=None.
-        # WM cross-attends to encoder INPUT tokens (pre-transformer) — same space as the target.
+        wm_pos    = self.wm_decoder_pos_embed.weight[:T].unsqueeze(1)           # (T, 1, d)
+        query_pos = self.wm_query_pos_embed.weight.unsqueeze(1)                 # (S, 1, d)
+        queries   = (self.wm_query_tokens + query_pos).expand(-1, batch_size, -1)  # (S, B, d)
+        wm_in     = torch.cat([queries, action_embeds + wm_pos], dim=0)         # (S+T, B, d)
+
         S = self.n_encoder_tokens
-        wm_cross_kv = self.wm_cross_attn_proj(encoder_in)                    # (S, B, cross_attn_dim)
-        wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)        # (S+T, B, dim_model)
-        z_pred = self.wm_proj_head(wm_out[:S])                               # (S, B, dim_model)
+        wm_cross_kv = self.wm_cross_attn_proj(encoder_in)               # (S, B, cross_attn_dim)
+        wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)   # (S+T, B, d)
+        z_pred = self.wm_proj_head(wm_out[:S])                           # (S, B, d)
 
-        # Image decoder — trained on pre-transformer encoder input tokens (direct ResNet spatial
-        # projections with positional embeddings). These have clear per-patch spatial structure
-        # so the decoder can learn to reconstruct images rather than collapsing to the dataset mean.
-        # Future decoding (z_pred) is done only in visualize().
         decoded_curr, gt_curr_img = None, None
         if hasattr(self, "wm_image_decoder") and OBS_IMAGES in batch:
             curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
-            decoded_curr = self.wm_image_decoder(curr_img_z.detach())        # (B, C, H, W)
-            gt_curr_img = batch[OBS_IMAGES][0].detach()                      # (B, C, H, W)
+            decoded_curr = self.wm_image_decoder(curr_img_z.detach())    # (B, C, H, W)
+            gt_curr_img = batch[OBS_IMAGES][0].detach()                  # (B, C, H, W)
 
         wm_tensors = (z_pred, z_target, decoded_curr, gt_curr_img)
-
-        return logits, token_ids, wm_tensors
+        return logits, flat_ids, wm_tensors
 
     def predict_ar(self, batch: dict[str, Tensor]) -> Tensor:
         """Autoregressive greedy inference.
