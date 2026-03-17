@@ -32,6 +32,7 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act_simple.configuration_act_simple import ACTSimpleConfig
 from lerobot.policies.awm.configuration_awm import AWMConfig
+from lerobot.policies.fawm.configuration_fawm import FAWMConfig
 from lerobot.policies.awm_diffusion.configuration_awm_diffusion import AWMDiffusionConfig
 from lerobot.policies.act_awm.configuration_act_awm import ACTAWMConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
@@ -131,6 +132,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
         return SARMRewardModel
+    elif name == "fawm":
+        from lerobot.policies.fawm.modeling_fawm import FAWMPolicy
+
+        return FAWMPolicy
     elif name == "groot":
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
