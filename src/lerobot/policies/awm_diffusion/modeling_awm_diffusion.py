@@ -886,6 +886,8 @@ class AWM(nn.Module):
         else:
             _, _, _, next_encoder_in = self._encode(next_batch)
             z_target = next_encoder_in.detach()  # (S, B, dim_model)
+        if self.config.normalize_wm_representations:
+            z_target = F.normalize(z_target, dim=-1)
 
         wm_cond = self._build_wm_context(token_ids, batch_size, encoder_in, cross_pos)
 
@@ -894,6 +896,8 @@ class AWM(nn.Module):
         z_noisy = self._q_sample(z_target, t, noise)
         noise_pred = self.wm_diffusion_denoiser(z_noisy, wm_cond, t)
         z_pred = self._predict_z0(z_noisy, t, noise_pred)                    # (S, B, dim_model)
+        if self.config.normalize_wm_representations:
+            z_pred = F.normalize(z_pred, dim=-1)
 
         wm_diffusion_loss_per_sample = ((noise_pred - noise) ** 2).mean(dim=(0, 2))    # (B,)
 

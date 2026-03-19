@@ -129,6 +129,7 @@ class AWMDiffusionConfig(PreTrainedConfig):
     wm_diffusion_n_heads: int = 8
     wm_diffusion_dit_depth: int = 6
     wm_diffusion_dit_mlp_ratio: float = 3.0
+    normalize_wm_representations: bool = True  # Enable LayerNorm inside the WM diffusion denoiser
 
     # Training preset
     optimizer_lr: float = 2e-4
