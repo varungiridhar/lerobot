@@ -115,6 +115,7 @@ class AWMDiffusionConfig(PreTrainedConfig):
 
     # World model
     wm_loss_weight: float = 0.2       # Weight on world model loss relative to action prediction loss
+    detach_encoder_from_wm: bool = False  # Detach encoder outputs before WM cross-attention
     use_ema_target: bool = False      # Use an EMA copy of the encoder to compute z_target
     ema_momentum: float = 0.996       # EMA decay coefficient (higher = slower target evolution)
     ema_momentum_end: float = 0.999   # Final EMA momentum after annealing

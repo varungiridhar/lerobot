@@ -798,7 +798,8 @@ class AWM(nn.Module):
         queries = (self.wm_query_tokens + query_pos).expand(-1, batch_size, -1)  # (S, B, dim_model)
         wm_in = torch.cat([queries, action_embeds + wm_pos], dim=0)          # (S+T, B, dim_model)
 
-        wm_cross_kv = self.wm_cross_attn_proj(encoder_in)                    # (S, B, cross_attn_dim)
+        wm_encoder_in = encoder_in.detach() if self.config.detach_encoder_from_wm else encoder_in
+        wm_cross_kv = self.wm_cross_attn_proj(wm_encoder_in)                 # (S, B, cross_attn_dim)
         wm_out = self.wm_decoder(wm_in, wm_cross_kv, cross_pos, None)        # (S+T, B, dim_model)
         return wm_out[: self.n_encoder_tokens]
 
