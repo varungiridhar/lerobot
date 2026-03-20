@@ -72,7 +72,7 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
 
     # Save locally: 2 rows — current obs pairs (top), future obs pairs (bottom).
     vis_dir = Path(output_dir) / "wm_viz"
-    vis_dir.mkdir(exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
     n = len(viz["curr"])
     grid = torchvision.utils.make_grid(
         torch.cat([viz["curr"], viz["next"]], dim=0),
