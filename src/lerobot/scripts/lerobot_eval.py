@@ -102,6 +102,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    post_reset_fn: Callable[[gym.vector.VectorEnv, dict, Any], None] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -139,6 +140,8 @@ def rollout(
     # Reset the policy and environments.
     policy.reset()
     observation, info = env.reset(seed=seeds)
+    if post_reset_fn is not None:
+        post_reset_fn(env, info, policy)
     if render_callback is not None:
         render_callback(env)
 
@@ -247,6 +250,20 @@ def rollout(
     return ret
 
 
+def _make_goal_fn(goal_provider, env_preprocessor, preprocessor):
+    """Return a post_reset_fn that encodes a goal observation and calls set_planning_goal."""
+
+    def _fn(env, info, policy):
+        raw_batch = goal_provider.get_goal_raw_obs(env)
+        goal_obs = preprocess_observation(raw_batch)
+        goal_obs = add_envs_task(env, goal_obs)
+        goal_obs = env_preprocessor(goal_obs)
+        goal_obs = preprocessor(goal_obs)
+        policy.set_planning_goal(goal_obs)
+
+    return _fn
+
+
 def eval_policy(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -322,6 +339,15 @@ def eval_policy(
     if return_episode_data:
         episode_data: dict | None = None
 
+    # Build a post_reset_fn to set the planning goal for planning-enabled policies.
+    post_reset_fn = None
+    if hasattr(policy, "set_planning_goal") and getattr(policy, "_planner", None) is not None:
+        from lerobot.envs.goal_providers import make_goal_provider
+
+        goal_provider = make_goal_provider(env)
+        if goal_provider is not None:
+            post_reset_fn = _make_goal_fn(goal_provider, env_preprocessor, preprocessor)
+
     # we dont want progress bar when we use slurm, since it clutters the logs
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
@@ -346,6 +372,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            post_reset_fn=post_reset_fn,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after

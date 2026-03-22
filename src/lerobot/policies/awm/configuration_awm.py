@@ -72,10 +72,12 @@ class AWMConfig(PreTrainedConfig):
         cross_attn_dim: Dimension to project encoder outputs to before using them as keys/values in the
             decoder's cross-attention. `None` (the default) resolves to `dim_model` (no compression).
         action_token_vocab_size: Number of uniform bins per action dimension used to tokenise actions into
-            discrete tokens.  The joint vocabulary size is ``action_token_vocab_size ** action_dim``, so
-            keep this small for high-dimensional action spaces (e.g. V=64 is fine for D≤3).
+            discrete tokens (vocabulary size = ``action_token_vocab_size``, one token per dimension).
         action_ranges: Per-dimension ``[lo, hi]`` bounds for uniform tokenisation.  ``None`` (the default)
             resolves to ``[[-1.0, 1.0]] * action_dim`` at model construction time.
+        use_planning: Enable WM-guided MPPI trajectory refinement at inference time.  Call
+            ``AWMPolicy.set_planning_goal(batch)`` once per episode to provide the goal observation,
+            then planning runs automatically inside ``predict_action_chunk()``.
     """
 
     # Input / output structure.
@@ -109,6 +111,15 @@ class AWMConfig(PreTrainedConfig):
     # Discrete action tokenisation.
     action_token_vocab_size: int = 128
     action_ranges: list[list[float]] | None = None  # None → [[-1.0, 1.0]] * action_dim
+
+    # Online planning — WM-guided MPPI trajectory refinement at inference time.
+    # Call AWMPolicy.set_planning_goal(batch) once per episode to provide the goal observation.
+    use_planning: bool = False
+    planning_type: str = "mppi"          # algorithm; add branches in planning_awm.build_planner()
+    planning_n_samples: int = 64         # perturbed trajectories evaluated per MPPI iteration
+    planning_n_iters: int = 5            # MPPI refinement iterations
+    planning_noise_sigma: float = 0.1    # Gaussian noise std in continuous action space
+    planning_temperature: float = 1.0    # MPPI inverse temperature λ (higher → sharper selection)
 
     # Training and loss computation.
     dropout: float = 0.1

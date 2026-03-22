@@ -13,24 +13,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AWM Policy — Autoregressive ACT Decoder with Discrete Action Tokens
+"""AWM Policy — Autoregressive ACT Decoder with Discrete Action Tokens and Online Planning.
 
 Two key differences from ACTSimple:
   1. Autoregressive decoder with causal self-attention: teacher-forcing at training time
      (shifted-right ground-truth token embeddings), step-by-step greedy decoding at inference.
-  2. Discrete action tokens: continuous actions are quantised via UniformActionTokenizer into
-     joint discrete tokens.  The model predicts a categorical distribution over the joint
-     vocabulary (cross-entropy loss) and decodes the argmax token back to a continuous action
-     for environment interaction.
+  2. Discrete action tokens: continuous actions are quantised via a tokenizer into discrete tokens.
 
-Optional:
-  - Cross-attention dimension reduction MLP: projects encoder outputs from `dim_model` to
-    `cross_attn_dim` before decoder cross-attention (default: no compression).
+Online planning (optional):
+  - At inference, the BC trajectory from predict_ar() is used as a warm start.
+  - An MPPI planner then refines it by rolling proposed trajectories through the world model and
+    minimising cosine distance to a cached goal latent.
+  - Call AWMPolicy.set_planning_goal(batch) once per episode before select_action().
 """
+
+from __future__ import annotations
 
 from collections import deque
 from copy import copy
 from itertools import chain
+from typing import Callable
 
 import einops
 import torch
@@ -68,7 +70,12 @@ class WMImageDecoder(nn.Module):
     For 96×96 images (h0=w0=3, S_img=9): ~160K parameters.
     """
 
-    def __init__(self, dim_model: int, image_shape: tuple[int, int, int], replace_final_stride_with_dilation: bool = False):
+    def __init__(
+        self,
+        dim_model: int,
+        image_shape: tuple[int, int, int],
+        replace_final_stride_with_dilation: bool = False,
+    ):
         super().__init__()
         C, H, W = image_shape
         stride = 16 if replace_final_stride_with_dilation else 32
@@ -85,7 +92,7 @@ class WMImageDecoder(nn.Module):
             nn.ConvTranspose2d(16,       8, 4, stride=2, padding=1), nn.ReLU(),  # ×2
             nn.ConvTranspose2d( 8,       4, 4, stride=2, padding=1), nn.ReLU(),  # ×2
             nn.ConvTranspose2d( 4,       2, 4, stride=2, padding=1), nn.ReLU(),  # ×2
-            nn.ConvTranspose2d( 2,       C, 4, stride=2, padding=1),             # ×2 → H×W (linear output)
+            nn.ConvTranspose2d( 2,       C, 4, stride=2, padding=1),             # ×2 → H×W
         )
 
     def forward(self, z: Tensor) -> Tensor:
@@ -130,6 +137,9 @@ class AWMPolicy(PreTrainedPolicy):
     At training time the decoder is teacher-forced with the (shifted-right) embeddings of the
     ground-truth token indices and trained with cross-entropy loss.  At inference time tokens
     are generated greedily one step at a time and decoded back to continuous actions.
+
+    Optionally, a WM-guided MPPI planner refines the BC trajectory at inference time.
+    Call ``set_planning_goal(batch)`` once per episode to activate planning.
     """
 
     config_class = AWMConfig
@@ -142,7 +152,42 @@ class AWMPolicy(PreTrainedPolicy):
 
         self.model = AWM(config)
 
+        # Planning: instantiate planner if enabled; goal must be set separately.
+        if config.use_planning:
+            from lerobot.policies.awm.planning_awm import build_planner
+            self._planner = build_planner(config)
+        else:
+            self._planner = None
+        self._goal_latent: Tensor | None = None  # set via set_planning_goal()
+
         self.reset()
+
+    # ------------------------------------------------------------------
+    # Planning API
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def set_planning_goal(self, batch: dict[str, Tensor]) -> None:
+        """Encode a goal observation and cache its latent for the planner.
+
+        Must be called once per episode (or whenever the goal changes) before
+        ``select_action()`` so that planning has a target to optimise toward.
+
+        Args:
+            batch: A single-timestep observation batch for the goal state.  The batch
+                should contain the same keys as a normal observation (e.g. images, state).
+        """
+        self.eval()
+        goal_batch = dict(batch)
+        if self.config.image_features:
+            goal_batch[OBS_IMAGES] = [goal_batch[key] for key in self.config.image_features]
+        _, _, _, goal_encoder_in = self.model._encode(goal_batch)
+        # goal_encoder_in: (S, B, dim_model) — take first (and only) batch element.
+        self._goal_latent = goal_encoder_in[:, 0, :].detach()  # (S, dim_model)
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
     def get_optim_params(self) -> dict:
         return [
@@ -179,14 +224,43 @@ class AWMPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions autoregressively; returns continuous actions."""
+        """Predict a chunk of actions; optionally refined via WM-guided MPPI.
+
+        Returns:
+            ``(B, chunk_size, action_dim)`` continuous action tensor.
+        """
         self.eval()
 
+        # Assemble image list expected by _encode / predict_ar.
         if self.config.image_features:
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        return self.model.predict_ar(batch)
+        # Encode once and share between BC decoder and planner.
+        batch_size, cross_kv, cross_pos, encoder_in = self.model._encode(batch)
+
+        # BC warm start: greedy autoregressive decoding.  (B, T, D)
+        actions = self.model._predict_ar_from_encoded(cross_kv, cross_pos, batch_size)
+
+        # WM-guided MPPI refinement (if planner is configured and a goal is set).
+        if self._planner is not None and self._goal_latent is not None:
+            # Move goal to the same device as the model.
+            goal = self._goal_latent.to(encoder_in.device)
+            lows = self.model.tokenizer.lows    # (D,)
+            highs = self.model.tokenizer.highs  # (D,)
+            # Run planning for each batch element independently (typically B=1 at inference).
+            refined = []
+            for b in range(batch_size):
+                enc_b = encoder_in[:, b : b + 1, :]     # (S, 1, dim_model)
+                cost_fn_b = self.model.make_wm_cost_fn(enc_b, cross_pos, goal)
+                refined.append(self._planner.optimize(actions[b], cost_fn_b, lows, highs))
+            actions = torch.stack(refined, dim=0)  # (B, T, D)
+
+        return actions  # (B, T, D)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Teacher-forced training forward pass; returns combined action + world model loss."""
@@ -538,6 +612,95 @@ class AWM(nn.Module):
 
         return batch_size, cross_kv, cross_pos, encoder_in_tokens
 
+    def _predict_ar_from_encoded(
+        self,
+        cross_kv: Tensor,
+        cross_pos: Tensor,
+        batch_size: int,
+    ) -> Tensor:
+        """Autoregressive greedy decoding given pre-computed encoder outputs.
+
+        Avoids re-running the encoder when it has already been called (e.g. by the planner).
+
+        Returns:
+            ``(B, chunk_size, action_dim)`` continuous action chunk.
+        """
+        device = cross_kv.device
+        decoder_seq = self.bos_embed.weight.unsqueeze(1).expand(1, batch_size, -1).contiguous()
+
+        D = self.action_dim
+        n_steps = self.config.chunk_size * D
+        predicted_flat: list[Tensor] = []
+        for i in range(n_steps):
+            T_cur = i + 1
+            causal_mask = _make_causal_mask(T_cur, device=device)
+            pos_embed_i = self.decoder_pos_embed.weight[:T_cur].unsqueeze(1)
+            out = self.decoder(
+                decoder_seq, cross_kv, cross_pos, causal_mask, decoder_pos_embed=pos_embed_i
+            )
+            tok_i = self.action_head(out[-1]).argmax(dim=-1)   # (B,)
+            predicted_flat.append(tok_i)
+            if i < n_steps - 1:
+                embed = self.token_embed(tok_i).unsqueeze(0)
+                decoder_seq = torch.cat([decoder_seq, embed], dim=0)
+        flat_ids = torch.stack(predicted_flat, dim=1)                       # (B, T*D)
+        token_ids = flat_ids.reshape(batch_size, self.config.chunk_size, D) # (B, T, D)
+        return self.tokenizer.decode(token_ids)                             # (B, T, D)
+
+    def make_wm_cost_fn(
+        self,
+        encoder_in: Tensor,
+        cross_pos: Tensor,
+        goal_latent: Tensor,
+    ) -> Callable[[Tensor], Tensor]:
+        """Build a WM-based cost function for use by the planner.
+
+        The returned callable evaluates N candidate action trajectories by rolling them
+        through the world model and measuring cosine distance to a goal latent — consistent
+        with the WM training objective.
+
+        Args:
+            encoder_in:  ``(S, 1, dim_model)`` pre-transformer encoder input tokens for the
+                         current observation (batch size 1 expected at inference).
+            cross_pos:   ``(S, 1, cross_attn_dim)`` positional biases for cross-attention.
+            goal_latent: ``(S, dim_model)`` encoder-in tokens of the goal observation (obtained
+                         by calling ``AWMPolicy.set_planning_goal()``).
+
+        Returns:
+            ``cost_fn(actions: (N, T, D)) → (N,)`` — cost per candidate trajectory.
+            Lower cost = trajectory predicted to end closer to the goal.
+        """
+        S = self.n_encoder_tokens
+        # Pre-compute WM cross-attention keys once; amortised across all planner iterations.
+        wm_cross_kv1 = self.wm_cross_attn_proj(encoder_in)  # (S, 1, cross_attn_dim)
+
+        @torch.no_grad()
+        def cost_fn(actions: Tensor) -> Tensor:
+            """Evaluate N candidate trajectories; returns ``(N,)`` costs."""
+            N, T, _ = actions.shape
+
+            # 1. Tokenise continuous actions and embed via WM embedding table.
+            token_ids = self.tokenizer.encode(actions)                            # (N, T, D)
+            action_emb = self.wm_token_embed(token_ids).mean(dim=2).permute(1, 0, 2)  # (T, N, d)
+
+            # 2. Build WM decoder input: [S query tokens ‖ T action tokens].
+            wm_pos    = self.wm_decoder_pos_embed.weight[:T].unsqueeze(1)         # (T, 1, d)
+            q_pos     = self.wm_query_pos_embed.weight.unsqueeze(1)               # (S, 1, d)
+            queries   = (self.wm_query_tokens + q_pos).expand(-1, N, -1)         # (S, N, d)
+            wm_in     = torch.cat([queries, action_emb + wm_pos], dim=0)         # (S+T, N, d)
+
+            # 3. Run WM decoder (bidirectional).
+            kv_n      = wm_cross_kv1.expand(-1, N, -1)                           # (S, N, cross_dim)
+            wm_out    = self.wm_decoder(wm_in, kv_n, cross_pos, None)            # (S+T, N, d)
+            z_pred    = self.wm_proj_head(wm_out[:S])                            # (S, N, d)
+
+            # 4. Cosine distance to goal (lower = closer to goal = better trajectory).
+            goal_n    = goal_latent.unsqueeze(1).expand(-1, N, -1)               # (S, N, d)
+            cos_sim   = F.cosine_similarity(z_pred, goal_n, dim=-1).mean(dim=0)  # (N,)
+            return 1.0 - cos_sim                                                  # ∈ [0, 2]
+
+        return cost_fn
+
     # ------------------------------------------------------------------
     # Forward passes
     # ------------------------------------------------------------------
@@ -612,39 +775,13 @@ class AWM(nn.Module):
         return logits, flat_ids, wm_tensors
 
     def predict_ar(self, batch: dict[str, Tensor]) -> Tensor:
-        """Autoregressive greedy inference.
-
-        At each step the highest-probability token is selected (argmax), embedded, and fed as
-        input to the next decoder step.  All generated token indices are decoded back to
-        continuous actions via the tokenizer.
+        """Autoregressive greedy inference (encodes internally).
 
         Returns:
             ``(B, chunk_size, action_dim)`` continuous action chunk.
         """
         batch_size, cross_kv, cross_pos, _ = self._encode(batch)
-
-        decoder_seq = self.bos_embed.weight.unsqueeze(1).expand(1, batch_size, -1).contiguous()
-
-        predicted_ids: list[Tensor] = []
-        for t in range(self.config.chunk_size):
-            T = t + 1
-            causal_mask = _make_causal_mask(T, device=decoder_seq.device)
-            pos_embed_t = self.decoder_pos_embed.weight[:T].unsqueeze(1)  # (T, 1, dim_model)
-
-            out = self.decoder(
-                decoder_seq, cross_kv, cross_pos, causal_mask, decoder_pos_embed=pos_embed_t
-            )  # (T, B, dim_model)
-
-            logits_t = self.action_head(out[-1])          # (B, total_vocab_size)
-            token_id_t = logits_t.argmax(dim=-1)          # (B,)  greedy
-            predicted_ids.append(token_id_t)
-
-            if t < self.config.chunk_size - 1:
-                embed = self.token_embed(token_id_t).unsqueeze(0)  # (1, B, dim_model)
-                decoder_seq = torch.cat([decoder_seq, embed], dim=0)
-
-        token_ids = torch.stack(predicted_ids, dim=1)  # (B, chunk_size)
-        return self.tokenizer.decode(token_ids)         # (B, chunk_size, action_dim)
+        return self._predict_ar_from_encoded(cross_kv, cross_pos, batch_size)
 
 
 # ---------------------------------------------------------------------------
