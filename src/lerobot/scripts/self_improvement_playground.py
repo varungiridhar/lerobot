@@ -48,10 +48,10 @@ OUTPUT_DIR = str(Path(POLICY).parent / "self_improvement")
 # Config — edit these for each experiment
 # ═════════════════════════════════════════════════════════════════
 # ── Self-improvement loop ──────────────────────────────────────
-N_ITERS = 0                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
-N_COLLECT_EPISODES = 50     # episodes per eval_and_collect
-FINETUNE_STEPS = 100        # 0 = skip end-to-end finetune
-FINETUNE_LR = 5e-6          # LR for end-to-end finetune
+N_ITERS = 1                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
+N_COLLECT_EPISODES = 20     # episodes per eval_and_collect
+FINETUNE_STEPS = 1000       # 0 = skip end-to-end finetune
+FINETUNE_LR = 1e-5          # LR for end-to-end finetune
 FINETUNE_WM_STEPS = 0       # 0 = skip WM-only finetune
 FINETUNE_WM_LR = 1e-6       # LR for WM-only finetune
 BATCH_SIZE = 8
