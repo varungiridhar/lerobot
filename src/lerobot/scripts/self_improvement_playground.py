@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 COMMIT = sys.argv[1]
 POLICY = (
     "/storage/home/hcoda1/6/vgiridhar6/forks/lerobot/outputs/"
-    "act_simple_awm_pusht_wm1.0_l2norm_improved_decoder/checkpoints/last/pretrained_model"
+    "act_simple_awm_pusht_wm1.0_l2norm_truly_deterministic/checkpoints/last/pretrained_model"
 )
 from pathlib import Path
 OUTPUT_DIR = str(Path(POLICY).parent / "self_improvement")
@@ -48,7 +48,7 @@ OUTPUT_DIR = str(Path(POLICY).parent / "self_improvement")
 # Config — edit these for each experiment
 # ═════════════════════════════════════════════════════════════════
 # ── Self-improvement loop ──────────────────────────────────────
-N_ITERS = 1                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
+N_ITERS = 0                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
 N_COLLECT_EPISODES = 50     # episodes per eval_and_collect
 FINETUNE_STEPS = 100        # 0 = skip end-to-end finetune
 FINETUNE_LR = 5e-6          # LR for end-to-end finetune
