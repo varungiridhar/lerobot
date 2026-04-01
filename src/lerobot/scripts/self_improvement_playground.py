@@ -48,10 +48,10 @@ OUTPUT_DIR = str(Path(POLICY).parent / "self_improvement")
 # Config — edit these for each experiment
 # ═════════════════════════════════════════════════════════════════
 # ── Self-improvement loop ──────────────────────────────────────
-N_ITERS = 1                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
-N_COLLECT_EPISODES = 20     # episodes per eval_and_collect
-FINETUNE_STEPS = 1000       # 0 = skip end-to-end finetune
-FINETUNE_LR = 1e-5          # LR for end-to-end finetune
+N_ITERS = 0                 # 0 = eval-only (skip loop), 1+ = collect→finetune cycles
+N_COLLECT_EPISODES = 50     # episodes per eval_and_collect
+FINETUNE_STEPS = 100        # 0 = skip end-to-end finetune
+FINETUNE_LR = 5e-6          # LR for end-to-end finetune
 FINETUNE_WM_STEPS = 0       # 0 = skip WM-only finetune
 FINETUNE_WM_LR = 1e-6       # LR for WM-only finetune
 BATCH_SIZE = 8
@@ -64,9 +64,9 @@ WM_ONLINE_MODE = "all"      # "all", "success_only", or "failure_only"
 
 # ── Final eval ─────────────────────────────────────────────────
 EVAL_N_EPISODES = 250       # episodes for final evaluation
-EVAL_USE_PLANNING = False   # True to enable GBP/MPPI planning at eval time
+EVAL_USE_PLANNING = True    # True to enable GBP/MPPI planning at eval time
 EVAL_PLANNING_ALGORITHM = "gcp"  # "gcp" or "mppi"
-EVAL_PLANNING_OVERRIDES = {}     # e.g. {"lr": 0.3, "lr_decay": 1.0, "n_iters": 20}
+EVAL_PLANNING_OVERRIDES = {"lr": 0.3, "lr_decay": 1.0, "n_iters": 20}
 
 # ═════════════════════════════════════════════════════════════════
 # WandB init
