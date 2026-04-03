@@ -437,6 +437,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.override_lr is not None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = cfg.override_lr
+        if lr_scheduler is not None:
+            lr_scheduler.base_lrs = [cfg.override_lr] * len(lr_scheduler.base_lrs)
         if is_main_process:
             logging.info(f"Overriding learning rate to {cfg.override_lr}")
 
