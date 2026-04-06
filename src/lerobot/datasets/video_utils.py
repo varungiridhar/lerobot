@@ -66,7 +66,17 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        try:
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        except RuntimeError as exc:
+            _default_decoder_cache.invalidate(str(video_path))
+            logging.warning(
+                "torchcodec failed while decoding %s at timestamps=%s; retrying with pyav. Original error: %s",
+                video_path,
+                timestamps,
+                exc,
+            )
+            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend="pyav")
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -201,6 +211,14 @@ class VideoDecoderCache:
             for _, file_handle in self._cache.values():
                 file_handle.close()
             self._cache.clear()
+
+    def invalidate(self, video_path: str) -> None:
+        """Remove a single cached decoder and close its file handle."""
+        with self._lock:
+            cached = self._cache.pop(str(video_path), None)
+            if cached is not None:
+                _, file_handle = cached
+                file_handle.close()
 
     def size(self) -> int:
         """Return the number of cached decoders."""

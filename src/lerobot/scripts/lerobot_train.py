@@ -56,7 +56,29 @@ from lerobot.utils.utils import (
 )
 
 
-def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
+def _rebuild_clean_viz_batch(raw_batch, dataset, preprocessor):
+    """Reload the current batch without dataset image transforms for visualization."""
+    if dataset is None or preprocessor is None:
+        return None
+    if getattr(dataset, "image_transforms", None) is None or "index" not in raw_batch:
+        return None
+
+    indices = raw_batch["index"]
+    if not isinstance(indices, torch.Tensor):
+        return None
+
+    image_transforms = dataset.image_transforms
+    dataset.image_transforms = None
+    try:
+        clean_items = [dataset[int(idx)] for idx in indices.detach().cpu().tolist()]
+    finally:
+        dataset.image_transforms = image_transforms
+
+    clean_batch = torch.utils.data.default_collate(clean_items)
+    return preprocessor(clean_batch)
+
+
+def _log_wm_visualizations(policy, batch, raw_batch, dataset, preprocessor, step, output_dir, wandb_logger):
     """Log world model image reconstruction pairs if the policy supports it.
 
     Saves a PNG grid locally with 2 rows (current obs on top, future obs on bottom).
@@ -66,7 +88,8 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
     if not hasattr(policy, "visualize"):
         return
     n_pairs = getattr(policy.config, "n_image_viz_pairs", 12)
-    viz = policy.visualize(batch, n_pairs=n_pairs)
+    viz_batch = _rebuild_clean_viz_batch(raw_batch, dataset, preprocessor) or batch
+    viz = policy.visualize(viz_batch, n_pairs=n_pairs)
     if viz is None:
         return
 
@@ -430,8 +453,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
+        raw_batch = next(dl_iter)
+        batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -475,7 +498,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_eval_step and is_main_process:
             # Log WM image reconstructions at eval frequency (no-op for non-AWM policies or state-only configs).
             _log_wm_visualizations(
-                accelerator.unwrap_model(policy), batch, step, cfg.output_dir, wandb_logger
+                accelerator.unwrap_model(policy),
+                batch,
+                raw_batch,
+                dataset,
+                preprocessor,
+                step,
+                cfg.output_dir,
+                wandb_logger,
             )
 
         if cfg.save_checkpoint and is_saving_step:

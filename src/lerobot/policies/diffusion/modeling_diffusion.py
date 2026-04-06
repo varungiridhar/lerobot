@@ -23,6 +23,7 @@ TODO(alexander-soare):
 import math
 from collections import deque
 from collections.abc import Callable
+from itertools import chain
 
 import einops
 import numpy as np
@@ -32,7 +33,14 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
+from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.ops.misc import FrozenBatchNorm2d
 
+from lerobot.policies.act_simple.modeling_act_simple import (
+    ACTEncoder,
+    ACTLearnedPositionEmbedding2d,
+    get_activation_fn,
+)
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
@@ -138,14 +146,19 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
+        return self.diffusion.compute_loss(batch)
+
+    @torch.no_grad()
+    def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        return self.diffusion.visualize(batch, n_pairs=n_pairs)
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -161,26 +174,259 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+class ResBlock2d(nn.Module):
+    """Conv2d residual block: two 3x3 convs with a skip connection."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.relu(x + self.block(x))
+
+
+class WMImageDecoder(nn.Module):
+    """Decode image latents back into pixel space for WM debugging and reconstruction loss."""
+
+    def __init__(
+        self,
+        dim_model: int,
+        image_shape: tuple[int, int, int],
+        replace_final_stride_with_dilation: bool = False,
+    ):
+        super().__init__()
+        channels, height, width = image_shape
+        stride = 16 if replace_final_stride_with_dilation else 32
+        self.h0 = height // stride
+        self.w0 = width // stride
+        base_ch = 128
+
+        self.chan_proj = nn.Conv2d(dim_model, base_ch, kernel_size=1)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(base_ch, 64, 4, stride=2, padding=1),
+            nn.ReLU(),
+            ResBlock2d(64),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.ReLU(),
+            ResBlock2d(32),
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
+            nn.ReLU(),
+            ResBlock2d(16),
+            nn.ConvTranspose2d(16, 8, 4, stride=2, padding=1),
+            nn.ReLU(),
+            ResBlock2d(8),
+            nn.ConvTranspose2d(8, channels, 4, stride=2, padding=1),
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        n_tokens, batch_size, dim_model = z.shape
+        x = z.permute(1, 2, 0).view(batch_size, dim_model, self.h0, self.w0)
+        x = self.chan_proj(x)
+        return self.decoder(x)
+
+
+def _n_encoder_tokens(config: DiffusionConfig) -> int:
+    n_tokens = sum([bool(config.robot_state_feature), bool(config.env_state_feature)])
+    if config.image_features:
+        stride = 16 if config.replace_final_stride_with_dilation else 32
+        for feat in config.image_features.values():
+            _, height, width = feat.shape
+            n_tokens += (height // stride) * (width // stride)
+    return n_tokens
+
+
+def _compute_wm_loss(z_pred: Tensor, z_target: Tensor, valid_wm: Tensor) -> Tensor:
+    valid_wm_f = valid_wm.to(dtype=z_pred.dtype)
+    valid_count = valid_wm_f.sum()
+    cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)
+    return 1 - (cos_sim * valid_wm_f).sum() / valid_count.clamp(min=1.0)
+
+
+def _compute_image_reconstruction_metrics(
+    pred: Tensor,
+    target: Tensor,
+    prefix: str,
+    valid_mask: Tensor | None = None,
+) -> dict[str, float]:
+    if valid_mask is not None:
+        if not valid_mask.any():
+            return {}
+        pred = pred[valid_mask]
+        target = target[valid_mask]
+    mse = F.mse_loss(pred, target)
+    psnr = -10.0 * torch.log10(mse.clamp(min=1e-8))
+    return {f"{prefix}/mse": float(mse.item()), f"{prefix}/psnr": float(psnr.item())}
+
+
+class WMDecoder(nn.Module):
+    """Bidirectional transformer decoder used to predict future observation latents."""
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.layers = nn.ModuleList([WMDecoderLayer(config) for _ in range(config.n_wm_decoder_layers)])
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(self, x: Tensor, cross_kv: Tensor, cross_pos: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, cross_kv, cross_pos)
+        return self.norm(x)
+
+
+class WMDecoderLayer(nn.Module):
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.multihead_attn = nn.MultiheadAttention(
+            config.dim_model, config.n_heads, dropout=config.dropout
+        )
+
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        self.norm3 = nn.LayerNorm(config.dim_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout3 = nn.Dropout(config.dropout)
+
+        self.activation = get_activation_fn(config.feedforward_activation)
+        self.pre_norm = config.pre_norm
+
+    def _add_pos(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
+        return tensor if pos_embed is None else tensor + pos_embed
+
+    def forward(self, x: Tensor, cross_kv: Tensor, cross_pos: Tensor) -> Tensor:
+        skip = x
+        if self.pre_norm:
+            x = self.norm1(x)
+        q = k = x
+        x = self.self_attn(q, k, value=x, need_weights=False)[0]
+        x = skip + self.dropout1(x)
+
+        if self.pre_norm:
+            skip = x
+            x = self.norm2(x)
+        else:
+            x = self.norm1(x)
+            skip = x
+
+        x = self.multihead_attn(
+            query=x,
+            key=self._add_pos(cross_kv, cross_pos),
+            value=cross_kv,
+            need_weights=False,
+        )[0]
+        x = skip + self.dropout2(x)
+
+        if self.pre_norm:
+            skip = x
+            x = self.norm3(x)
+        else:
+            x = self.norm2(x)
+            skip = x
+
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = skip + self.dropout3(x)
+        if not self.pre_norm:
+            x = self.norm3(x)
+        return x
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
 
         # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = self.config.robot_state_feature.shape[0]
+        per_step_global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
+                per_step_global_cond_dim += encoders[0].feature_dim * num_images
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+                per_step_global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
-            global_cond_dim += self.config.env_state_feature.shape[0]
+            per_step_global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.global_cond_dim = per_step_global_cond_dim * config.n_obs_steps
+
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=self.global_cond_dim)
+
+        if config.image_features:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=config.pretrained_backbone_weights,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            self.wm_backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            self.wm_encoder_img_feat_input_proj = nn.Conv2d(
+                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+            )
+
+        self.wm_encoder = ACTEncoder(config)
+        if config.robot_state_feature:
+            self.wm_encoder_robot_state_input_proj = nn.Linear(
+                config.robot_state_feature.shape[0], config.dim_model
+            )
+        if config.env_state_feature:
+            self.wm_encoder_env_state_input_proj = nn.Linear(
+                config.env_state_feature.shape[0], config.dim_model
+            )
+
+        self.n_1d_tokens = sum([bool(config.robot_state_feature), bool(config.env_state_feature)])
+        self.wm_encoder_1d_feature_pos_embed = nn.Embedding(self.n_1d_tokens, config.dim_model)
+        if config.image_features:
+            _, height, width = next(iter(config.image_features.values())).shape
+            self.wm_encoder_cam_feat_pos_embed = ACTLearnedPositionEmbedding2d(
+                height, width, config.dim_model
+            )
+
+        action_dim = config.action_feature.shape[0]
+        self.wm_decoder = WMDecoder(config)
+        self.wm_action_proj = nn.Linear(action_dim, config.dim_model)
+        self.wm_action_pos_embed = nn.Embedding(config.horizon, config.dim_model)
+        self.wm_global_cond_proj = nn.Sequential(
+            nn.Linear(self.global_cond_dim, config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.dim_model),
+        )
+        self.wm_global_cond_pos_embed = nn.Parameter(torch.zeros(1, 1, config.dim_model))
+
+        self.n_encoder_tokens = _n_encoder_tokens(config)
+        self.wm_query_tokens = nn.Parameter(torch.zeros(self.n_encoder_tokens, 1, config.dim_model))
+        nn.init.trunc_normal_(self.wm_query_tokens, std=0.02)
+        self.wm_query_pos_embed = nn.Embedding(self.n_encoder_tokens, config.dim_model)
+
+        self.wm_proj_head = nn.Sequential(
+            nn.Linear(config.dim_model, config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.dim_model),
+        )
+        self.wm_cross_attn_proj = nn.Sequential(
+            nn.Linear(config.dim_model, config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.dim_model),
+        )
+
+        if config.image_features:
+            stride = 16 if config.replace_final_stride_with_dilation else 32
+            _, height, width = next(iter(config.image_features.values())).shape
+            self.img_tokens_per_cam = (height // stride) * (width // stride)
+            self.wm_image_decoder = WMImageDecoder(
+                config.dim_model,
+                tuple(next(iter(config.image_features.values())).shape),
+                config.replace_final_stride_with_dilation,
+            )
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -197,6 +443,33 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+        self._reset_wm_parameters()
+
+    def _reset_wm_parameters(self):
+        modules = [
+            self.wm_encoder.parameters(),
+            self.wm_decoder.parameters(),
+            self.wm_action_proj.parameters(),
+            self.wm_global_cond_proj.parameters(),
+            self.wm_proj_head.parameters(),
+            self.wm_cross_attn_proj.parameters(),
+            self.wm_query_pos_embed.parameters(),
+            self.wm_encoder_1d_feature_pos_embed.parameters(),
+        ]
+        if hasattr(self, "wm_encoder_robot_state_input_proj"):
+            modules.append(self.wm_encoder_robot_state_input_proj.parameters())
+        if hasattr(self, "wm_encoder_env_state_input_proj"):
+            modules.append(self.wm_encoder_env_state_input_proj.parameters())
+        if hasattr(self, "wm_encoder_img_feat_input_proj"):
+            modules.append(self.wm_encoder_img_feat_input_proj.parameters())
+        if hasattr(self, "wm_image_decoder"):
+            modules.append(self.wm_image_decoder.parameters())
+
+        for p in chain(*modules):
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        nn.init.normal_(self.wm_global_cond_pos_embed, std=0.02)
 
     # ========= inference  ============
     def conditional_sample(
@@ -273,6 +546,88 @@ class DiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
+    def _conditioning_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        obs_steps = batch[OBS_STATE].shape[1]
+        if obs_steps == self.config.n_obs_steps:
+            return batch
+
+        result = dict(batch)
+        result[OBS_STATE] = batch[OBS_STATE][:, : self.config.n_obs_steps]
+        if OBS_IMAGES in batch:
+            result[OBS_IMAGES] = batch[OBS_IMAGES][:, : self.config.n_obs_steps]
+        if OBS_ENV_STATE in batch:
+            result[OBS_ENV_STATE] = batch[OBS_ENV_STATE][:, : self.config.n_obs_steps]
+        return result
+
+    def _single_observation_batch(self, batch: dict[str, Tensor], idx: int) -> dict[str, Tensor]:
+        result = {}
+        for key, value in batch.items():
+            if not isinstance(value, Tensor):
+                result[key] = value
+                continue
+            if key == OBS_IMAGES:
+                result[key] = [value[:, idx, cam_idx] for cam_idx in range(value.shape[2])]
+            elif key in {OBS_STATE, OBS_ENV_STATE}:
+                result[key] = value[:, idx]
+            else:
+                result[key] = value
+        return result
+
+    def _encode_wm_observation(self, batch: dict[str, Tensor]) -> tuple[int, Tensor, Tensor, Tensor]:
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+        elif OBS_ENV_STATE in batch:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
+        else:
+            batch_size = batch[OBS_STATE].shape[0]
+
+        encoder_in_tokens: list[Tensor] = []
+        encoder_in_pos_embed: list[Tensor] = list(self.wm_encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+
+        if self.config.robot_state_feature:
+            encoder_in_tokens.append(self.wm_encoder_robot_state_input_proj(batch[OBS_STATE]))
+        if self.config.env_state_feature:
+            encoder_in_tokens.append(self.wm_encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+        if self.config.image_features:
+            for img in batch[OBS_IMAGES]:
+                cam_features = self.wm_backbone(img)["feature_map"]
+                cam_pos_embed = self.wm_encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                cam_features = self.wm_encoder_img_feat_input_proj(cam_features)
+
+                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                encoder_in_tokens.extend(list(cam_features))
+                encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, dim=0)
+        encoder_out = self.wm_encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+        return batch_size, encoder_out, encoder_in_pos_embed, encoder_in_tokens
+
+    def _predict_future_latent(
+        self,
+        encoder_in: Tensor,
+        encoder_pos: Tensor,
+        actions: Tensor,
+        global_cond: Tensor,
+    ) -> Tensor:
+        batch_size = actions.shape[0]
+        seq_len = actions.shape[1]
+
+        action_embeds = self.wm_action_proj(actions).transpose(0, 1)
+        action_pos = self.wm_action_pos_embed.weight[:seq_len].unsqueeze(1)
+        query_pos = self.wm_query_pos_embed.weight.unsqueeze(1)
+        queries = (self.wm_query_tokens + query_pos).expand(-1, batch_size, -1)
+        global_cond_token = self.wm_global_cond_proj(global_cond).unsqueeze(0) + self.wm_global_cond_pos_embed
+
+        wm_in = torch.cat([queries, action_embeds + action_pos, global_cond_token], dim=0)
+        wm_encoder_in = encoder_in.detach() if self.config.detach_encoder_from_wm else encoder_in
+        wm_cross_kv = self.wm_cross_attn_proj(wm_encoder_in)
+        wm_out = self.wm_decoder(wm_in, wm_cross_kv, encoder_pos)
+        return self.wm_proj_head(wm_out[: self.n_encoder_tokens])
+
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """
         This function expects `batch` to have:
@@ -300,15 +655,15 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         """
         This function expects `batch` to have (at least):
         {
-            "observation.state": (B, n_obs_steps, state_dim)
+            "observation.state": (B, n_obs_steps + 1, state_dim)
 
-            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+            "observation.images": (B, n_obs_steps + 1, num_cameras, C, H, W)
                 AND/OR
-            "observation.environment_state": (B, n_obs_steps, environment_dim)
+            "observation.environment_state": (B, n_obs_steps + 1, environment_dim)
 
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
@@ -320,10 +675,14 @@ class DiffusionModel(nn.Module):
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
+        assert n_obs_steps == self.config.n_obs_steps + 1
+
+        conditioning_batch = self._conditioning_batch(batch)
+        curr_batch = self._single_observation_batch(batch, self.config.n_obs_steps - 1)
+        next_batch = self._single_observation_batch(batch, self.config.n_obs_steps)
 
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(conditioning_batch)
 
         # Forward diffusion.
         trajectory = batch[ACTION]
@@ -362,8 +721,112 @@ class DiffusionModel(nn.Module):
                 )
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
+        diffusion_loss = loss.mean()
 
-        return loss.mean()
+        _, _, encoder_pos, encoder_in = self._encode_wm_observation(curr_batch)
+        z_pred = self._predict_future_latent(encoder_in, encoder_pos, trajectory, global_cond)
+        _, _, _, next_encoder_in = self._encode_wm_observation(next_batch)
+        z_target = next_encoder_in.detach()
+
+        next_obs_is_pad = batch.get(
+            "observation.state_is_pad",
+            batch.get("observation.environment_state_is_pad"),
+        )
+        if next_obs_is_pad is None:
+            valid_wm = torch.ones(trajectory.shape[0], dtype=torch.bool, device=trajectory.device)
+        else:
+            valid_wm = ~next_obs_is_pad[:, -1]
+        wm_loss = _compute_wm_loss(z_pred, z_target, valid_wm)
+
+        total_loss = diffusion_loss + self.config.wm_loss_weight * wm_loss
+        info = {
+            "diffusion_loss": diffusion_loss.item(),
+            "action_loss": diffusion_loss.item(),
+            "wm_loss": wm_loss.item(),
+            "effective_wm_loss_weight": self.config.wm_loss_weight,
+            "z_target_norm": z_target.norm(dim=-1).mean().item(),
+            "z_pred_norm": z_pred.norm(dim=-1).mean().item(),
+            "z_pred_batch_std": z_pred.std(dim=1).mean().item(),
+            "z_target_batch_std": z_target.std(dim=1).mean().item(),
+        }
+
+        with torch.no_grad():
+            info["wm_cosine_sim"] = F.cosine_similarity(z_pred, z_target, dim=-1).mean().item()
+            info["z_pred_target_norm_ratio"] = (
+                z_pred.norm(dim=-1).mean() / z_target.norm(dim=-1).mean().clamp(min=1e-8)
+            ).item()
+
+        if hasattr(self, "wm_image_decoder") and OBS_IMAGES in curr_batch:
+            curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
+            decoded_curr = self.wm_image_decoder(curr_img_z)
+            gt_curr_img = curr_batch[OBS_IMAGES][0].detach()
+            decoder_loss = F.mse_loss(decoded_curr, gt_curr_img)
+            total_loss = total_loss + self.config.decoder_loss_weight * decoder_loss
+            info["decoder_loss"] = decoder_loss.item()
+
+            with torch.no_grad():
+                info.update(
+                    _compute_image_reconstruction_metrics(
+                        decoded_curr.detach(),
+                        gt_curr_img,
+                        prefix="wm_curr",
+                    )
+                )
+
+                next_img_z = z_pred[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
+                decoded_next = self.wm_image_decoder(next_img_z.detach())
+                gt_next_img = next_batch[OBS_IMAGES][0].detach()
+                info.update(
+                    _compute_image_reconstruction_metrics(
+                        decoded_next,
+                        gt_next_img,
+                        prefix="wm_next",
+                        valid_mask=valid_wm,
+                    )
+                )
+
+        info["loss"] = total_loss.item()
+        return total_loss, info
+
+    @torch.no_grad()
+    def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
+        if not self.config.image_features or not hasattr(self, "wm_image_decoder"):
+            return None
+
+        was_training = self.training
+        self.eval()
+
+        n = min(n_pairs, batch[ACTION].shape[0])
+        batch = {key: value[:n] if isinstance(value, Tensor) else value for key, value in batch.items()}
+
+        conditioning_batch = self._conditioning_batch(batch)
+        curr_batch = self._single_observation_batch(batch, self.config.n_obs_steps - 1)
+        next_batch = self._single_observation_batch(batch, self.config.n_obs_steps)
+        global_cond = self._prepare_global_conditioning(conditioning_batch)
+
+        _, _, encoder_pos, encoder_in = self._encode_wm_observation(curr_batch)
+        curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
+        decoded_curr = self.wm_image_decoder(curr_img_z)
+
+        z_pred = self._predict_future_latent(encoder_in, encoder_pos, batch[ACTION], global_cond)
+        next_img_z = z_pred[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
+        decoded_next = self.wm_image_decoder(next_img_z)
+        gt_curr = curr_batch[OBS_IMAGES][0]
+        gt_next = next_batch[OBS_IMAGES][0]
+
+        def _to_01(t: Tensor) -> Tensor:
+            batch_size = t.shape[0]
+            t_flat = t.view(batch_size, -1)
+            lo = t_flat.min(dim=1).values.view(batch_size, 1, 1, 1)
+            hi = t_flat.max(dim=1).values.view(batch_size, 1, 1, 1)
+            return ((t - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+
+        if was_training:
+            self.train()
+
+        curr = torch.cat([_to_01(gt_curr), _to_01(decoded_curr)], dim=3)
+        next_ = torch.cat([_to_01(gt_next), _to_01(decoded_next)], dim=3)
+        return {"curr": curr.cpu(), "next": next_.cpu()}
 
 
 class SpatialSoftmax(nn.Module):

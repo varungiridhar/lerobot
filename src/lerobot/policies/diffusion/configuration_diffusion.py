@@ -151,6 +151,25 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # World model head.
+    wm_loss_weight: float = 0.2
+    detach_encoder_from_wm: bool = False
+    decoder_loss_weight: float = 0.1
+    n_image_viz_pairs: int = 12
+
+    # ACT-style latent encoder / decoder used by the WM head.
+    replace_final_stride_with_dilation: bool = False
+    pre_norm: bool = False
+    dim_model: int = 512
+    n_heads: int = 8
+    dim_feedforward: int = 3200
+    feedforward_activation: str = "relu"
+    n_encoder_layers: int = 4
+    dropout: float = 0.1
+
+    # Approx. 60M-parameter transformer in latent space for future prediction.
+    n_wm_decoder_layers: int = 10
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
@@ -227,7 +246,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        return list(range(1 - self.n_obs_steps, 1)) + [1 - self.n_obs_steps + self.horizon]
 
     @property
     def action_delta_indices(self) -> list:
