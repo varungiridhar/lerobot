@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,17 @@ def episodes_to_lerobot_dataset(
         root=root,
         use_videos=False,
     )
+
+    # Pre-create image directories for every episode so that add_frame
+    # never hits a missing-directory error (upstream add_frame only does
+    # mkdir on frame_index==0 and write_image silently swallows errors).
+    image_keys = [k for k, v in ds_features.items() if v.get("dtype") in ("image", "video")]
+    for ep_idx in range(len(episodes)):
+        for img_key in image_keys:
+            img_dir = root / Path(
+                DEFAULT_IMAGE_PATH.format(image_key=img_key, episode_index=ep_idx, frame_index=0)
+            ).parent
+            img_dir.mkdir(parents=True, exist_ok=True)
 
     n_success, n_fail = 0, 0
     for episode in episodes:

@@ -110,11 +110,28 @@ class _FinetuneDataset(torch.utils.data.Dataset):
 
     @property
     def episodes(self):
-        return self._primary.episodes
+        # Return None so that EpisodeAwareSampler uses all combined episodes
+        # (both primary and online) when get_episode_boundaries() is used.
+        return None
 
     @property
     def features(self):
         return self._primary.features
+
+    def get_episode_boundaries(self):
+        """Return combined (from_indices, to_indices) covering primary + online episodes.
+
+        Online episode boundaries are shifted by len(primary) so they
+        correspond to the indices used by __getitem__.
+        """
+        primary_from = list(self._primary.meta.episodes["dataset_from_index"])
+        primary_to = list(self._primary.meta.episodes["dataset_to_index"])
+
+        offset = len(self._primary)
+        online_from = [idx + offset for idx in self._online.meta.episodes["dataset_from_index"]]
+        online_to = [idx + offset for idx in self._online.meta.episodes["dataset_to_index"]]
+
+        return primary_from + online_from, primary_to + online_to
 
 
 def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
@@ -240,7 +257,7 @@ def update_policy(
 
 
 @parser.wrap()
-def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, dataset=None):
     """
     Main function to train a policy.
 
@@ -308,35 +325,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Dataset loading synchronization: main process downloads first to avoid race conditions
-    if is_main_process:
-        logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
-
-    accelerator.wait_for_everyone()
-
-    # Now all other processes can safely load the dataset
-    if not is_main_process:
-        dataset = make_dataset(cfg)
-
-    # Concatenate online dataset for self-improvement finetuning
-    if cfg.online_dataset_root:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset as _LRD
-
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, dataset.meta)
-        online_ds = _LRD(
-            repo_id="online",
-            root=cfg.online_dataset_root,
-            delta_timestamps=delta_timestamps,
-            video_backend=cfg.dataset.video_backend,
-            tolerance_s=cfg.tolerance_s,
-        )
+    # When a caller passes a pre-built dataset (e.g. self-improvement
+    # pipeline), skip all dataset creation and online concatenation.
+    if dataset is None:
+        # Dataset loading synchronization: main process downloads first to avoid race conditions
         if is_main_process:
-            logging.info(
-                "Concatenating online dataset: %d episodes, %d frames from %s",
-                online_ds.num_episodes, online_ds.num_frames, cfg.online_dataset_root,
+            logging.info("Creating dataset")
+            dataset = make_dataset(cfg)
+
+        accelerator.wait_for_everyone()
+
+        # Now all other processes can safely load the dataset
+        if not is_main_process:
+            dataset = make_dataset(cfg)
+
+        # Concatenate online dataset for self-improvement finetuning
+        if cfg.online_dataset_root:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset as _LRD
+
+            delta_timestamps = resolve_delta_timestamps(cfg.policy, dataset.meta)
+            online_ds = _LRD(
+                repo_id="online",
+                root=cfg.online_dataset_root,
+                delta_timestamps=delta_timestamps,
+                video_backend=cfg.dataset.video_backend,
+                tolerance_s=cfg.tolerance_s,
             )
-        dataset = _FinetuneDataset(dataset, online_ds)
+            if is_main_process:
+                logging.info(
+                    "Concatenating online dataset: %d episodes, %d frames from %s",
+                    online_ds.num_episodes, online_ds.num_frames, cfg.online_dataset_root,
+                )
+            dataset = _FinetuneDataset(dataset, online_ds)
+    else:
+        if is_main_process:
+            logging.info("Using caller-provided dataset: %d frames, %d episodes",
+                         dataset.num_frames, dataset.num_episodes)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -442,6 +466,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_main_process:
             logging.info(f"Overriding learning rate to {cfg.override_lr}")
 
+    # Freeze parameters AFTER optimizer creation and state loading so that the
+    # optimizer state dict matches the checkpoint (all params present).  Frozen
+    # params keep their optimizer state but receive no gradients, so
+    # optimizer.step() simply skips them.
+    if cfg.trainable_param_keywords is not None:
+        n_frozen = 0
+        n_trainable = 0
+        for name, param in policy.named_parameters():
+            if any(kw in name for kw in cfg.trainable_param_keywords):
+                param.requires_grad = True
+                n_trainable += 1
+            else:
+                param.requires_grad = False
+                n_frozen += 1
+        if is_main_process:
+            logging.info(
+                "Parameter freezing: %d trainable, %d frozen (keywords: %s)",
+                n_trainable, n_frozen, cfg.trainable_param_keywords,
+            )
+
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
@@ -465,10 +509,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
+        if isinstance(dataset, _FinetuneDataset):
+            from_indices, to_indices = dataset.get_episode_boundaries()
+            episode_indices_to_use = None  # use all combined episodes
+        else:
+            from_indices = dataset.meta.episodes["dataset_from_index"]
+            to_indices = dataset.meta.episodes["dataset_to_index"]
+            episode_indices_to_use = dataset.episodes
         sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
+            from_indices,
+            to_indices,
+            episode_indices_to_use=episode_indices_to_use,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
         )

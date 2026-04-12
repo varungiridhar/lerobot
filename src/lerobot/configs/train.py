@@ -82,6 +82,12 @@ class TrainPipelineConfig(HubMixin):
     # than the one saved in the checkpoint's optimizer state.
     override_lr: float | None = None
 
+    # When set, only parameters whose name contains one of these keywords
+    # will remain trainable.  All other parameters are frozen (requires_grad=False).
+    # Useful for self-improvement finetuning where only the world model head
+    # should be updated.  Example: ["wm_"] trains only WM-related parameters.
+    trainable_param_keywords: list[str] | None = None
+
     # Path to an additional online LeRobotDataset to concatenate with the
     # primary dataset for self-improvement finetuning.  When set, training
     # samples from both the primary and online datasets.  Normalization
@@ -101,23 +107,26 @@ class TrainPipelineConfig(HubMixin):
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
-            # The entire train config is already loaded, we just need to get the checkpoint dir
-            config_path = parser.parse_arg("config_path")
-            if not config_path:
-                raise ValueError(
-                    f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
-                )
+            if self.checkpoint_path is None:
+                # Resolve checkpoint_path from CLI args (normal CLI usage).
+                # When called in-process, callers pre-set checkpoint_path and
+                # policy.pretrained_path directly, so this block is skipped.
+                config_path = parser.parse_arg("config_path")
+                if not config_path:
+                    raise ValueError(
+                        f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
+                    )
 
-            if not Path(config_path).resolve().exists():
-                raise NotADirectoryError(
-                    f"{config_path=} is expected to be a local path. "
-                    "Resuming from the hub is not supported for now."
-                )
+                if not Path(config_path).resolve().exists():
+                    raise NotADirectoryError(
+                        f"{config_path=} is expected to be a local path. "
+                        "Resuming from the hub is not supported for now."
+                    )
 
-            policy_dir = Path(config_path).parent
-            if self.policy is not None:
-                self.policy.pretrained_path = policy_dir
-            self.checkpoint_path = policy_dir.parent
+                policy_dir = Path(config_path).parent
+                if self.policy is not None:
+                    self.policy.pretrained_path = policy_dir
+                self.checkpoint_path = policy_dir.parent
 
         if self.policy is None:
             raise ValueError(

@@ -3,69 +3,74 @@
 Pipeline per iteration:
     1. Evaluate current policy & collect on-policy trajectories.
     2. Package trajectories into a LeRobotDataset on disk.
-    3. Call ``lerobot-train --resume --online_dataset_root=<path>`` to
-       continue training on the pretrain + online data (concatenated at
-       load time — no data copying).
+    3. Call ``train()`` in-process with a ``_FinetuneDataset`` that
+       concatenates pretrain + online data.
 
-Usage:
-    python -u src/lerobot/scripts/self_improvement.py <commit_hash>
+Usage (CLI):
+    lerobot-self-improve --policy_path=/path/to/pretrained_model --n_iters=3
+    # or
+    python -m lerobot.scripts.self_improvement --policy_path=/path/to/pretrained_model
 """
 
+import datetime as dt
 import logging
 import os
-import subprocess
-import sys
+import shutil
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 
-# ═════════════════════════════════════════════════════════════════
-# Determinism — must be set before any CUDA operations
-# ═════════════════════════════════════════════════════════════════
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-torch.backends.cudnn.benchmark = False
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.use_deterministic_algorithms(True)
-
-from lerobot.utils.random_utils import set_seed
+from lerobot.configs import parser
+from lerobot.policies.act_simple_with_awm_head.planning import PlanningConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ═════════════════════════════════════════════════════════════════
-# Config — edit these for each experiment
-# ═════════════════════════════════════════════════════════════════
-COMMIT = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 
-# ── Pretrain checkpoint (the starting point) ──────────────────
-POLICY = (
-    "/storage/home/hcoda1/6/vgiridhar6/forks/lerobot/outputs/"
-    "act_simple_awm_pusht_wm1.0_l2norm_truly_deterministic/checkpoints/100000/pretrained_model"
-)
-PRETRAIN_DATASET_REPO_ID = "lerobot/pusht"
-PRETRAIN_DATASET_ROOT = None  # None = use HF cache
-TASK_DESCRIPTION = "Push the T-shaped block onto the target."
+@dataclass
+class SelfImprovementConfig:
+    """Configuration for the self-improvement pipeline."""
 
-# ── Self-improvement loop ─────────────────────────────────────
-N_ITERS = 0                   # Number of collect→finetune cycles
-N_COLLECT_EPISODES = 50       # Episodes per eval_and_collect
-FINETUNE_STEPS = 100          # Training steps per iteration
-FINETUNE_LR = 5e-6            # LR for finetuning (None = keep pretrain LR)
-BATCH_SIZE = 8
-BC_MASK_MODE = "none"         # "none" or "failure"
-EVAL_SEED = 42
-LOG_FREQ = 50
-SAVE_FREQ = None              # None = save only at end of finetune
+    # ── Pretrain checkpoint (the starting point) ──────────────────
+    policy_path: str = ""
+    pretrain_dataset_repo_id: str = "lerobot/pusht"
+    pretrain_dataset_root: str | None = None
+    task_description: str = "Push the T-shaped block onto the target."
 
-# ── Final eval ────────────────────────────────────────────────
-EVAL_N_EPISODES = 250         # Final evaluation episodes
-EVAL_USE_PLANNING = True
-EVAL_PLANNING_ALGORITHM = "gbp"
-EVAL_PLANNING_OVERRIDES = {"lr": 0.3, "n_iters": 20}
+    # ── Self-improvement loop ─────────────────────────────────────
+    n_iters: int = 0
+    n_collect_episodes: int = 50
+    finetune_steps: int = 100
+    finetune_lr: float | None = 5e-6
+    batch_size: int = 8
+    bc_mask_mode: str = "none"  # "none" or "failure"
+    trainable_param_keywords: list[str] | None = None  # e.g. ["wm_"] to only train WM head
+    eval_seed: int = 42
+    log_freq: int = 50
+    save_freq: int | None = None
 
-# ── WandB ─────────────────────────────────────────────────────
-WANDB_PROJECT = "awm"
-WANDB_ENTITY = "pair-diffusion"
+    # ── Collection (and default eval) planning ─────────────────────
+    use_planning: bool = True
+    planner: PlanningConfig = field(default_factory=PlanningConfig)
+
+    # ── Final eval ────────────────────────────────────────────────
+    eval_n_episodes: int = 250
+    # Override planning config for final eval only.
+    # When None, final eval uses the same use_planning/planner as collection.
+    eval_use_planning: bool | None = None
+    eval_planner: PlanningConfig | None = None
+
+    # ── WandB ─────────────────────────────────────────────────────
+    wandb_project: str = "awm"
+    wandb_entity: str = ""
+
+    # ── General ───────────────────────────────────────────────────
+    experiment_name: str = ""  # e.g. "bc-finetune-lr5e6"
+    seed: int = 1000
+    cudnn_deterministic: bool = True
+    device: str = "cuda"
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -78,8 +83,7 @@ def eval_and_collect(
     seed: int = 42,
     device: str = "cuda",
     use_planning: bool = False,
-    planning_algorithm: str = "gcp",
-    planning_overrides: dict | None = None,
+    planner: PlanningConfig | None = None,
 ) -> tuple[dict, list[dict]]:
     """Evaluate the policy and collect trajectory data.
 
@@ -103,13 +107,9 @@ def eval_and_collect(
     policy_cfg.pretrained_path = Path(policy_path)
     policy_cfg.device = device
 
-    if use_planning:
+    if use_planning and planner is not None:
         policy_cfg.use_planning = True
-        policy_cfg.planning.algorithm = planning_algorithm
-        if planning_overrides:
-            for key, value in planning_overrides.items():
-                if hasattr(policy_cfg.planning, key):
-                    setattr(policy_cfg.planning, key, value)
+        policy_cfg.planning = planner
 
     policy = make_policy(cfg=policy_cfg, env_cfg=env_cfg)
     policy.eval()
@@ -153,56 +153,110 @@ def eval_and_collect(
     return metrics, episodes
 
 
-def run_finetune(
+def _build_finetune_dataset(
+    episodes: list[dict],
+    pretrain_cfg,
+    fps: int,
+    features: dict,
+    task_description: str,
+    bc_mask_mode: str = "none",
+):
+    """Build a _FinetuneDataset (pretrain + online) for in-process training.
+
+    Writes the online episodes to a temp directory (LeRobotDataset requires
+    disk backing), loads the pretrain dataset, resolves delta_timestamps,
+    reloads the online dataset with the correct timestamps, and wraps both
+    in a _FinetuneDataset.
+
+    Returns ``(finetune_dataset, tmp_dir)`` — caller must clean up tmp_dir.
+    """
+    from lerobot.datasets.factory import make_dataset, resolve_delta_timestamps
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.scripts.lerobot_train import _FinetuneDataset
+    from lerobot.scripts.self_improvement_data import episodes_to_lerobot_dataset
+
+    # 1. Write online episodes to a temp dir
+    tmp_dir = tempfile.mkdtemp(prefix="self_improve_online_")
+    online_root = Path(tmp_dir) / "dataset"
+    episodes_to_lerobot_dataset(
+        episodes=episodes,
+        repo_id="self_improve/online_accumulated",
+        root=online_root,
+        fps=fps,
+        features=features,
+        task_description=task_description,
+        bc_mask_mode=bc_mask_mode,
+    )
+
+    # 2. Load pretrain dataset
+    pretrain_ds = make_dataset(pretrain_cfg)
+
+    # 3. Reload online dataset with correct delta_timestamps
+    delta_timestamps = resolve_delta_timestamps(pretrain_cfg.policy, pretrain_ds.meta)
+    online_ds = LeRobotDataset(
+        repo_id="self_improve/online_accumulated",
+        root=online_root,
+        delta_timestamps=delta_timestamps,
+        tolerance_s=pretrain_cfg.tolerance_s,
+    )
+
+    logger.info(
+        "Built finetune dataset: pretrain=%d frames + online=%d frames (%d episodes)",
+        pretrain_ds.num_frames, online_ds.num_frames, online_ds.num_episodes,
+    )
+
+    return _FinetuneDataset(pretrain_ds, online_ds), tmp_dir
+
+
+def _build_train_config(
     config_path: str,
-    online_dataset_root: str,
+    checkpoint_path: Path,
     total_steps: int,
     output_dir: str,
-    commit: str,
+    job_name: str,
     finetune_lr: float | None = None,
     batch_size: int = 8,
     log_freq: int = 50,
     save_freq: int | None = None,
-) -> str:
-    """Call ``lerobot-train --resume`` as a subprocess.
+    wandb_project: str = "awm",
+    wandb_entity: str = "",
+    trainable_param_keywords: list[str] | None = None,
+):
+    """Load a TrainPipelineConfig from a checkpoint and apply overrides."""
+    from lerobot.configs.train import TrainPipelineConfig
 
-    The pretrain dataset is loaded from the checkpoint's saved config.
-    The online dataset is concatenated via ``--online_dataset_root``.
+    cfg = TrainPipelineConfig.from_pretrained(config_path)
 
-    Returns the path to the last checkpoint's pretrained_model directory.
-    """
-    actual_save_freq = save_freq if save_freq is not None else total_steps
+    # Pre-set fields that validate() normally resolves from CLI args
+    cfg.resume = True
+    cfg.checkpoint_path = checkpoint_path
+    if cfg.policy is not None:
+        cfg.policy.pretrained_path = checkpoint_path / "pretrained_model"
 
-    cmd = [
-        sys.executable, "-m", "lerobot.scripts.lerobot_train",
-        f"--config_path={config_path}",
-        "--resume=true",
-        f"--online_dataset_root={online_dataset_root}",
-        f"--steps={total_steps}",
-        f"--output_dir={output_dir}",
-        f"--job_name=self-improve-{commit[:7]}",
-        f"--batch_size={batch_size}",
-        f"--log_freq={log_freq}",
-        f"--save_freq={actual_save_freq}",
-        f"--eval_freq=0",
-        f"--wandb.enable=true",
-        f"--wandb.project={WANDB_PROJECT}",
-        f"--wandb.entity={WANDB_ENTITY}",
-        "--cudnn_deterministic=true",
-    ]
-    if finetune_lr is not None:
-        cmd.append(f"--override_lr={finetune_lr}")
+    # Apply overrides
+    cfg.steps = total_steps
+    cfg.output_dir = Path(output_dir)
+    cfg.job_name = job_name
+    cfg.batch_size = batch_size
+    cfg.log_freq = log_freq
+    cfg.save_freq = save_freq if save_freq is not None else total_steps
+    cfg.eval_freq = 0
+    cfg.cudnn_deterministic = True
+    cfg.override_lr = finetune_lr
 
-    logger.info("Running lerobot-train:\n  %s", " \\\n    ".join(cmd))
+    cfg.wandb.enable = True
+    cfg.wandb.project = wandb_project
+    cfg.wandb.entity = wandb_entity
 
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"lerobot-train failed with return code {result.returncode}")
+    cfg.trainable_param_keywords = trainable_param_keywords
 
-    # Find the last checkpoint
+    return cfg
+
+
+def _find_last_checkpoint(output_dir: str) -> str:
+    """Find the last checkpoint's pretrained_model directory."""
     ckpt_dir = Path(output_dir) / "checkpoints" / "last" / "pretrained_model"
     if not ckpt_dir.exists():
-        # Fall back to step-based directory
         checkpoints_dir = Path(output_dir) / "checkpoints"
         step_dirs = sorted(
             [d for d in checkpoints_dir.iterdir() if d.is_dir() and d.name != "last"],
@@ -211,8 +265,6 @@ def run_finetune(
         if not step_dirs:
             raise FileNotFoundError(f"No checkpoints found in {checkpoints_dir}")
         ckpt_dir = step_dirs[-1] / "pretrained_model"
-
-    logger.info("Finetune checkpoint: %s", ckpt_dir)
     return str(ckpt_dir)
 
 
@@ -220,46 +272,59 @@ def run_finetune(
 # Main
 # ═════════════════════════════════════════════════════════════════
 
-def main():
+@parser.wrap()
+def self_improve(cfg: SelfImprovementConfig):
     from lerobot.scripts.self_improvement_data import (
-        episodes_to_lerobot_dataset,
         get_pretrain_info,
         read_training_step,
     )
+    from lerobot.utils.random_utils import set_seed
 
-    set_seed(1000)
+    # ── Determinism ──────────────────────────────────────────
+    if cfg.cudnn_deterministic:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.use_deterministic_algorithms(True)
+
+    set_seed(cfg.seed)
 
     # ── Resolve paths ────────────────────────────────────────
-    policy_dir = Path(POLICY)
+    policy_dir = Path(cfg.policy_path)
     checkpoint_dir = policy_dir.parent  # e.g. .../checkpoints/last/
-    base_output = str(checkpoint_dir / "self_improvement" / COMMIT[:8])
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    slug = cfg.experiment_name or f"run_pid{os.getpid()}"
+    run_id = f"{timestamp}_{slug}"
+    base_output = str(checkpoint_dir / "self_improvement" / run_id)
 
     # ── Pretrain info ────────────────────────────────────────
-    pretrain_info = get_pretrain_info(PRETRAIN_DATASET_REPO_ID, PRETRAIN_DATASET_ROOT)
+    pretrain_info = get_pretrain_info(cfg.pretrain_dataset_repo_id, cfg.pretrain_dataset_root)
     pretrain_step = read_training_step(checkpoint_dir)
     logger.info(
         "Pretrain: %s — %d episodes, %d frames, step %d",
-        PRETRAIN_DATASET_REPO_ID, pretrain_info["num_episodes"],
+        cfg.pretrain_dataset_repo_id, pretrain_info["num_episodes"],
         pretrain_info["num_frames"], pretrain_step,
     )
 
-    ckpt = POLICY
+    ckpt = cfg.policy_path
     current_step = pretrain_step
 
-    for iteration in range(N_ITERS):
+    all_collected_episodes = []  # Accumulate across iterations
+
+    for iteration in range(cfg.n_iters):
         logger.info("=" * 60)
-        logger.info("ITERATION %d / %d  (step %d)", iteration, N_ITERS, current_step)
+        logger.info("ITERATION %d / %d  (step %d)", iteration, cfg.n_iters, current_step)
         logger.info("=" * 60)
 
         # ── 1. Evaluate and collect ──────────────────────────
-        logger.info("Collecting %d episodes...", N_COLLECT_EPISODES)
+        logger.info("Collecting %d episodes...", cfg.n_collect_episodes)
         metrics, episodes = eval_and_collect(
             ckpt,
-            n_episodes=N_COLLECT_EPISODES,
-            seed=EVAL_SEED,
-            use_planning=EVAL_USE_PLANNING,
-            planning_algorithm=EVAL_PLANNING_ALGORITHM,
-            planning_overrides=EVAL_PLANNING_OVERRIDES or None,
+            n_episodes=cfg.n_collect_episodes,
+            seed=cfg.eval_seed,
+            device=cfg.device,
+            use_planning=cfg.use_planning,
+            planner=cfg.planner,
         )
         n_success = sum(1 for e in episodes if e["success"])
         n_fail = len(episodes) - n_success
@@ -268,57 +333,102 @@ def main():
             metrics["pc_success"], n_success, n_fail,
         )
 
-        # ── 2. Package online data as LeRobotDataset ─────────
-        iter_dir = Path(base_output) / f"iter_{iteration}"
-        online_root = iter_dir / "online_dataset"
-        online_ds = episodes_to_lerobot_dataset(
-            episodes=episodes,
-            repo_id=f"self_improve/online_iter{iteration}",
-            root=online_root,
-            fps=pretrain_info["fps"],
-            features=pretrain_info["features"],
-            task_description=TASK_DESCRIPTION,
-            bc_mask_mode=BC_MASK_MODE,
+        # ── 2. Accumulate and package online data ────────────
+        all_collected_episodes.extend(episodes)
+        logger.info(
+            "Accumulated dataset: %d total episodes (%d new this iteration)",
+            len(all_collected_episodes), len(episodes),
         )
 
-        # ── 3. Finetune via lerobot-train ────────────────────
-        # No merge needed — lerobot-train concatenates the pretrain
-        # dataset (from the checkpoint config) with the online dataset
-        # via --online_dataset_root.
-        total_steps = current_step + FINETUNE_STEPS
+        # ── 3. Build dataset and train in-process ────────────
+        total_steps = current_step + cfg.finetune_steps
+        iter_dir = Path(base_output) / f"iter_{iteration}"
         ft_output_dir = str(iter_dir / "train")
         ft_config_path = str(Path(ckpt) / "train_config.json")
 
-        ckpt = run_finetune(
+        train_cfg = _build_train_config(
             config_path=ft_config_path,
-            online_dataset_root=str(online_ds.root),
+            checkpoint_path=Path(ckpt).parent,
             total_steps=total_steps,
             output_dir=ft_output_dir,
-            commit=COMMIT,
-            finetune_lr=FINETUNE_LR,
-            batch_size=BATCH_SIZE,
-            log_freq=LOG_FREQ,
-            save_freq=SAVE_FREQ,
+            job_name=f"self-improve-{slug}",
+            finetune_lr=cfg.finetune_lr,
+            batch_size=cfg.batch_size,
+            log_freq=cfg.log_freq,
+            save_freq=cfg.save_freq,
+            wandb_project=cfg.wandb_project,
+            wandb_entity=cfg.wandb_entity,
+            trainable_param_keywords=cfg.trainable_param_keywords,
         )
+
+        dataset, tmp_dir = _build_finetune_dataset(
+            episodes=all_collected_episodes,
+            pretrain_cfg=train_cfg,
+            fps=pretrain_info["fps"],
+            features=pretrain_info["features"],
+            task_description=cfg.task_description,
+            bc_mask_mode=cfg.bc_mask_mode,
+        )
+
+        try:
+            from lerobot.scripts.lerobot_train import train
+            train(train_cfg, dataset=dataset)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logger.info("Cleaned up temp online dataset: %s", tmp_dir)
+
+        ckpt = _find_last_checkpoint(ft_output_dir)
         current_step = total_steps
-        logger.info("Finetune done → %s (step %d)", ckpt, current_step)
+        logger.info("Finetune done -> %s (step %d)", ckpt, current_step)
 
     # ═════════════════════════════════════════════════════════
     # Final evaluation
     # ═════════════════════════════════════════════════════════
-    logger.info("Running final evaluation (%d episodes)...", EVAL_N_EPISODES)
-    final_metrics, _ = eval_and_collect(
+    final_use_planning = cfg.eval_use_planning if cfg.eval_use_planning is not None else cfg.use_planning
+    final_planner = cfg.eval_planner if cfg.eval_planner is not None else cfg.planner
+
+    # Always run BC baseline eval first (no planning).
+    logger.info("Running BC baseline evaluation (%d episodes)...", cfg.eval_n_episodes)
+    bc_metrics, _ = eval_and_collect(
         ckpt,
-        n_episodes=EVAL_N_EPISODES,
-        seed=EVAL_SEED,
-        use_planning=EVAL_USE_PLANNING,
-        planning_algorithm=EVAL_PLANNING_ALGORITHM,
-        planning_overrides=EVAL_PLANNING_OVERRIDES or None,
+        n_episodes=cfg.eval_n_episodes,
+        seed=cfg.eval_seed,
+        device=cfg.device,
+        use_planning=False,
     )
-    print(f"EVAL_RESULTS: {final_metrics.get('pc_success', 0):.1f}% success")
-    print(f"EVAL_AVG_MAX_REWARD: {final_metrics.get('avg_max_reward', 0):.4f}")
-    print(f"EVAL_EP_S: {final_metrics.get('eval_ep_s', 0):.3f}")
+    print(f"BC_EVAL_RESULTS: {bc_metrics.get('pc_success', 0):.1f}% success")
+    print(f"BC_EVAL_AVG_MAX_REWARD: {bc_metrics.get('avg_max_reward', 0):.4f}")
+    print(f"BC_EVAL_EP_S: {bc_metrics.get('eval_ep_s', 0):.3f}")
+
+    # If final eval uses planning, run it as a second eval.
+    # Otherwise BC baseline IS the final eval — no need to duplicate.
+    if final_use_planning:
+        logger.info(
+            "Running planning evaluation (%d episodes, planner=%s)...",
+            cfg.eval_n_episodes, final_planner.algorithm if final_planner else "default",
+        )
+        plan_metrics, _ = eval_and_collect(
+            ckpt,
+            n_episodes=cfg.eval_n_episodes,
+            seed=cfg.eval_seed,
+            device=cfg.device,
+            use_planning=True,
+            planner=final_planner,
+        )
+        print(f"PLAN_EVAL_RESULTS: {plan_metrics.get('pc_success', 0):.1f}% success")
+        print(f"PLAN_EVAL_AVG_MAX_REWARD: {plan_metrics.get('avg_max_reward', 0):.4f}")
+        print(f"PLAN_EVAL_EP_S: {plan_metrics.get('eval_ep_s', 0):.3f}")
+
     print(f"CHECKPOINT: {ckpt}")
+
+
+def main():
+    from lerobot.utils.import_utils import register_third_party_plugins
+    from lerobot.utils.utils import init_logging
+
+    init_logging()
+    register_third_party_plugins()
+    self_improve()
 
 
 if __name__ == "__main__":
