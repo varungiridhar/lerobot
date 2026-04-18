@@ -175,6 +175,7 @@ prompt*.md
 # Data folders
 data/
 outputs
+experiments/
 
 # Translations
 *.mo
