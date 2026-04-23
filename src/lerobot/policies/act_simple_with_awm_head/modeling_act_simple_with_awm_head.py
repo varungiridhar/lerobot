@@ -264,62 +264,54 @@ class SharedResNet18Backbone(nn.Module):
 
 
 class ActionVisionHead(nn.Module):
-    """Diffusion-policy visual head on top of the shared ResNet feature map."""
+    """Diffusion-policy visual head on top of a shared ResNet feature map."""
 
-    def __init__(self, config: ACTSimpleWithAWMHeadConfig, shared_backbone: SharedResNet18Backbone):
+    def __init__(
+        self,
+        config: ACTSimpleWithAWMHeadConfig,
+        feature_map_shape: tuple[int, int, int],
+        shared_backbone: SharedResNet18Backbone | None = None,
+    ):
         super().__init__()
         self.config = config
+        # Kept as a module alias for older checkpoints; forward consumes precomputed feature maps.
         self.shared_backbone = shared_backbone
-
-        if config.action_crop_shape is not None:
-            self.do_crop = True
-            self.center_crop = torchvision.transforms.CenterCrop(config.action_crop_shape)
-            if config.action_crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.action_crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
-        else:
-            self.do_crop = False
-
-        images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.action_crop_shape if config.action_crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        feature_map_shape = get_output_shape(self.shared_backbone, dummy_shape)[1:]
-
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.action_spatial_softmax_num_keypoints)
         self.feature_dim = config.action_spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(self.feature_dim, self.feature_dim)
         self.relu = nn.ReLU()
 
-    def forward(self, x: Tensor) -> Tensor:
-        if self.do_crop:
-            x = self.maybe_random_crop(x) if self.training else self.center_crop(x)
-        x = self.shared_backbone(x)
-        x = torch.flatten(self.pool(x), start_dim=1)
+    def forward(self, feature_map: Tensor) -> Tensor:
+        x = torch.flatten(self.pool(feature_map), start_dim=1)
         x = self.relu(self.out(x))
         return x
 
 
 class ActionDiffusionModel(nn.Module):
-    """Diffusion-policy action generator with its own visual encoder stack."""
+    """Diffusion-policy action generator conditioned on shared visual features."""
 
-    def __init__(self, config: ACTSimpleWithAWMHeadConfig, shared_backbone: SharedResNet18Backbone | None):
+    def __init__(
+        self,
+        config: ACTSimpleWithAWMHeadConfig,
+        feature_map_shape: tuple[int, int, int] | None,
+        shared_backbone: SharedResNet18Backbone | None = None,
+    ):
         super().__init__()
         self.config = config
 
         global_cond_dim = config.robot_state_feature.shape[0]
         if config.image_features:
             num_images = len(config.image_features)
+            if feature_map_shape is None:
+                raise ValueError("Feature map shape is required when image features are configured.")
             if config.action_use_separate_rgb_encoder_per_camera:
-                if shared_backbone is None:
-                    raise ValueError("A shared backbone is required when image features are configured.")
-                encoders = [ActionVisionHead(config, shared_backbone) for _ in range(num_images)]
+                encoders = [
+                    ActionVisionHead(config, feature_map_shape, shared_backbone) for _ in range(num_images)
+                ]
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
             else:
-                if shared_backbone is None:
-                    raise ValueError("A shared backbone is required when image features are configured.")
-                self.rgb_encoder = ActionVisionHead(config, shared_backbone)
+                self.rgb_encoder = ActionVisionHead(config, feature_map_shape, shared_backbone)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if config.env_state_feature:
             global_cond_dim += config.env_state_feature.shape[0]
@@ -352,17 +344,23 @@ class ActionDiffusionModel(nn.Module):
             use_film_scale_modulation=self.config.action_use_film_scale_modulation,
         )
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+    def _prepare_global_conditioning(
+        self,
+        batch: dict[str, Tensor],
+        image_feature_maps: Tensor | None = None,
+    ) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
 
         if self.config.image_features:
+            if image_feature_maps is None:
+                raise ValueError("Precomputed shared ResNet feature maps are required for image conditioning.")
             if self.config.action_use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                features_per_camera = einops.rearrange(image_feature_maps, "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
                     [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                        encoder(features)
+                        for encoder, features in zip(self.rgb_encoder, features_per_camera, strict=True)
                     ]
                 )
                 img_features = einops.rearrange(
@@ -373,7 +371,7 @@ class ActionDiffusionModel(nn.Module):
                 )
             else:
                 img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                    einops.rearrange(image_feature_maps, "b s n ... -> (b s n) ...")
                 )
                 img_features = einops.rearrange(
                     img_features,
@@ -388,8 +386,8 @@ class ActionDiffusionModel(nn.Module):
 
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        global_cond = self._prepare_global_conditioning(batch)
+    def compute_loss(self, batch: dict[str, Tensor], image_feature_maps: Tensor | None = None) -> Tensor:
+        global_cond = self._prepare_global_conditioning(batch, image_feature_maps)
         trajectory = batch[ACTION]
         eps = torch.randn_like(trajectory)
         timesteps = torch.randint(
@@ -412,9 +410,14 @@ class ActionDiffusionModel(nn.Module):
         return loss.mean()
 
     @torch.no_grad()
-    def sample(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def sample(
+        self,
+        batch: dict[str, Tensor],
+        image_feature_maps: Tensor | None = None,
+        noise: Tensor | None = None,
+    ) -> Tensor:
         batch_size = batch[OBS_STATE].shape[0]
-        global_cond = self._prepare_global_conditioning(batch)
+        global_cond = self._prepare_global_conditioning(batch, image_feature_maps)
         sample = (
             noise
             if noise is not None
@@ -510,6 +513,13 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
         return self.model.predict_action(queued_batch)
 
+    def _prepare_wm_observation(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Format a single-step observation batch for the WM encoder."""
+        wm_batch = dict(batch)
+        if self.config.image_features:
+            wm_batch[OBS_IMAGES] = [wm_batch[key] for key in self.config.image_features]
+        return wm_batch
+
     @torch.no_grad()
     def set_goal(self, batch: dict[str, Tensor]) -> None:
         """Encode a goal observation and store its latent tokens for planning.
@@ -519,11 +529,7 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
                 Should correspond to a single time-step (n_obs_steps=1).
         """
         self.eval()
-        if self.config.use_planning:
-            raise NotImplementedError("Planning has not been updated for the diffusion action branch yet.")
-        if self.config.image_features:
-            batch = dict(batch)
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = self._prepare_wm_observation(batch)
         _, _, encoder_pos, encoder_in = self.model._encode(batch)
         # encoder_in: (S, B, dim_model) — store as-is, index per batch element during planning.
         self._z_goal = encoder_in
@@ -541,7 +547,34 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         Returns:
             (B, chunk_size, action_dim) tensor of planned actions.
         """
-        raise NotImplementedError("Planning has not been updated for the diffusion action branch yet.")
+        if self._planner is None:
+            return self.predict_action_chunk(batch)
+        if self._z_goal is None:
+            raise RuntimeError("Planning requested before calling set_goal().")
+
+        queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
+        initial_actions = self.model.predict_action(queued_batch)
+
+        wm_batch = self._prepare_wm_observation(batch)
+        _, _, encoder_pos, encoder_in = self.model._encode(wm_batch)
+        encoder_pos = self._encoder_pos_cache if self._encoder_pos_cache is not None else encoder_pos
+
+        batch_size = initial_actions.shape[0]
+        goal_batch_size = self._z_goal.shape[1]
+        planned_actions = []
+        for batch_idx in range(batch_size):
+            goal_idx = batch_idx if goal_batch_size > 1 else 0
+            planned_actions.append(
+                self._planner.optimize(
+                    z_start=encoder_in[:, batch_idx].detach(),
+                    encoder_pos=encoder_pos,
+                    z_goal=self._z_goal[:, goal_idx].detach(),
+                    initial_actions=initial_actions[batch_idx].detach(),
+                    wm_predict_fn=self.model.run_wm_decoder,
+                )
+            )
+
+        return torch.stack(planned_actions, dim=0)
 
     @torch.no_grad()
     def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
@@ -728,12 +761,14 @@ class ACTSimpleWithAWMHead(nn.Module):
         super().__init__()
         self.config = config
 
-        shared_backbone = None
+        feature_map_shape = None
         if config.image_features:
             self.shared_backbone = SharedResNet18Backbone(config)
-            shared_backbone = self.shared_backbone
+            images_shape = next(iter(config.image_features.values())).shape
+            dummy_shape = (1, *images_shape)
+            feature_map_shape = get_output_shape(self.shared_backbone, dummy_shape)[1:]
 
-        self.action_diffusion = ActionDiffusionModel(config, shared_backbone)
+        self.action_diffusion = ActionDiffusionModel(config, feature_map_shape, getattr(self, "shared_backbone", None))
 
         # ------------------------------------------------------------------
         # Transformer encoder for the WM branch
@@ -868,7 +903,32 @@ class ACTSimpleWithAWMHead(nn.Module):
     # Encoding
     # ------------------------------------------------------------------
 
-    def _encode(self, batch: dict[str, Tensor]) -> tuple[int, Tensor, Tensor, Tensor]:
+    def _encode_stacked_image_features(self, images: Tensor) -> Tensor:
+        """Run all observation images through the shared ResNet in one flattened pass."""
+        batch_size, n_obs_steps, n_images = images.shape[:3]
+        flat_images = einops.rearrange(images, "b s n c h w -> (b s n) c h w")
+        flat_features = self.shared_backbone(flat_images)
+        return einops.rearrange(
+            flat_features,
+            "(b s n) c h w -> b s n c h w",
+            b=batch_size,
+            s=n_obs_steps,
+            n=n_images,
+        )
+
+    def _encode_image_list_features(self, images: list[Tensor]) -> list[Tensor]:
+        """Run a list of camera images through the shared ResNet with one concatenated call."""
+        if len(images) == 1:
+            return [self.shared_backbone(images[0])]
+        batch_size = images[0].shape[0]
+        flat_features = self.shared_backbone(torch.cat(images, dim=0))
+        return list(flat_features.split(batch_size, dim=0))
+
+    def _encode(
+        self,
+        batch: dict[str, Tensor],
+        image_feature_maps: list[Tensor] | None = None,
+    ) -> tuple[int, Tensor, Tensor, Tensor]:
         """Run the encoder.
 
         Returns:
@@ -891,8 +951,9 @@ class ACTSimpleWithAWMHead(nn.Module):
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
         if self.config.image_features:
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.shared_backbone(img)
+            if image_feature_maps is None:
+                image_feature_maps = self._encode_image_list_features(batch[OBS_IMAGES])
+            for cam_features in image_feature_maps:
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
@@ -986,8 +1047,17 @@ class ACTSimpleWithAWMHead(nn.Module):
         next_batch: dict[str, Tensor],
     ) -> tuple[Tensor, tuple[Tensor, Tensor, Tensor | None, Tensor | None]]:
         """Training forward: diffusion action loss + WM loss."""
-        action_loss = self.action_diffusion.compute_loss(action_batch)
-        batch_size, _, encoder_pos, encoder_in = self._encode(curr_batch)
+        action_feature_maps = None
+        curr_feature_maps = None
+        if self.config.image_features:
+            action_feature_maps = self._encode_stacked_image_features(action_batch[OBS_IMAGES])
+            curr_feature_maps = [
+                action_feature_maps[:, self.config.n_obs_steps - 1, cam_idx]
+                for cam_idx in range(action_feature_maps.shape[2])
+            ]
+
+        action_loss = self.action_diffusion.compute_loss(action_batch, action_feature_maps)
+        batch_size, _, encoder_pos, encoder_in = self._encode(curr_batch, curr_feature_maps)
 
         # === World model decoder ===
         # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
@@ -1032,7 +1102,10 @@ class ACTSimpleWithAWMHead(nn.Module):
 
     def predict_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Inference: predict action chunk (no WM needed)."""
-        return self.action_diffusion.sample(batch)
+        image_feature_maps = None
+        if self.config.image_features:
+            image_feature_maps = self._encode_stacked_image_features(batch[OBS_IMAGES])
+        return self.action_diffusion.sample(batch, image_feature_maps)
 
     def run_wm_decoder(
         self,

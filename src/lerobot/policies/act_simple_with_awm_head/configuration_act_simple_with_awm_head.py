@@ -74,10 +74,10 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
     # The diffusion-policy loader drops the final frames to avoid excessive action padding.
     drop_n_last_frames: int = 7  # chunk_size - n_action_steps - n_obs_steps + 1
 
-    # Action diffusion branch: vision backbone + crop/spatial-softmax preprocessing.
+    # Action diffusion branch: shared full-frame vision backbone + spatial-softmax preprocessing.
     action_vision_backbone: str = "resnet18"
-    action_crop_shape: tuple[int, int] | None = (84, 84)
-    action_crop_is_random: bool = True
+    action_crop_shape: tuple[int, int] | None = None
+    action_crop_is_random: bool = False
     action_pretrained_backbone_weights: str | None = None
     action_use_group_norm: bool = True
     action_spatial_softmax_num_keypoints: int = 32
@@ -212,13 +212,8 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
             raise ValueError("You must provide `observation.state` for the diffusion action branch.")
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
-        if self.action_crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.action_crop_shape[0] > image_ft.shape[1] or self.action_crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`action_crop_shape` should fit within the images shapes. Got {self.action_crop_shape} "
-                        f"for `action_crop_shape` and {image_ft.shape} for `{key}`."
-                    )
+        # Deprecated crop fields are accepted for checkpoint compatibility, but the action and WM
+        # branches now both consume full-frame shared ResNet feature maps.
 
     @property
     def observation_delta_indices(self) -> list[int]:
