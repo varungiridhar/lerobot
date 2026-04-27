@@ -166,7 +166,8 @@ wandb/
 data
 
 # Claude
-.claude/
+.claude/*
+!.claude/skills/
 prompt*.md
 
 # Dev scripts
@@ -175,7 +176,6 @@ prompt*.md
 # Data folders
 data/
 outputs
-experiments/
 
 # Translations
 *.mo
