@@ -6,9 +6,9 @@ from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
 from .helpers.gradient import gradient_checkpoint_forward
 
-from lerobot.policies.fastwam.utils.logging_config import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):

@@ -12,9 +12,9 @@ from .state_dict_converters import (
 from ..wan_video_dit import WanVideoDiT
 from ..wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
 from ..wan_video_vae import WanVideoVAE38
-from lerobot.policies.fastwam.utils.logging_config import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
 
 

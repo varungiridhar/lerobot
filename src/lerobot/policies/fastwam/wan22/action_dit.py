@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional
 
-from lerobot.policies.fastwam.utils.logging_config import get_logger
+import logging
 
 from .helpers.gradient import gradient_checkpoint_forward
 from .wan_video_dit import (
@@ -12,7 +12,7 @@ from .wan_video_dit import (
     precompute_freqs_cis,
 )
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class ActionHead(nn.Module):

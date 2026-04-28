@@ -3,11 +3,11 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from lerobot.policies.fastwam.utils.logging_config import get_logger
+import logging
 
 from .fastwam_joint import FastWAMJoint
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class FastWAMIDM(FastWAMJoint):

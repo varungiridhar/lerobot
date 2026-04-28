@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
-from lerobot.policies.fastwam.utils.logging_config import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class MoT(nn.Module):
