@@ -14,16 +14,20 @@ from torch import Tensor
 class PlanningConfig:
     """Configuration for test-time latent state planning.
 
-    Shared fields (used by both MPPI and GBP):
+    Defaults reflect optima from the 2026-04-04 PushT planning hparam sweep
+    (sweep run M13 for MPPI, G7 for GBP). Active values below are MPPI's,
+    matching algorithm="mppi"; GBP's differing optima are shown as comments.
+
+    Shared:
         algorithm: Planning algorithm — "mppi" or "gbp".
-        n_samples: Number of candidate trajectories sampled per iteration.
-        n_iters: Maximum number of refinement iterations.
-        noise_std: Initial noise standard deviation for trajectory perturbation.
-        action_cost_coef: Optional coefficient for action magnitude regularization.
-        noise_decay: Multiplicative decay applied to noise_std each iteration.
+        noise_std: Perturbation std (MPPI sampling; GBP is gradient-based, unused).
 
     MPPI-specific:
+        n_samples: Number of candidate trajectories sampled per iteration.
+        n_iters: Maximum number of refinement iterations.
+        noise_decay: Multiplicative decay applied to noise_std each iteration.
         temperature: Softmax temperature for importance weight computation.
+        action_cost_coef: Optional coefficient for action magnitude regularization.
 
     GBP-specific:
         lr: Gradient descent step size.
@@ -33,17 +37,20 @@ class PlanningConfig:
     """
 
     algorithm: str = "mppi"
+    noise_std: float = 0.3
+
+    # MPPI optimum (sweep M13: 49.2% success, avg_max_reward=0.8143)
     n_samples: int = 64
     n_iters: int = 5
-    noise_std: float = 0.3
-    action_cost_coef: float = 0.0
     noise_decay: float = 0.5
+    temperature: float = 0.05
+    action_cost_coef: float = 0.0
 
-    # MPPI
-    temperature: float = 1.0
-
-    # GBP
-    lr: float = 0.1
+    # GBP optimum (sweep G7: 47.6% success, avg_max_reward=0.7848).
+    # To use, set algorithm="gbp" and override:
+    #   n_iters: int = 10
+    #   action_cost_coef: float = 0.1
+    lr: float = 0.3
     lr_decay: float = 1.0
     convergence_tol: float = 1e-3
     antithetic: bool = True
