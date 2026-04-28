@@ -161,16 +161,16 @@ class FastWAMPolicy(PreTrainedPolicy):
         return chunk.unsqueeze(0)            # (1, chunk_size, action_dim)
 
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return the next action (B=1, action_dim) from the action queue.
+        """Return the next action (B, action_dim) from the action queue.
 
         When the queue is empty, run a new inference pass to fill it with
         ``n_action_steps`` actions from the current observation.
         """
         if not self._queue:
-            chunk = self.predict_action_chunk(batch)  # (1, chunk_size, action_dim)
-            for a in chunk[0, : self.config.n_action_steps]:
-                self._queue.append(a)
-        return self._queue.popleft().unsqueeze(0)  # (1, action_dim)
+            chunk = self.predict_action_chunk(batch)  # (B, chunk_size, action_dim)
+            # Queue steps as (B, action_dim) tensors, matching ACT convention.
+            self._queue.extend(chunk[:, : self.config.n_action_steps].transpose(0, 1))
+        return self._queue.popleft()  # (B, action_dim)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Training forward pass — delegates to FastWAM.training_loss."""

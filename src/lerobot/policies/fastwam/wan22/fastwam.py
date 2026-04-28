@@ -1044,7 +1044,7 @@ class FastWAM(torch.nn.Module):
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": latents_action[0].detach().to(dtype=torch.float32),
         }
 
     @torch.no_grad()
