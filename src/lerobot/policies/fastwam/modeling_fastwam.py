@@ -128,6 +128,9 @@ class FastWAMPolicy(PreTrainedPolicy):
         if config.freeze_text_encoder and self.model.text_encoder is not None:
             for p in self.model.text_encoder.parameters():
                 p.requires_grad_(False)
+        if config.freeze_video_dit:
+            for p in self.model.video_expert.parameters():
+                p.requires_grad_(False)
 
         self.reset()
 

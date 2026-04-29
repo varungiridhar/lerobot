@@ -193,6 +193,3 @@ results_self_improvement_deterministic.tsv
 
 # experiments things
 experiment/
-*.md
-*.png
-*.pdf

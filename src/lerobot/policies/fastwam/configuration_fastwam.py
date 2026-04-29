@@ -62,14 +62,9 @@ class FastWAMConfig(PreTrainedConfig):
     # ---- Inference ----
     num_inference_steps: int = 20
 
-    # ---- Temporal (video DiT) ----
-    num_video_frames: int = 33          # total frames in video sequence (VAE latent T)
-    action_video_freq_ratio: int = 4    # action tokens per video frame
-
     # ---- Pretrained weights (Wan2.2) ----
     wan22_pretrained_path: str = "Wan-AI/Wan2.2-TI2V-5B"
     tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B"
-    load_wan22_weights: bool = True     # compat alias (always True at inference)
     load_text_encoder: bool = True
     redirect_common_files: bool = True  # use DiffSynth safetensors mirrors
     action_dit_pretrained_path: str | None = None
