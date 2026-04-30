@@ -257,7 +257,12 @@ def update_policy(
 
 
 @parser.wrap()
-def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, dataset=None):
+def train(
+    cfg: TrainPipelineConfig,
+    accelerator: Accelerator | None = None,
+    dataset=None,
+    extra_wandb_metrics: dict | None = None,
+):
     """
     Main function to train a policy.
 
@@ -272,6 +277,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, data
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
+        dataset: Optional pre-built dataset (used by the self-improvement orchestrator).
+        extra_wandb_metrics: Optional dict of scalar metrics to log to wandb at the
+            resumed step before the training loop starts. Used by the self-improvement
+            orchestrator to log on-policy collection stats (e.g. n_success / n_fail)
+            so all wandb logging stays inside this function.
     """
     cfg.validate()
 
@@ -456,6 +466,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, data
 
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+
+    # Log caller-provided context metrics (e.g. on-policy collection stats from the
+    # self-improvement orchestrator) at the resumed step, before any training updates.
+    if extra_wandb_metrics and wandb_logger is not None:
+        wandb_logger.log_dict(extra_wandb_metrics, step)
 
     # Apply LR override after loading optimizer state (useful for finetuning with a different LR)
     if cfg.override_lr is not None:

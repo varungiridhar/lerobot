@@ -187,30 +187,6 @@ def episodes_from_eval_info(info: dict) -> list[dict]:
     return episodes
 
 
-def get_pretrain_info(
-    pretrain_repo_id: str,
-    pretrain_root: str | Path | None = None,
-) -> dict:
-    """Load pretrain dataset metadata without reading frame data.
-
-    Returns dict with ``fps``, ``features``, ``num_episodes``,
-    ``num_frames``, and ``task_description``.
-    """
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
-    meta = LeRobotDatasetMetadata(pretrain_repo_id, root=pretrain_root)
-    task_desc = ""
-    if meta.tasks is not None and len(meta.tasks) > 0:
-        task_desc = meta.tasks.iloc[0].name
-    return {
-        "fps": meta.fps,
-        "features": dict(meta.features),
-        "num_episodes": meta.total_episodes,
-        "num_frames": meta.total_frames,
-        "task_description": task_desc,
-    }
-
-
 def read_training_step(checkpoint_dir: str | Path) -> int:
     """Read the training step from a checkpoint directory."""
     from lerobot.utils.train_utils import load_training_step
