@@ -30,7 +30,7 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset, resolve_delta_timestamps
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler, WeightedEpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -507,7 +507,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, data
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    drop_n_last = getattr(cfg.policy, "drop_n_last_frames", None)
+    use_weighted = (
+        isinstance(dataset, _FinetuneDataset)
+        and cfg.online_sample_ratio is not None
+    )
+    if drop_n_last is not None or use_weighted:
         shuffle = False
         if isinstance(dataset, _FinetuneDataset):
             from_indices, to_indices = dataset.get_episode_boundaries()
@@ -516,13 +521,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None, data
             from_indices = dataset.meta.episodes["dataset_from_index"]
             to_indices = dataset.meta.episodes["dataset_to_index"]
             episode_indices_to_use = dataset.episodes
-        sampler = EpisodeAwareSampler(
-            from_indices,
-            to_indices,
-            episode_indices_to_use=episode_indices_to_use,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
+        if use_weighted:
+            sampler = WeightedEpisodeAwareSampler(
+                from_indices,
+                to_indices,
+                n_primary_episodes=dataset._primary.num_episodes,
+                online_sample_ratio=cfg.online_sample_ratio,
+                drop_n_last_frames=drop_n_last if drop_n_last is not None else 0,
+            )
+            if is_main_process:
+                logging.info(
+                    "Using WeightedEpisodeAwareSampler with online_sample_ratio=%.3f",
+                    cfg.online_sample_ratio,
+                )
+        else:
+            sampler = EpisodeAwareSampler(
+                from_indices,
+                to_indices,
+                episode_indices_to_use=episode_indices_to_use,
+                drop_n_last_frames=drop_n_last,
+                shuffle=True,
+            )
     else:
         shuffle = True
         sampler = None

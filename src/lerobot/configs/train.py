@@ -94,6 +94,12 @@ class TrainPipelineConfig(HubMixin):
     # statistics come from the primary dataset only.
     online_dataset_root: str | None = None
 
+    # When set (in (0, 1)) and the dataset is a _FinetuneDataset, each batch
+    # frame is drawn from the online bucket with this probability and from
+    # the primary (pretrain) bucket otherwise (RLPD-style upsampling).
+    # When None, sampling is uniform over the union of primary + online frames.
+    online_sample_ratio: float | None = None
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
