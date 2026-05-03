@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
-from lerobot.optim.optimizers import AdamConfig
-from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.optim.optimizers import AdamConfig, AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig, DiffuserSchedulerConfig
 from lerobot.policies.act_simple_with_awm_head.planning import PlanningConfig
 
 
@@ -27,9 +27,10 @@ from lerobot.policies.act_simple_with_awm_head.planning import PlanningConfig
 class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
     """Configuration for ACT Simple + World Model Head policy.
 
-    Combines a diffusion-policy action head with the world model decoder from AWM.
-    The action generator uses the same diffusion U-Net setup as the diffusion policy,
-    while the world model decoder keeps the existing transformer-based latent prediction path.
+    By default this matches the main-branch ACT Simple + AWM head implementation:
+    an ACT Simple action decoder with an AWM-style world model head. When
+    ``use_diffusion_action_head`` is enabled, the action generator switches to the
+    diffusion-policy U-Net path while keeping the existing world model decoder.
 
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy.
@@ -59,20 +60,23 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 1
     chunk_size: int = 16
-    n_action_steps: int = 8
+    n_action_steps: int = 10
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MIN_MAX,
-            "ACTION": NormalizationMode.MIN_MAX,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.MEAN_STD,
         }
     )
 
+    # Action branch selector.
+    use_diffusion_action_head: bool = False
+
     # The diffusion-policy loader drops the final frames to avoid excessive action padding.
-    drop_n_last_frames: int = 7  # chunk_size - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int = 0
 
     # Action diffusion branch: shared full-frame vision backbone + spatial-softmax preprocessing.
     action_vision_backbone: str = "resnet18"
@@ -131,12 +135,17 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
     n_image_viz_pairs: int = 12
 
     # Training preset.
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 1e-5
+    optimizer_lr_backbone: float = 1e-5
+    optimizer_grad_clip_norm: float = 10.0
     optimizer_betas: tuple[float, float] = (0.95, 0.999)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
+    optimizer_weight_decay: float = 0.0
+    use_lr_schedule: bool = False
     scheduler_name: str = "cosine"
-    scheduler_warmup_steps: int = 500
+    scheduler_warmup_steps: int = 5000
+    scheduler_decay_steps: int = 100_000
+    scheduler_decay_lr: float = 0.0
 
     # Test-time planning.
     use_planning: bool = False
@@ -155,60 +164,80 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
-        if not self.action_vision_backbone.startswith("resnet"):
-            raise ValueError(
-                f"`action_vision_backbone` must be one of the ResNet variants. Got {self.action_vision_backbone}."
-            )
-        if self.vision_backbone != self.action_vision_backbone:
-            raise ValueError(
-                "The WM and action branches now share a single visual backbone, so "
-                f"`vision_backbone` and `action_vision_backbone` must match. Got "
-                f"{self.vision_backbone=} and {self.action_vision_backbone=}."
-            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.n_obs_steps <= 0:
+        if self.use_diffusion_action_head:
+            if self.drop_n_last_frames == 0:
+                self.drop_n_last_frames = self.chunk_size - self.n_action_steps - self.n_obs_steps + 1
+            if not self.action_vision_backbone.startswith("resnet"):
+                raise ValueError(
+                    f"`action_vision_backbone` must be one of the ResNet variants. Got {self.action_vision_backbone}."
+                )
+            if self.vision_backbone != self.action_vision_backbone:
+                raise ValueError(
+                    "The WM and action branches now share a single visual backbone, so "
+                    f"`vision_backbone` and `action_vision_backbone` must match. Got "
+                    f"{self.vision_backbone=} and {self.action_vision_backbone=}."
+                )
+            if self.n_obs_steps <= 0:
+                raise ValueError(f"`n_obs_steps` must be positive. Got {self.n_obs_steps}.")
+            supported_prediction_types = ["epsilon", "sample"]
+            if self.action_prediction_type not in supported_prediction_types:
+                raise ValueError(
+                    f"`action_prediction_type` must be one of {supported_prediction_types}. "
+                    f"Got {self.action_prediction_type}."
+                )
+            supported_noise_schedulers = ["DDPM", "DDIM"]
+            if self.action_noise_scheduler_type not in supported_noise_schedulers:
+                raise ValueError(
+                    f"`action_noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+                    f"Got {self.action_noise_scheduler_type}."
+                )
+            downsampling_factor = 2 ** len(self.action_down_dims)
+            if self.chunk_size % downsampling_factor != 0:
+                raise ValueError(
+                    "The chunk size should be an integer multiple of the diffusion downsampling factor. "
+                    f"Got {self.chunk_size=} and {self.action_down_dims=}."
+                )
+        elif self.n_obs_steps != 1:
             raise ValueError(
-                f"`n_obs_steps` must be positive. Got {self.n_obs_steps}."
-            )
-        supported_prediction_types = ["epsilon", "sample"]
-        if self.action_prediction_type not in supported_prediction_types:
-            raise ValueError(
-                f"`action_prediction_type` must be one of {supported_prediction_types}. "
-                f"Got {self.action_prediction_type}."
-            )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.action_noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`action_noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.action_noise_scheduler_type}."
-            )
-        downsampling_factor = 2 ** len(self.action_down_dims)
-        if self.chunk_size % downsampling_factor != 0:
-            raise ValueError(
-                "The chunk size should be an integer multiple of the diffusion downsampling factor. "
-                f"Got {self.chunk_size=} and {self.action_down_dims=}."
+                f"Multiple observation steps not handled yet without diffusion. Got `nobs_steps={self.n_obs_steps}`"
             )
 
-    def get_optimizer_preset(self) -> AdamConfig:
-        return AdamConfig(
+    def get_optimizer_preset(self) -> AdamConfig | AdamWConfig:
+        if self.use_diffusion_action_head:
+            return AdamConfig(
+                lr=self.optimizer_lr,
+                betas=self.optimizer_betas,
+                eps=self.optimizer_eps,
+                weight_decay=self.optimizer_weight_decay,
+            )
+        return AdamWConfig(
             lr=self.optimizer_lr,
-            betas=self.optimizer_betas,
-            eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
-    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
-        return DiffuserSchedulerConfig(
-            name=self.scheduler_name,
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig | CosineDecayWithWarmupSchedulerConfig | None:
+        if self.use_diffusion_action_head:
+            return DiffuserSchedulerConfig(
+                name=self.scheduler_name,
+                num_warmup_steps=self.scheduler_warmup_steps,
+            )
+        if not self.use_lr_schedule:
+            return None
+        return CosineDecayWithWarmupSchedulerConfig(
             num_warmup_steps=self.scheduler_warmup_steps,
+            num_decay_steps=self.scheduler_decay_steps,
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
         )
 
     def validate_features(self) -> None:
-        if self.robot_state_feature is None:
+        if self.use_diffusion_action_head and self.robot_state_feature is None:
             raise ValueError("You must provide `observation.state` for the diffusion action branch.")
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
@@ -217,7 +246,9 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        return list(range(1 - self.n_obs_steps, 1)) + [self.chunk_size]
+        if self.use_diffusion_action_head:
+            return list(range(1 - self.n_obs_steps, 1)) + [self.chunk_size]
+        return [0, self.chunk_size]
 
     @property
     def action_delta_indices(self) -> list:

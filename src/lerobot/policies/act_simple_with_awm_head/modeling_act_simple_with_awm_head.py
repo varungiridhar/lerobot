@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion action head + AWM world-model head."""
+"""ACT Simple + AWM head with an optional diffusion action branch."""
 
 from collections import deque
 from copy import deepcopy
@@ -25,8 +25,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
+from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act_simple.modeling_act_simple import (
+    ACTDecoder,
     ACTEncoder,
     ACTLearnedPositionEmbedding2d,
     get_activation_fn,
@@ -442,7 +445,7 @@ class ActionDiffusionModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
-    """Diffusion action policy with an AWM-style world model head."""
+    """ACT Simple + AWM head policy with an optional diffusion action branch."""
 
     config_class = ACTSimpleWithAWMHeadConfig
     name = "act_simple_with_awm_head"
@@ -465,18 +468,39 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        return self.model.parameters()
+        if self.config.use_diffusion_action_head:
+            return self.model.parameters()
+        return [
+            {
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if not n.startswith("model.backbone") and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if n.startswith("model.backbone") and p.requires_grad
+                ],
+                "lr": self.config.optimizer_lr_backbone,
+            },
+        ]
 
     def reset(self):
         """This should be called whenever the environment is reset."""
-        self._queues = {
-            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
-            ACTION: deque(maxlen=self.config.n_action_steps),
-        }
-        if self.config.image_features:
-            self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
-        if self.config.env_state_feature:
-            self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.use_diffusion_action_head:
+            self._queues = {
+                OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+                ACTION: deque(maxlen=self.config.n_action_steps),
+            }
+            if self.config.image_features:
+                self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.env_state_feature:
+                self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        else:
+            self._queues = None
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._z_goal: Tensor | None = None            # (S, B, dim_model)
         self._encoder_pos_cache: Tensor | None = None  # (S, 1, dim_model)
@@ -491,13 +515,14 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
 
-        if ACTION in batch:
-            batch = dict(batch)
-            batch.pop(ACTION)
-        if self.config.image_features:
-            batch = dict(batch)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        self._queues = populate_queues(self._queues, batch)
+        if self.config.use_diffusion_action_head:
+            if ACTION in batch:
+                batch = dict(batch)
+                batch.pop(ACTION)
+            if self.config.image_features:
+                batch = dict(batch)
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            self._queues = populate_queues(self._queues, batch)
 
         if len(self._action_queue) == 0:
             if self.config.use_planning and self._z_goal is not None:
@@ -510,8 +535,14 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
-        queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
-        return self.model.predict_action(queued_batch)
+        if self.config.use_diffusion_action_head:
+            queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
+            return self.model.predict_action(queued_batch)
+
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        return self.model.predict_action(batch)
 
     def _prepare_wm_observation(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Format a single-step observation batch for the WM encoder."""
@@ -552,11 +583,36 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         if self._z_goal is None:
             raise RuntimeError("Planning requested before calling set_goal().")
 
-        queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
-        initial_actions = self.model.predict_action(queued_batch)
+        if self.config.use_diffusion_action_head:
+            queued_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in self._queues if k != ACTION}
+            initial_actions = self.model.predict_action(queued_batch)
 
-        wm_batch = self._prepare_wm_observation(batch)
-        _, _, encoder_pos, encoder_in = self.model._encode(wm_batch)
+            wm_batch = self._prepare_wm_observation(batch)
+            _, _, encoder_pos, encoder_in = self.model._encode(wm_batch)
+            encoder_pos = self._encoder_pos_cache if self._encoder_pos_cache is not None else encoder_pos
+
+            batch_size = initial_actions.shape[0]
+            goal_batch_size = self._z_goal.shape[1]
+            planned_actions = []
+            for batch_idx in range(batch_size):
+                goal_idx = batch_idx if goal_batch_size > 1 else 0
+                planned_actions.append(
+                    self._planner.optimize(
+                        z_start=encoder_in[:, batch_idx].detach(),
+                        encoder_pos=encoder_pos,
+                        z_goal=self._z_goal[:, goal_idx].detach(),
+                        initial_actions=initial_actions[batch_idx].detach(),
+                        wm_predict_fn=self.model.run_wm_decoder,
+                    )
+                )
+            return torch.stack(planned_actions, dim=0)
+
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        initial_actions = self.model.predict_action(batch)
+        _, _, encoder_pos, encoder_in = self.model._encode(batch)
         encoder_pos = self._encoder_pos_cache if self._encoder_pos_cache is not None else encoder_pos
 
         batch_size = initial_actions.shape[0]
@@ -656,32 +712,48 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         return {"curr": curr.cpu(), "next": next_.cpu()}
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Training forward pass: diffusion action loss + WM loss."""
-        curr_obs_idx = self.config.n_obs_steps - 1
-        next_obs_idx = self.config.n_obs_steps
+        """Training forward pass: action loss + WM loss."""
+        if self.config.use_diffusion_action_head:
+            curr_obs_idx = self.config.n_obs_steps - 1
+            next_obs_idx = self.config.n_obs_steps
 
-        action_batch = _slice_obs_batch(batch, slice(0, self.config.n_obs_steps))
-        curr_batch = _slice_obs_batch(batch, curr_obs_idx)
-        next_batch = _slice_obs_batch(batch, next_obs_idx)
+            action_batch = _slice_obs_batch(batch, slice(0, self.config.n_obs_steps))
+            curr_batch = _slice_obs_batch(batch, curr_obs_idx)
+            next_batch = _slice_obs_batch(batch, next_obs_idx)
 
-        if self.config.image_features:
-            action_batch = dict(action_batch)
-            action_batch[OBS_IMAGES] = torch.stack(
-                [action_batch[key] for key in self.config.image_features],
-                dim=2,
-            )
-            curr_batch = dict(curr_batch)
-            curr_batch[OBS_IMAGES] = [curr_batch[key] for key in self.config.image_features]
-            next_batch = dict(next_batch)
-            next_batch[OBS_IMAGES] = [next_batch[key] for key in self.config.image_features]
+            if self.config.image_features:
+                action_batch = dict(action_batch)
+                action_batch[OBS_IMAGES] = torch.stack(
+                    [action_batch[key] for key in self.config.image_features],
+                    dim=2,
+                )
+                curr_batch = dict(curr_batch)
+                curr_batch[OBS_IMAGES] = [curr_batch[key] for key in self.config.image_features]
+                next_batch = dict(next_batch)
+                next_batch[OBS_IMAGES] = [next_batch[key] for key in self.config.image_features]
+            action_loss, wm_tensors = self.model(action_batch, curr_batch, next_batch)
+        else:
+            curr_obs_idx = 0
+            next_obs_idx = 1
+            curr_batch = _slice_obs_batch(batch, curr_obs_idx)
+            next_batch = _slice_obs_batch(batch, next_obs_idx)
+
+            if self.config.image_features:
+                curr_batch = dict(curr_batch)
+                curr_batch[OBS_IMAGES] = [curr_batch[key] for key in self.config.image_features]
+                next_batch = dict(next_batch)
+                next_batch[OBS_IMAGES] = [next_batch[key] for key in self.config.image_features]
+            bc_loss_mask = batch.get("bc_loss_mask")
+            if bc_loss_mask is not None:
+                curr_batch = dict(curr_batch)
+                curr_batch["bc_loss_mask"] = bc_loss_mask
+            action_loss, wm_tensors = self.model(curr_batch, None, next_batch)
 
         # Episode-boundary mask: True where t+H is beyond the episode end.
         next_obs_is_pad = batch.get(
             "observation.state_is_pad",
             batch.get("observation.environment_state_is_pad"),
         )
-
-        action_loss, wm_tensors = self.model(action_batch, curr_batch, next_batch)
 
         # WM loss.
         z_pred, z_target, decoded_curr, gt_curr_img = wm_tensors
@@ -755,7 +827,7 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
 # ---------------------------------------------------------------------------
 
 class ACTSimpleWithAWMHead(nn.Module):
-    """Core network: diffusion action branch + WM decoder head."""
+    """Core network: main-branch ACT Simple path or optional diffusion path."""
 
     def __init__(self, config: ACTSimpleWithAWMHeadConfig):
         super().__init__()
@@ -763,17 +835,33 @@ class ACTSimpleWithAWMHead(nn.Module):
 
         feature_map_shape = None
         if config.image_features:
-            self.shared_backbone = SharedResNet18Backbone(config)
-            images_shape = next(iter(config.image_features.values())).shape
-            dummy_shape = (1, *images_shape)
-            feature_map_shape = get_output_shape(self.shared_backbone, dummy_shape)[1:]
+            if config.use_diffusion_action_head:
+                self.shared_backbone = SharedResNet18Backbone(config)
+                images_shape = next(iter(config.image_features.values())).shape
+                dummy_shape = (1, *images_shape)
+                feature_map_shape = get_output_shape(self.shared_backbone, dummy_shape)[1:]
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
-        self.action_diffusion = ActionDiffusionModel(config, feature_map_shape, getattr(self, "shared_backbone", None))
+        if config.use_diffusion_action_head:
+            self.action_diffusion = ActionDiffusionModel(
+                config,
+                feature_map_shape,
+                getattr(self, "shared_backbone", None),
+            )
 
         # ------------------------------------------------------------------
         # Transformer encoder for the WM branch
         # ------------------------------------------------------------------
         self.encoder = ACTEncoder(config)
+
+        if not config.use_diffusion_action_head:
+            self.action_decoder = ACTDecoder(config)
 
         # ------------------------------------------------------------------
         # Encoder input projections
@@ -787,8 +875,9 @@ class ACTSimpleWithAWMHead(nn.Module):
                 config.env_state_feature.shape[0], config.dim_model
             )
         if config.image_features:
+            backbone_out_channels = self.shared_backbone.out_channels if config.use_diffusion_action_head else backbone_model.fc.in_features
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                self.shared_backbone.out_channels, config.dim_model, kernel_size=1
+                backbone_out_channels, config.dim_model, kernel_size=1
             )
 
         # ------------------------------------------------------------------
@@ -802,6 +891,9 @@ class ACTSimpleWithAWMHead(nn.Module):
             self.encoder_cam_feat_pos_embed = ACTLearnedPositionEmbedding2d(H, W, config.dim_model)
 
         action_dim = config.action_feature.shape[0]
+        if not config.use_diffusion_action_head:
+            self.action_decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+            self.action_head = nn.Linear(config.dim_model, action_dim)
 
         # ------------------------------------------------------------------
         # World model decoder
@@ -861,14 +953,11 @@ class ACTSimpleWithAWMHead(nn.Module):
         return self
 
     def _reset_parameters(self):
-        modules = [
-            self.action_diffusion.parameters(),
-            self.encoder.parameters(),
-            self.wm_decoder.parameters(),
-            self.wm_proj_head.parameters(),
-            self.wm_cross_attn_proj.parameters(),
-            self.wm_query_pos_embed.parameters(),
-        ]
+        modules = [self.encoder.parameters(), self.wm_decoder.parameters(), self.wm_proj_head.parameters(), self.wm_cross_attn_proj.parameters(), self.wm_query_pos_embed.parameters()]
+        if self.config.use_diffusion_action_head:
+            modules.insert(0, self.action_diffusion.parameters())
+        else:
+            modules.insert(0, self.action_decoder.parameters())
         if hasattr(self, "wm_image_decoder"):
             modules.append(self.wm_image_decoder.parameters())
         for p in chain(*modules):
@@ -878,6 +967,8 @@ class ACTSimpleWithAWMHead(nn.Module):
     def _build_ema_encoder(self):
         if hasattr(self, "shared_backbone"):
             self.ema_shared_backbone = deepcopy(self.shared_backbone)
+        if hasattr(self, "backbone"):
+            self.ema_backbone = deepcopy(self.backbone)
         self.ema_encoder = deepcopy(self.encoder)
         if hasattr(self, "encoder_robot_state_input_proj"):
             self.ema_encoder_robot_state_input_proj = deepcopy(self.encoder_robot_state_input_proj)
@@ -951,9 +1042,13 @@ class ACTSimpleWithAWMHead(nn.Module):
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
         if self.config.image_features:
-            if image_feature_maps is None:
-                image_feature_maps = self._encode_image_list_features(batch[OBS_IMAGES])
-            for cam_features in image_feature_maps:
+            if self.config.use_diffusion_action_head:
+                if image_feature_maps is None:
+                    image_feature_maps = self._encode_image_list_features(batch[OBS_IMAGES])
+                feature_iter = image_feature_maps
+            else:
+                feature_iter = [self.backbone(img)["feature_map"] for img in batch[OBS_IMAGES]]
+            for cam_features in feature_iter:
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
@@ -983,7 +1078,10 @@ class ACTSimpleWithAWMHead(nn.Module):
 
         if self.config.image_features:
             for img in batch[OBS_IMAGES]:
-                cam_features = self.ema_shared_backbone(img)
+                if self.config.use_diffusion_action_head:
+                    cam_features = self.ema_shared_backbone(img)
+                else:
+                    cam_features = self.ema_backbone(img)["feature_map"]
                 cam_pos_embed = self.ema_encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.ema_encoder_img_feat_input_proj(cam_features)
 
@@ -1007,6 +1105,8 @@ class ACTSimpleWithAWMHead(nn.Module):
         ema_pairs = []
         if hasattr(self, "ema_shared_backbone"):
             ema_pairs.extend(zip(self.shared_backbone.parameters(), self.ema_shared_backbone.parameters()))
+        if hasattr(self, "ema_backbone"):
+            ema_pairs.extend(zip(self.backbone.parameters(), self.ema_backbone.parameters()))
         ema_pairs.extend(zip(self.encoder.parameters(), self.ema_encoder.parameters()))
         if hasattr(self, "ema_encoder_robot_state_input_proj"):
             ema_pairs.extend(
@@ -1046,18 +1146,42 @@ class ACTSimpleWithAWMHead(nn.Module):
         curr_batch: dict[str, Tensor],
         next_batch: dict[str, Tensor],
     ) -> tuple[Tensor, tuple[Tensor, Tensor, Tensor | None, Tensor | None]]:
-        """Training forward: diffusion action loss + WM loss."""
-        action_feature_maps = None
-        curr_feature_maps = None
-        if self.config.image_features:
-            action_feature_maps = self._encode_stacked_image_features(action_batch[OBS_IMAGES])
-            curr_feature_maps = [
-                action_feature_maps[:, self.config.n_obs_steps - 1, cam_idx]
-                for cam_idx in range(action_feature_maps.shape[2])
-            ]
-
-        action_loss = self.action_diffusion.compute_loss(action_batch, action_feature_maps)
-        batch_size, _, encoder_pos, encoder_in = self._encode(curr_batch, curr_feature_maps)
+        """Training forward: action loss + WM loss."""
+        if self.config.use_diffusion_action_head:
+            action_feature_maps = None
+            curr_feature_maps = None
+            if self.config.image_features:
+                action_feature_maps = self._encode_stacked_image_features(action_batch[OBS_IMAGES])
+                curr_feature_maps = [
+                    action_feature_maps[:, self.config.n_obs_steps - 1, cam_idx]
+                    for cam_idx in range(action_feature_maps.shape[2])
+                ]
+            action_loss = self.action_diffusion.compute_loss(action_batch, action_feature_maps)
+            batch_size, _, encoder_pos, encoder_in = self._encode(curr_batch, curr_feature_maps)
+            actions = action_batch[ACTION]
+        else:
+            batch_size, encoder_out, encoder_pos, encoder_in = self._encode(action_batch)
+            decoder_in = torch.zeros(
+                (self.config.chunk_size, batch_size, self.config.dim_model),
+                dtype=encoder_pos.dtype,
+                device=encoder_pos.device,
+            )
+            decoder_out = self.action_decoder(
+                decoder_in,
+                encoder_out,
+                encoder_pos_embed=encoder_pos,
+                decoder_pos_embed=self.action_decoder_pos_embed.weight.unsqueeze(1),
+            )
+            decoder_out = decoder_out.transpose(0, 1)
+            actions = self.action_head(decoder_out)
+            action_loss_unreduced = (
+                F.l1_loss(action_batch[ACTION], actions, reduction="none")
+                * ~action_batch["action_is_pad"].unsqueeze(-1)
+            )
+            bc_loss_mask = action_batch.get("bc_loss_mask")
+            if bc_loss_mask is not None:
+                action_loss_unreduced = action_loss_unreduced * bc_loss_mask.view(-1, 1, 1)
+            action_loss = action_loss_unreduced.mean()
 
         # === World model decoder ===
         # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
@@ -1070,7 +1194,6 @@ class ACTSimpleWithAWMHead(nn.Module):
             z_target = F.normalize(z_target, dim=-1)
 
         # WM input: [S query tokens, T continuous action tokens].
-        actions = action_batch[ACTION]  # (B, T, action_dim)
         T = actions.shape[1]
         action_embeds = self.wm_action_proj(actions).transpose(0, 1)  # (T, B, dim_model)
         wm_action_pos = self.wm_action_pos_embed.weight[:T].unsqueeze(1)  # (T, 1, dim_model)
@@ -1090,22 +1213,39 @@ class ACTSimpleWithAWMHead(nn.Module):
 
         # Image decoder.
         decoded_curr, gt_curr_img = None, None
-        if hasattr(self, "wm_image_decoder") and OBS_IMAGES in curr_batch:
+        image_batch = curr_batch if self.config.use_diffusion_action_head else action_batch
+        if hasattr(self, "wm_image_decoder") and OBS_IMAGES in image_batch:
             curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
             if self.config.normalize_wm_representations:
                 curr_img_z = F.normalize(curr_img_z, dim=-1)
             decoded_curr = self.wm_image_decoder(curr_img_z.detach())
-            gt_curr_img = curr_batch[OBS_IMAGES][0].detach()
+            gt_curr_img = image_batch[OBS_IMAGES][0].detach()
 
         wm_tensors = (z_pred, z_target, decoded_curr, gt_curr_img)
         return action_loss, wm_tensors
 
     def predict_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Inference: predict action chunk (no WM needed)."""
-        image_feature_maps = None
-        if self.config.image_features:
-            image_feature_maps = self._encode_stacked_image_features(batch[OBS_IMAGES])
-        return self.action_diffusion.sample(batch, image_feature_maps)
+        if self.config.use_diffusion_action_head:
+            image_feature_maps = None
+            if self.config.image_features:
+                image_feature_maps = self._encode_stacked_image_features(batch[OBS_IMAGES])
+            return self.action_diffusion.sample(batch, image_feature_maps)
+
+        batch_size, encoder_out, encoder_pos, _ = self._encode(batch)
+        decoder_in = torch.zeros(
+            (self.config.chunk_size, batch_size, self.config.dim_model),
+            dtype=encoder_pos.dtype,
+            device=encoder_pos.device,
+        )
+        decoder_out = self.action_decoder(
+            decoder_in,
+            encoder_out,
+            encoder_pos_embed=encoder_pos,
+            decoder_pos_embed=self.action_decoder_pos_embed.weight.unsqueeze(1),
+        )
+        decoder_out = decoder_out.transpose(0, 1)
+        return self.action_head(decoder_out)
 
     def run_wm_decoder(
         self,
