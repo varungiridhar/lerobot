@@ -70,7 +70,12 @@ def _save_init_states(hdf5_path, demo_keys, out_path):
     print(f"Saved {len(init_states)} init states to {out_path}")
 
 
-def convert_mimicgen_to_lerobot(hdf5_path, repo_id, root=None, max_episodes=None, fps=20, use_videos=True, save_init_states=False):
+def _looks_like_lerobot_dataset(path: Path) -> bool:
+    """A directory we created via LeRobotDataset.create() always has meta/info.json."""
+    return (path / "meta" / "info.json").is_file()
+
+
+def convert_mimicgen_to_lerobot(hdf5_path, repo_id, root=None, max_episodes=None, fps=20, use_videos=True, save_init_states=False, force=False):
     hdf5_path = Path(hdf5_path)
     with h5py.File(hdf5_path, "r") as f:
         env_args = json.loads(f["data"].attrs["env_args"])
@@ -99,6 +104,12 @@ def convert_mimicgen_to_lerobot(hdf5_path, repo_id, root=None, max_episodes=None
 
     root_path = Path(root) if root else HF_LEROBOT_HOME / repo_id
     if root_path.exists():
+        if not (_looks_like_lerobot_dataset(root_path) or force):
+            raise RuntimeError(
+                f"Refusing to delete {root_path}: does not look like a LeRobot dataset "
+                f"(missing meta/info.json). Pass --force to override."
+            )
+        print(f"Removing existing dataset at {root_path}")
         shutil.rmtree(root_path)
 
     dataset = LeRobotDataset.create(repo_id=repo_id, fps=fps, features=features, root=root_path, robot_type="panda", use_videos=use_videos)
@@ -143,5 +154,7 @@ if __name__ == "__main__":
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--no_videos", action="store_true")
     p.add_argument("--save_init_states", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="Allow deleting --root even if it doesn't look like a LeRobot dataset.")
     a = p.parse_args()
-    convert_mimicgen_to_lerobot(a.hdf5_path, a.repo_id, a.root, a.max_episodes, a.fps, not a.no_videos, a.save_init_states)
+    convert_mimicgen_to_lerobot(a.hdf5_path, a.repo_id, a.root, a.max_episodes, a.fps, not a.no_videos, a.save_init_states, a.force)
