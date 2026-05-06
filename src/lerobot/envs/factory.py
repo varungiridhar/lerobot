@@ -20,7 +20,7 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, PushtEnv
+from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, MimicGenEnv, PushtEnv
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import ProcessorStep
@@ -35,6 +35,8 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return PushtEnv(**kwargs)
     elif env_type == "libero":
         return LiberoEnv(**kwargs)
+    elif env_type == "mimicgen":
+        return MimicGenEnv(**kwargs)
     else:
         raise ValueError(f"Policy type '{env_type}' is not available.")
 
@@ -179,6 +181,21 @@ def make_env(
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
             control_mode=cfg.control_mode,
+            episode_length=cfg.episode_length,
+        )
+    elif "mimicgen" in cfg.type:
+        from lerobot.envs.mimicgen import create_mimicgen_envs
+
+        if cfg.task is None:
+            raise ValueError("MimicGenEnv requires a task to be specified")
+
+        return create_mimicgen_envs(
+            task=cfg.task,
+            n_envs=n_envs,
+            camera_name=cfg.camera_name,
+            init_states_path=cfg.init_states_path,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
             episode_length=cfg.episode_length,
         )
     elif "metaworld" in cfg.type:

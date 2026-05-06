@@ -32,6 +32,8 @@ from lerobot.utils.constants import (
     LIBERO_KEY_JOINTS_VEL,
     LIBERO_KEY_PIXELS_AGENTVIEW,
     LIBERO_KEY_PIXELS_EYE_IN_HAND,
+    MIMICGEN_KEY_PIXELS_AGENTVIEW,
+    MIMICGEN_KEY_PIXELS_EYE_IN_HAND,
     OBS_ENV_STATE,
     OBS_IMAGE,
     OBS_IMAGES,
@@ -341,6 +343,60 @@ class LiberoEnv(EnvConfig):
         return {
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
+        }
+
+
+@EnvConfig.register_subclass("mimicgen")
+@dataclass
+class MimicGenEnv(EnvConfig):
+    task: str = "Coffee_D0"
+    fps: int = 20
+    episode_length: int | None = None
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "agentview,robot0_eye_in_hand"
+    init_states_path: str | None = None
+    observation_height: int = 84
+    observation_width: int = 84
+    # Resolution for env.render() — used by lerobot_eval to record videos.
+    # Decoupled from observation_height/width so the policy still sees 84x84
+    # while video output looks reasonable.
+    render_height: int = 256
+    render_width: int = 256
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            MIMICGEN_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+            MIMICGEN_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    def __post_init__(self):
+        self.features[MIMICGEN_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+        )
+        self.features[MIMICGEN_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+        )
+        if self.obs_type == "pixels_agent_pos":
+            # Flat 8D state: eef_pos(3) + axis_angle(3) + gripper_qpos(2)
+            self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(8,))
+        elif self.obs_type != "pixels":
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "render_height": self.render_height,
+            "render_width": self.render_width,
         }
 
 

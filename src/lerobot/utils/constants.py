@@ -86,3 +86,8 @@ LIBERO_KEY_JOINTS_POS = "robot_state/joints/pos"
 LIBERO_KEY_JOINTS_VEL = "robot_state/joints/vel"
 LIBERO_KEY_PIXELS_AGENTVIEW = "pixels/agentview_image"
 LIBERO_KEY_PIXELS_EYE_IN_HAND = "pixels/robot0_eye_in_hand_image"
+
+# Constants for MimicGen image observation keys (env emits flat agent_pos so no
+# robot_state sub-keys are needed in features_map).
+MIMICGEN_KEY_PIXELS_AGENTVIEW = "pixels/agentview"
+MIMICGEN_KEY_PIXELS_EYE_IN_HAND = "pixels/robot0_eye_in_hand"
