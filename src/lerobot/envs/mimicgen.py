@@ -143,6 +143,7 @@ class MimicGenEnv(gym.Env):
         self.render_width = render_width if render_width is not None else observation_width
         self.num_steps_wait = num_steps_wait
         self._max_episode_steps = max_episode_steps
+        self._elapsed_steps = 0
 
         self.camera_name = _parse_camera_names(camera_name)
         if camera_name_mapping is None:
@@ -252,48 +253,55 @@ class MimicGenEnv(gym.Env):
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
-
-        # robosuite's placement samplers / lighting / contact-solver caches use
-        # np.random under the hood and aren't seeded by gym. Seed them here so
-        # the same gym seed yields bit-identical observations across resets.
-        if seed is not None:
-            np.random.seed(seed)
+        self._elapsed_steps = 0
 
         idx = None
         if self._init_states is not None:
             idx = int(self.np_random.integers(len(self._init_states)))
 
-        # Restore the per-demo XML model when available. Source demos randomize
-        # object placements per demo; without restoring the matching XML the
-        # set_state below loads qpos into a slightly different model and the
-        # resulting eef pose / rendered scene drifts from the recorded demo.
-        if (
-            idx is not None
-            and self._model_files is not None
-            and idx < len(self._model_files)
-            and self._model_files[idx]
-        ):
-            self._env.reset()
-            xml = self._model_files[idx]
-            if hasattr(self._env, "edit_model_xml"):
-                xml = self._env.edit_model_xml(xml)
+        # robosuite's placement samplers / lighting / contact-solver caches use
+        # the global np.random under the hood and aren't seeded by gym. Scope a
+        # global-RNG window around the reset so we get bit-identical sims for
+        # the same gym seed without dirtying numpy's RNG for the rest of the
+        # process (dataloaders, augmentations, MPPI noise, etc.).
+        np_state = np.random.get_state()
+        try:
+            if seed is not None:
+                np.random.seed(seed)
+
+            # Restore the per-demo XML model when available. Source demos randomize
+            # object placements per demo; without restoring the matching XML the
+            # set_state below loads qpos into a slightly different model and the
+            # resulting eef pose / rendered scene drifts from the recorded demo.
+            if (
+                idx is not None
+                and self._model_files is not None
+                and idx < len(self._model_files)
+                and self._model_files[idx]
+            ):
+                self._env.reset()
+                xml = self._model_files[idx]
+                if hasattr(self._env, "edit_model_xml"):
+                    xml = self._env.edit_model_xml(xml)
+                else:
+                    from robosuite.utils.mjcf_utils import postprocess_model_xml
+                    xml = postprocess_model_xml(xml)
+                self._env.reset_from_xml_string(xml)
+                self._env.sim.reset()
             else:
-                from robosuite.utils.mjcf_utils import postprocess_model_xml
-                xml = postprocess_model_xml(xml)
-            self._env.reset_from_xml_string(xml)
-            self._env.sim.reset()
-        else:
-            self._env.reset()
+                self._env.reset()
 
-        if idx is not None:
-            self._env.sim.set_state_from_flattened(self._init_states[idx].numpy())
-            self._env.sim.forward()
+            if idx is not None:
+                self._env.sim.set_state_from_flattened(self._init_states[idx].numpy())
+                self._env.sim.forward()
 
-        raw_obs = self._env._get_observations()
+            raw_obs = self._env._get_observations()
 
-        # Let the simulation settle.
-        for _ in range(self.num_steps_wait):
-            raw_obs, _, _, _ = self._env.step(get_mimicgen_dummy_action())
+            # Let the simulation settle.
+            for _ in range(self.num_steps_wait):
+                raw_obs, _, _, _ = self._env.step(get_mimicgen_dummy_action())
+        finally:
+            np.random.set_state(np_state)
 
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False, "init_state_idx": idx}
@@ -305,6 +313,7 @@ class MimicGenEnv(gym.Env):
                 f"Expected 1-D action (shape ({ACTION_DIM},)), got shape {action.shape}"
             )
         raw_obs, reward, done, info = self._env.step(action)
+        self._elapsed_steps += 1
 
         # robosuite 1.4.x uses _check_success() (bool), newer versions use is_success() (dict)
         if hasattr(self._env, "is_success"):
@@ -313,6 +322,7 @@ class MimicGenEnv(gym.Env):
         else:
             is_success = self._env._check_success()
         terminated = done or is_success
+        truncated = self._elapsed_steps >= self._max_episode_steps and not terminated
 
         info.update({
             "task": self.task,
@@ -322,15 +332,13 @@ class MimicGenEnv(gym.Env):
 
         observation = self._format_raw_obs(raw_obs)
 
-        if terminated:
+        if terminated or truncated:
             info["final_info"] = {
                 "task": self.task,
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
 
-        truncated = False
         return observation, reward, terminated, truncated, info
 
     def render(self):

@@ -395,6 +395,8 @@ class MimicGenEnv(EnvConfig):
         return {
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
             "render_height": self.render_height,
             "render_width": self.render_width,
         }
