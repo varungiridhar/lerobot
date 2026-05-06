@@ -157,11 +157,23 @@ class FastWAMPolicy(PreTrainedPolicy):
         return {n: p for n, p in self.named_parameters() if p.requires_grad}
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return the full action chunk (B, chunk_size, action_dim) for the current observation."""
+        """Return the full action chunk (B, chunk_size, action_dim) for the current observation.
+
+        Note: FastWAM's infer_action only supports B=1, so we loop over batch elements.
+        """
         self.eval()
-        # _run_inference returns (chunk_size, action_dim) for B=1; add batch dim
-        chunk = self._run_inference(batch)   # (chunk_size, action_dim) on CPU
-        return chunk.unsqueeze(0)            # (1, chunk_size, action_dim)
+        # Determine batch size from any tensor in the batch.
+        B = next(v for v in batch.values() if isinstance(v, Tensor)).shape[0]
+        task_list = batch.get("task", None)
+
+        chunks = []
+        for i in range(B):
+            batch_i = {k: v[i : i + 1] for k, v in batch.items() if isinstance(v, Tensor)}
+            if task_list is not None:
+                batch_i["task"] = [task_list[i]]
+            chunks.append(self._run_inference(batch_i))  # (chunk_size, action_dim)
+
+        return torch.stack(chunks, dim=0)  # (B, chunk_size, action_dim)
 
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the next action (B, action_dim) from the action queue.
