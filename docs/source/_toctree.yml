@@ -69,6 +69,8 @@
     title: Using Libero
   - local: metaworld
     title: Using MetaWorld
+  - local: mimicgen
+    title: Using MimicGen
   title: "Simulation"
 - sections:
   - local: introduction_processors

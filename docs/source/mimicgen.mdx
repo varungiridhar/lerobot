@@ -1,0 +1,117 @@
+# MimicGen
+
+[MimicGen](https://github.com/NVlabs/mimicgen) is a data-generation system from NVIDIA that synthesizes large-scale robot manipulation datasets from a small number of human demonstrations. The released benchmark ships ~26 robosuite-based tasks (Coffee, Stack, Square, Threading, ThreePieceAssembly, HammerCleanup, MugCleanup, NutAssembly, PickPlace, Kitchen, CoffeePreparation) at varying spatial generalization levels (`_D0`, `_D1`, `_D2`).
+
+- 📄 [MimicGen paper](https://arxiv.org/abs/2310.17596)
+- 💻 [NVlabs/mimicgen repo](https://github.com/NVlabs/mimicgen)
+
+LeRobot wraps the underlying robosuite environments through `lerobot.envs.mimicgen.MimicGenEnv`, exposing a standard `gymnasium.Env` interface so MimicGen tasks slot into the same train / eval pipeline as Libero, MetaWorld, etc.
+
+## Installation
+
+The MimicGen integration has two parts:
+
+1. PyPI dependencies (`robosuite`, `mujoco`, `h5py`, `scipy`) — packaged as the `mimicgen` extras group in this repo.
+2. The `mimicgen_envs` package itself, which lives in [NVlabs/mimicgen](https://github.com/NVlabs/mimicgen) and is **not on PyPI**. Importing it registers the Coffee/Stack/Threading/etc. tasks with robosuite at runtime.
+
+### Adding MimicGen to an existing LeRobot environment
+
+If you already have LeRobot installed and just want to add MimicGen support:
+
+```bash
+# 1. PyPI deps
+pip install -e ".[mimicgen]"
+
+# 2. Install mimicgen_envs from NVlabs/mimicgen. Pick ONE of the two options below.
+
+# Option A — editable clone (recommended if you want to read / patch the package):
+git clone https://github.com/NVlabs/mimicgen.git
+pip install -e ./mimicgen
+
+# Option B — pinned commit (one-liner, read-only):
+pip install "mimicgen_envs @ git+https://github.com/NVlabs/mimicgen.git@45db4b35a5a79e82ca8a70ce1321f855498ca82c"
+```
+
+Verify the install:
+
+```bash
+python -c "import mimicgen_envs, robosuite; print(robosuite.__version__)"
+# expect: 1.4.x
+```
+
+### Fresh install
+
+If you're setting up LeRobot from scratch, follow the standard [installation guide](./installation), then run the two steps above. `pip install -e ".[all]"` already pulls the `mimicgen` extras group; you only need step 2 (the NVlabs/mimicgen install).
+
+### Headless rendering
+
+robosuite uses MuJoCo's offscreen renderer for image observations. On headless machines (servers, SLURM nodes) set:
+
+```bash
+export MUJOCO_GL=egl
+```
+
+Without this you'll see GLFW / X-server errors when the env tries to render `agentview` / `robot0_eye_in_hand` cameras.
+
+## Sanity check
+
+Once the install is done, verify that the dataset, env, and replay path all line up before you start a long training run:
+
+```bash
+python scripts/sanity_check_mimicgen.py \
+    --repo_id local/mimicgen_coffee_d0 \
+    --dataset_root /path/to/converted/mimicgen_coffee_d0 \
+    --task Coffee_D0
+```
+
+This script runs five checks: dataset batch shapes, env reset observation, train/eval parity, recorded-demo replay through the simulator, and reset/step determinism. A clean run prints `[ OK ]` for all of them.
+
+## Converting source HDF5s to LeRobot format
+
+MimicGen ships HDF5 demonstration files. Convert one to the LeRobot v3.0 dataset layout with:
+
+```bash
+python scripts/convert_mimicgen_to_lerobot.py \
+    --hdf5_path /path/to/coffee_d0.hdf5 \
+    --repo_id local/mimicgen_coffee_d0 \
+    --root /path/to/output/mimicgen_coffee_d0 \
+    --save_init_states
+```
+
+`--save_init_states` writes `meta/init_states.pt` so the env can be reset deterministically to each demo's starting sim state for eval.
+
+## Quick start — train a diffusion policy
+
+`scripts/run_mimicgen_train.sh` is a reference SLURM-friendly recipe for the three D0 tasks (`coffee_d0`, `threading_d0`, `square_d0`). The core invocation is:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=local/mimicgen_coffee_d0 \
+    --dataset.root=/path/to/mimicgen_coffee_d0 \
+    --policy.type=diffusion \
+    --env.type=mimicgen \
+    --env.task=Coffee_D0 \
+    --env.init_states_path=/path/to/mimicgen_coffee_d0/meta/init_states.pt \
+    --eval.n_episodes=10 \
+    --eval.batch_size=1 \
+    --steps=100000 \
+    --batch_size=32
+```
+
+Notes:
+
+- `--env.task` accepts a single MimicGen task name or a comma-separated list (e.g. `Coffee_D0,Stack_D0`).
+- `--env.init_states_path` is required for deterministic eval rollouts; without it the env samples a random init state per reset.
+- Most MimicGen tasks default to a Panda arm. `NutAssembly_D0` and `PickPlace_D0` use Sawyer — the wrapper handles this automatically.
+
+## Quick start — evaluate a trained policy
+
+```bash
+lerobot-eval \
+    --policy.path=your-checkpoint-dir \
+    --env.type=mimicgen \
+    --env.task=Coffee_D0 \
+    --env.init_states_path=/path/to/mimicgen_coffee_d0/meta/init_states.pt \
+    --eval.n_episodes=50 \
+    --eval.batch_size=1
+```

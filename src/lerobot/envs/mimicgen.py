@@ -195,10 +195,7 @@ class MimicGenEnv(gym.Env):
 
     def _make_robosuite_env(self, env_name: str, control_freq: int):
         """Create the underlying robosuite environment."""
-        try:
-            import mimicgen  # noqa: F401 — v1.0+ package name
-        except ImportError:
-            import mimicgen_envs  # noqa: F401 — v0.1.x package name
+        import mimicgen_envs  # noqa: F401 — registers MimicGen tasks with robosuite
         import robosuite
         from robosuite.controllers import load_controller_config
 
