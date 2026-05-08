@@ -9,39 +9,48 @@ LeRobot wraps the underlying robosuite environments through `lerobot.envs.mimicg
 
 ## Installation
 
+> **Use a dedicated conda env for MimicGen.** The pinned `mimicgen_envs` build forces `mujoco==2.3.2`, which conflicts with other LeRobot env extras (e.g. Libero requires `mujoco>=3.0.0`) and pulls in a `robomimic` version that is incompatible with the Libero stack. Don't try to add MimicGen on top of an existing LeRobot env — create a fresh one as below.
+
 The MimicGen integration has two parts:
 
-1. PyPI dependencies (`robosuite`, `mujoco`, `h5py`, `scipy`) — packaged as the `mimicgen` extras group in this repo.
+1. PyPI dependencies (`robosuite>=1.4.1`, `mujoco`, `h5py`, `scipy`) — packaged as the `mimicgen` extras group in this repo.
 2. The `mimicgen_envs` package itself, which lives in [NVlabs/mimicgen](https://github.com/NVlabs/mimicgen) and is **not on PyPI**. Importing it registers the Coffee/Stack/Threading/etc. tasks with robosuite at runtime.
 
-### Adding MimicGen to an existing LeRobot environment
+### Setup
 
-If you already have LeRobot installed and just want to add MimicGen support:
+Run from the LeRobot repo root:
 
 ```bash
-# 1. PyPI deps
-pip install -e ".[mimicgen]"
+# 1. Create a dedicated conda env
+conda create -n lerobot-mimicgen python=3.10 -y
+conda activate lerobot-mimicgen
 
-# 2. Install mimicgen_envs from NVlabs/mimicgen. Pick ONE of the two options below.
+# 2. Install LeRobot with the mimicgen extras
+python -m pip install -e ".[mimicgen]"
 
-# Option A — editable clone (recommended if you want to read / patch the package):
+# 3. Install mimicgen_envs from NVlabs/mimicgen, pinned + editable
 git clone https://github.com/NVlabs/mimicgen.git
-pip install -e ./mimicgen
+cd mimicgen
+git checkout 45db4b35a5a79e82ca8a70ce1321f855498ca82c
+cd ..
+python -m pip install -e ./mimicgen
 
-# Option B — pinned commit (one-liner, read-only):
-pip install "mimicgen_envs @ git+https://github.com/NVlabs/mimicgen.git@45db4b35a5a79e82ca8a70ce1321f855498ca82c"
+# 4. Install FFmpeg 7 so torchcodec can decode the dataset's videos
+conda install -y -c conda-forge "ffmpeg=7"
 ```
+
+Three non-obvious things to know:
+
+- **Use `python -m pip`, not bare `pip`.** On shared/cluster machines a `~/.local/bin/pip` may shadow the env's pip via PATH, and `pip install ...` will silently install into the wrong Python's user-site. `python -m pip` always uses the active env.
+- **The commit pin and the editable (`-e`) flag are both required.** HEAD of NVlabs/mimicgen renamed the package to `mimicgen`, but our wrapper imports `mimicgen_envs`. And the pinned commit's `setup.py` uses `find_packages()`, which silently drops `mimicgen_envs/models/` (no `__init__.py`) when building a wheel — so a non-editable install (`pip install "mimicgen_envs @ git+..."`) produces a broken package that fails at import time with `ModuleNotFoundError: No module named 'mimicgen_envs.models'`.
+- **FFmpeg must be installed via conda (step 4).** torchcodec — the default video backend — looks for unversioned shared libs (`libavutil.so.59`, `libavcodec.so.61`, etc.) at runtime. PyAV ships its own copies under `av.libs/` but with hashed filenames torchcodec can't see, so without the conda-forge ffmpeg the dataset fails to load with `RuntimeError: Could not load libtorchcodec`. If `conda install` OOMs on a login node, run it on a compute node (`sbatch` a short job that just runs the install).
 
 Verify the install:
 
 ```bash
 python -c "import mimicgen_envs, robosuite; print(robosuite.__version__)"
-# expect: 1.4.x
+# expect: 1.4.1
 ```
-
-### Fresh install
-
-If you're setting up LeRobot from scratch, follow the standard [installation guide](./installation), then run the two steps above. `pip install -e ".[all]"` already pulls the `mimicgen` extras group; you only need step 2 (the NVlabs/mimicgen install).
 
 ### Headless rendering
 
