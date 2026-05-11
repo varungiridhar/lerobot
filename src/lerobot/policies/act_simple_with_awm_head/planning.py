@@ -110,7 +110,8 @@ class MPPIPlanner(BasePlanner):
         z_goal: Tensor,
         initial_actions: Tensor,
         wm_predict_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
-    ) -> Tensor:
+    ) -> tuple[Tensor, list[tuple[float, float, float]]]:
+        """Returns (optimized_actions, per_iter_costs) where each cost entry is (mean, min, max) across K samples."""
         T, action_dim = initial_actions.shape
         K = self.config.n_samples
         S, D = z_start.shape
@@ -119,6 +120,7 @@ class MPPIPlanner(BasePlanner):
 
         mean = initial_actions.clone()  # (T, action_dim)
         noise_std = self.config.noise_std
+        iter_costs: list[tuple[float, float, float]] = []  # (mean, min, max) per iter
 
         # Pre-expand static tensors to avoid repeated allocation.
         encoder_in_k = z_start.unsqueeze(1).expand(S, K, D)  # (S, K, D)
@@ -141,6 +143,8 @@ class MPPIPlanner(BasePlanner):
                     action_cost = actions_k.pow(2).mean(dim=(0, 2))  # (K,)
                     cost = cost + self.config.action_cost_coef * action_cost
 
+                iter_costs.append((float(cost.mean()), float(cost.min()), float(cost.max())))
+
                 # MPPI importance weights.
                 weights = F.softmax(-cost / self.config.temperature, dim=0)  # (K,)
 
@@ -148,7 +152,7 @@ class MPPIPlanner(BasePlanner):
                 mean = (actions_k * weights.view(1, K, 1)).sum(dim=1)  # (T, action_dim)
                 noise_std = noise_std * self.config.noise_decay
 
-        return mean  # (T, action_dim)
+        return mean, iter_costs
 
 
 class GBPPlanner(BasePlanner):

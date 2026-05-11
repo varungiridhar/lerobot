@@ -61,7 +61,11 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any, TypedDict
 
+import cv2
 import einops
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import gymnasium as gym
 import numpy as np
 import torch
@@ -72,7 +76,7 @@ from tqdm import trange
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.goal_provider import BaseGoalProvider, make_goal_provider
+from lerobot.envs.goal_provider import BaseGoalProvider, make_carrot_goal_provider
 from lerobot.envs.utils import (
     add_envs_task,
     check_env_attributes_and_types,
@@ -93,6 +97,116 @@ from lerobot.utils.utils import (
 )
 
 
+def _make_cost_plot_frames(
+    cost_history: list[list[tuple[float, float, float]]],
+    cost_steps: list[int],
+    max_step: int,
+    width: int,
+    height: int,
+) -> list[np.ndarray]:
+    """Generate a plot strip for each step 0..max_step, animating only the vertical line.
+
+    Draws the full episode cost history once, then sweeps a red vertical line across steps.
+    Each MPPI iteration is a steelblue line with increasing alpha (faint=early, opaque=late).
+    Returns a list of (height, width, 3) uint8 arrays, one per step.
+    """
+    fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    fig.patch.set_facecolor("white")
+
+    if cost_history and cost_steps:
+        n_iters = len(cost_history[0])
+        for it in range(n_iters):
+            alpha = (it + 1) / n_iters
+            ys = [step_costs[it][0] for step_costs in cost_history if it < len(step_costs)]
+            xs = cost_steps[: len(ys)]
+            ax.plot(xs, ys, color="steelblue", alpha=alpha, linewidth=1.5,
+                    label=f"iter {it}" if it in (0, n_iters - 1) else None)
+        ax.legend(fontsize=6, loc="upper left", framealpha=0.6)
+
+    ax.set_xlabel("Episode step", fontsize=7)
+    ax.set_ylabel("MPPI cost (mean)", fontsize=7)
+    ax.set_xlim(0, max_step)
+    ax.tick_params(labelsize=6)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout(pad=0.4)
+
+    # Vertical line is the only element that changes; updating it is much cheaper than re-drawing.
+    vline = ax.axvline(x=0, color="red", linewidth=1.5, linestyle="--", alpha=0.85)
+
+    frames = []
+    for t in range(max_step + 1):
+        vline.set_xdata([t, t])
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3].copy()
+        frames.append(cv2.resize(buf, (width, height)))
+
+    plt.close(fig)
+    return frames
+
+
+def _decoded_tensor_to_uint8(decoded: "torch.Tensor", height: int, width: int) -> np.ndarray:
+    """Convert a (1, C, H, W) WM decoded tensor to a (height, width, 3) uint8 display image.
+
+    Uses per-image min-max normalization since the decoder output is in raw activation space.
+    """
+    img = decoded[0]  # (C, H, W)
+    lo = img.flatten().min()
+    hi = img.flatten().max()
+    img = ((img - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+    img = img.permute(1, 2, 0).cpu().numpy()  # (H, W, C)
+    if img.shape[2] == 1:
+        img = np.repeat(img, 3, axis=2)
+    img = (img * 255).astype(np.uint8)
+    if img.shape[:2] != (height, width):
+        img = cv2.resize(img, (width, height))
+    return img
+
+
+def _add_column_label(frame: np.ndarray, label: str) -> None:
+    """Draw a small text label at the top-left of a frame in-place."""
+    cv2.putText(frame, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def _cache_goal_image(
+    goal_obs_raw: dict[str, np.ndarray],
+    goal_img_cache: list | None,
+    num_envs: int,
+) -> None:
+    """Copy the goal image from a raw goal obs dict into the per-env cache for video rendering.
+
+    Prefers ``pixels_vis`` (high-res visualization) over ``pixels`` (policy input resolution).
+    """
+    if goal_img_cache is None:
+        return
+    vis_key = "pixels_vis" if "pixels_vis" in goal_obs_raw else "pixels"
+    if vis_key not in goal_obs_raw:
+        return
+    for i in range(min(len(goal_img_cache), num_envs)):
+        goal_img_cache[i] = goal_obs_raw[vis_key][i].copy()
+
+
+def _draw_action_traj(
+    frame: np.ndarray,
+    traj: np.ndarray,
+    color: tuple[int, int, int],
+    env_size: int = 512,
+) -> None:
+    """Draw an action trajectory as connected dots on a rendered frame (in-place).
+
+    traj: (T, 2) array of (x, y) positions in env action coordinates.
+    color: RGB tuple.
+    Draws on top of the existing image — does NOT affect the observation fed to the policy.
+    """
+    H, W = frame.shape[:2]
+    pts = [(int(ax * W / env_size), int(ay * H / env_size)) for ax, ay in traj]
+    for pt in pts:
+        cv2.circle(frame, pt, radius=3, color=color, thickness=-1)
+    for p0, p1 in zip(pts[:-1], pts[1:]):
+        cv2.line(frame, p0, p1, color=color, thickness=1)
+
+
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -104,6 +218,7 @@ def rollout(
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     goal_provider: BaseGoalProvider | None = None,
+    goal_img_cache: list | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -138,21 +253,36 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
-    # Reset the policy and environments.
+    max_steps_val = env.call("_max_episode_steps")[0]
+
+    # Reset the policy and environments to the same initial state for the real eval.
     policy.reset()
     observation, info = env.reset(seed=seeds)
-    if render_callback is not None:
-        render_callback(env)
 
-    # Provide goal observation for planning-enabled policies.
+    # Allow providers to do any post-reset initialization.
+    if goal_provider is not None:
+        new_obs = goal_provider.initialize_envs(list(seeds) if seeds is not None else None, env)
+        if new_obs is not None:
+            observation = new_obs
+
+    # Provide initial goal observation for planning-enabled policies.
     if goal_provider is not None and hasattr(policy, "set_goal"):
         goal_obs_raw = goal_provider.get_goal_obs(env)
-        goal_obs = preprocess_observation(goal_obs_raw)
+        _cache_goal_image(goal_obs_raw, goal_img_cache, env.num_envs)
+        # Strip vis-only keys before sending through the policy pipeline.
+        goal_obs_policy = {k: v for k, v in goal_obs_raw.items() if k != "pixels_vis"}
+        goal_obs = preprocess_observation(goal_obs_policy)
         goal_obs = add_envs_task(env, goal_obs)
         goal_obs = env_preprocessor(goal_obs)
         goal_obs = preprocessor(goal_obs)
         with torch.inference_mode():
             policy.set_goal(goal_obs)
+
+    # First render happens after goal is set so the side-by-side video includes the goal from step 0.
+    if render_callback is not None:
+        render_callback(env)
+
+    n_action_steps: int = getattr(getattr(policy, "config", None), "n_action_steps", 1)
 
     all_observations = []
     all_actions = []
@@ -163,7 +293,7 @@ def rollout(
     step = 0
     # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
-    max_steps = env.call("_max_episode_steps")[0]
+    max_steps = max_steps_val
     progbar = trange(
         max_steps,
         desc=f"Running rollout with at most {max_steps} steps",
@@ -172,6 +302,25 @@ def rollout(
     )
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
+        # Update the carrot goal at every planning chunk boundary (skip step 0,
+        # which was already handled by the initial set_goal call above).
+        if (
+            step > 0
+            and step % n_action_steps == 0
+            and goal_provider is not None
+            and hasattr(policy, "set_goal")
+        ):
+            dyn_goal_raw = goal_provider.get_goal_obs_at_step(step, env)
+            if dyn_goal_raw is not None:
+                _cache_goal_image(dyn_goal_raw, goal_img_cache, env.num_envs)
+                dyn_goal_policy = {k: v for k, v in dyn_goal_raw.items() if k != "pixels_vis"}
+                dyn_goal = preprocess_observation(dyn_goal_policy)
+                dyn_goal = add_envs_task(env, dyn_goal)
+                dyn_goal = env_preprocessor(dyn_goal)
+                dyn_goal = preprocessor(dyn_goal)
+                with torch.inference_mode():
+                    policy.set_goal(dyn_goal)
+
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
         if return_observations:
@@ -188,6 +337,18 @@ def rollout(
         with torch.no_grad():
             action = policy.select_action(observation)
         action = postprocessor(action)
+
+        # Accumulate MPPI cost history and log spread every planning step.
+        _iter_costs = getattr(policy, "_debug_iter_costs", None)
+        if _iter_costs is not None and step % n_action_steps == 0:
+            if not getattr(policy, "_debug_cost_history", None):
+                policy._debug_cost_history = [[] for _ in range(env.num_envs)]
+                policy._debug_cost_steps = [[] for _ in range(env.num_envs)]
+            for env_i, costs in enumerate(_iter_costs):
+                policy._debug_cost_history[env_i].append(costs)
+                policy._debug_cost_steps[env_i].append(step)
+                spread = " | ".join(f"{mn:.3f}[{mi:.3f},{mx:.3f}]" for mn, mi, mx in costs)
+                logging.info("step=%d env=%d mppi_costs: %s", step, env_i, spread)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
@@ -317,6 +478,10 @@ def eval_policy(
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
+    # Shared mutable cache: goal_img_cache[i] holds the latest goal image for env i.
+    # rollout() updates it whenever policy.set_goal() is called.
+    goal_img_cache: list[np.ndarray | None] = [None] * env.num_envs
+
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
@@ -324,7 +489,75 @@ def eval_policy(
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            env_renders = [env.envs[i].render() for i in range(n_to_render_now)]  # noqa: B023
+            # Overlay BC (blue) and planning (orange) trajectories for debugging.
+            # Drawn on the vis frame only — never touches the observation fed to the policy.
+            bc_traj = getattr(policy, "_debug_bc_traj", None)
+            plan_traj = getattr(policy, "_debug_plan_traj", None)
+            iter_costs = getattr(policy, "_debug_iter_costs", None)
+            if bc_traj is not None and plan_traj is not None:
+                for i in range(min(n_to_render_now, bc_traj.shape[0])):
+                    bc_env = postprocessor(bc_traj[i : i + 1]).squeeze(0).numpy()    # (T, A)
+                    pl_env = postprocessor(plan_traj[i : i + 1]).squeeze(0).numpy()  # (T, A)
+                    _draw_action_traj(env_renders[i], bc_env, color=(0, 100, 255))   # blue
+                    _draw_action_traj(env_renders[i], pl_env, color=(255, 140, 0))   # orange
+                    # Per-iteration MPPI cost text (top-left corner): mean [min, max].
+                    if iter_costs is not None and i < len(iter_costs):
+                        H = env_renders[i].shape[0]
+                        font_scale = H / 512 * 0.4
+                        thickness = max(1, int(H / 512))
+                        for it, (c_mean, c_min, c_max) in enumerate(iter_costs[i]):
+                            y = int(H * 0.04) + it * int(H * 0.055)
+                            cv2.putText(
+                                env_renders[i],
+                                f"iter {it}: {c_mean:.3f} [{c_min:.3f}, {c_max:.3f}]",
+                                (6, y),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                font_scale,
+                                (0, 0, 0),
+                                thickness,
+                                cv2.LINE_AA,
+                            )
+            # Build multi-column frame: env | [wm_bc | wm_plan] | goal
+            has_goals = any(goal_img_cache[i] is not None for i in range(n_to_render_now))  # noqa: B023
+            wm_bc_all = getattr(policy, "_debug_wm_bc_decoded", None)
+            wm_pl_all = getattr(policy, "_debug_wm_plan_decoded", None)
+            has_wm_vis = wm_bc_all is not None
+
+            frames_out = []
+            for i, ef in enumerate(env_renders):
+                h, w = ef.shape[:2]
+                columns = [ef]
+
+                # WM decoded BC prediction.
+                if has_wm_vis:  # noqa: B023
+                    bc_dec = wm_bc_all[i] if i < len(wm_bc_all) else None  # noqa: B023
+                    bc_img = _decoded_tensor_to_uint8(bc_dec, h, w) if bc_dec is not None else np.zeros((h, w, 3), dtype=np.uint8)
+                    _add_column_label(bc_img, "WM BC pred")
+                    columns.append(bc_img)
+
+                # WM decoded planned prediction.
+                if has_wm_vis:  # noqa: B023
+                    pl_dec = wm_pl_all[i] if i < len(wm_pl_all) else None  # noqa: B023
+                    pl_img = _decoded_tensor_to_uint8(pl_dec, h, w) if pl_dec is not None else np.zeros((h, w, 3), dtype=np.uint8)
+                    _add_column_label(pl_img, "WM MPPI pred")
+                    columns.append(pl_img)
+
+                # Goal image.
+                if has_goals:  # noqa: B023
+                    gf = goal_img_cache[i] if i < len(goal_img_cache) else None  # noqa: B023
+                    if gf is not None:
+                        if gf.shape[:2] != (h, w):
+                            from PIL import Image as _PILImage
+                            gf = np.array(_PILImage.fromarray(gf).resize((w, h), _PILImage.BILINEAR))
+                    else:
+                        gf = np.zeros((h, w, 3), dtype=np.uint8)
+                    _add_column_label(gf, "goal")
+                    columns.append(gf)
+
+                frames_out.append(np.concatenate(columns, axis=1))
+
+            ep_frames.append(np.stack(frames_out))  # noqa: B023
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
@@ -360,6 +593,7 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             goal_provider=goal_provider,
+            goal_img_cache=goal_img_cache if max_episodes_rendered > 0 else None,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -404,6 +638,28 @@ def eval_policy(
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
+
+            # Post-process: stitch a static cost-plot strip (with animated vertical line) below each frame.
+            # The full episode history is available now, so we render the plot once per env and just
+            # sweep the vertical line position across steps — much cheaper than per-frame rendering.
+            cost_history_all = getattr(policy, "_debug_cost_history", None)
+            if cost_history_all is not None:
+                cost_steps_all = getattr(policy, "_debug_cost_steps", None) or []
+                n_envs_b, n_steps, H, W, C = batch_stacked_frames.shape
+                plot_h = max(80, H // 3)
+                new_frames = np.empty((n_envs_b, n_steps, H + plot_h, W, C), dtype=np.uint8)
+                new_frames[:, :, :H] = batch_stacked_frames
+                done_indices_list = done_indices.flatten().tolist()
+                for i in range(n_envs_b):
+                    history_i = cost_history_all[i] if i < len(cost_history_all) else []
+                    steps_i = cost_steps_all[i] if i < len(cost_steps_all) else []
+                    done_i = int(done_indices_list[i]) if i < len(done_indices_list) else n_steps - 1
+                    plot_frames = _make_cost_plot_frames(
+                        history_i, steps_i, max_step=done_i, width=W, height=plot_h
+                    )
+                    for t in range(n_steps):
+                        new_frames[i, t, H:] = plot_frames[min(t, done_i)]
+                batch_stacked_frames = new_frames
             for stacked_frames, done_index in zip(
                 batch_stacked_frames, done_indices.flatten().tolist(), strict=False
             ):
@@ -568,11 +824,24 @@ def eval_main(cfg: EvalPipelineConfig):
     # Set up goal provider for planning-capable policies.
     goal_provider = None
     if hasattr(policy.config, "use_planning") and policy.config.use_planning:
-        try:
+        dataset_root = cfg.carrot_goal.dataset_root if cfg.carrot_goal and cfg.carrot_goal.dataset_root else None
+        if dataset_root is not None:
+            # Carrot-on-a-stick: goal advances with the episode using dataset reference frames.
+            horizon = getattr(policy.config, "chunk_size", 16)
+            goal_provider = make_carrot_goal_provider(
+                env_type=cfg.env.type,
+                horizon=horizon,
+                dataset_root=dataset_root,
+            )
+            logging.info(
+                f"Planning enabled: carrot goal provider (horizon={horizon}) "
+                f"for env type '{cfg.env.type}'"
+            )
+        else:
+            # Static final-goal: renders the fully-solved state once per episode.
+            from lerobot.envs.goal_provider import make_goal_provider
             goal_provider = make_goal_provider(cfg.env.type)
-            logging.info(f"Planning enabled: using {type(goal_provider).__name__} for env type '{cfg.env.type}'")
-        except ValueError as e:
-            logging.warning(f"Planning requested but no goal provider available: {e}. Falling back to BC.")
+            logging.info(f"Planning enabled: static final-goal provider for env type '{cfg.env.type}'")
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(

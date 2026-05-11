@@ -301,6 +301,18 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._z_goal: Tensor | None = None            # (S, B, dim_model)
         self._encoder_pos_cache: Tensor | None = None  # (S, 1, dim_model)
+        # Flags used to initialize debug sentinel values below.
+        _planning_active = getattr(self.config, "use_planning", False)
+        _has_wm_decoder = _planning_active and hasattr(self.model, "wm_image_decoder")
+        # Debug info populated by _plan_action_chunk for vis-only use.
+        self._debug_bc_traj: Tensor | None = None          # (B, chunk_size, action_dim)
+        self._debug_plan_traj: Tensor | None = None        # (B, chunk_size, action_dim)
+        self._debug_iter_costs: list[list[tuple[float, float, float]]] | None = None  # [B][n_iters]
+        # Initialized to [] (not None) when active so render_frame sees consistent column count from step 0.
+        self._debug_wm_bc_decoded: list[Tensor] | None = [] if _has_wm_decoder else None    # [B] of (1, C, H, W) float
+        self._debug_wm_plan_decoded: list[Tensor] | None = [] if _has_wm_decoder else None  # [B] of (1, C, H, W) float
+        self._debug_cost_history: list[list[list[tuple[float, float, float]]]] | None = [] if _planning_active else None  # [env][t][iter]
+        self._debug_cost_steps: list[list[int]] | None = [] if _planning_active else None   # [env][t] = step number
 
     def update(self):
         if self._pending_ema_momentum is not None:
@@ -372,6 +384,7 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
 
         B = bc_actions.shape[0]
         results = []
+        iter_costs_all: list[list[tuple[float, float, float]]] = []
         for b in range(B):
             z_start_b = encoder_in[:, b, :]  # (S, D)
 
@@ -391,7 +404,7 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
                 # enc_in_n: (S, N, D), enc_pos: (S, 1, D), actions_n: (T, N, action_dim)
                 return model.run_wm_decoder(enc_in_n, enc_pos, actions_n)
 
-            optimized = self._planner.optimize(
+            optimized, iter_costs = self._planner.optimize(
                 z_start=z_start_b,
                 encoder_pos=encoder_pos,
                 z_goal=z_goal_b,
@@ -399,8 +412,33 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
                 wm_predict_fn=wm_predict_fn,
             )
             results.append(optimized)
+            iter_costs_all.append(iter_costs)
 
-        return torch.stack(results, dim=0)  # (B, T, action_dim)
+        planned = torch.stack(results, dim=0)  # (B, T, action_dim)
+
+        # Decode WM predictions to images for visualization.
+        # BC: what the world model predicts from the BC warm-start actions.
+        # Plan: what the world model predicts from the MPPI-optimized actions.
+        self._debug_wm_bc_decoded = None
+        self._debug_wm_plan_decoded = None
+        if hasattr(self.model, "wm_image_decoder"):
+            n_1d = self.model.n_1d_tokens
+            s_img = self.model.img_tokens_per_cam
+            decoded_bc_list, decoded_plan_list = [], []
+            for b in range(B):
+                enc_in_b = encoder_in[:, b : b + 1, :]  # (S, 1, D)
+                z_bc = self.model.run_wm_decoder(enc_in_b, encoder_pos, bc_actions[b].unsqueeze(1))
+                z_pl = self.model.run_wm_decoder(enc_in_b, encoder_pos, planned[b].unsqueeze(1))
+                decoded_bc_list.append(self.model.wm_image_decoder(z_bc[n_1d : n_1d + s_img]).cpu())
+                decoded_plan_list.append(self.model.wm_image_decoder(z_pl[n_1d : n_1d + s_img]).cpu())
+            self._debug_wm_bc_decoded = decoded_bc_list
+            self._debug_wm_plan_decoded = decoded_plan_list
+
+        # Store trajectories and per-iter costs for vis-only overlays in the eval renderer.
+        self._debug_bc_traj = bc_actions.detach().cpu()
+        self._debug_plan_traj = planned.detach().cpu()
+        self._debug_iter_costs = iter_costs_all  # list[B] of list[n_iters] floats
+        return planned
 
     @torch.no_grad()
     def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
