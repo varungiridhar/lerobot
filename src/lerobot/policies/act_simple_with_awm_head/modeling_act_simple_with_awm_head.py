@@ -166,12 +166,16 @@ def _slice_obs_batch(batch: dict[str, Tensor], idx: int) -> dict[str, Tensor]:
     return result
 
 
-def _compute_wm_loss(z_pred: Tensor, z_target: Tensor, valid_wm: Tensor) -> Tensor:
-    """Cosine similarity world-model loss, masked at episode boundaries."""
+def _compute_wm_loss(z_pred: Tensor, z_target: Tensor, valid_wm: Tensor, use_mse: bool = False) -> Tensor:
+    """World-model loss (cosine similarity or MSE), masked at episode boundaries."""
     valid_wm_f = valid_wm.to(dtype=z_pred.dtype)
     valid_count = valid_wm_f.sum()
-    cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)  # (B,)
-    wm_loss = 1 - (cos_sim * valid_wm_f).sum() / valid_count.clamp(min=1.0)
+    if use_mse:
+        per_sample = F.mse_loss(z_pred, z_target, reduction="none").mean(dim=(0, 2))  # (B,)
+        wm_loss = (per_sample * valid_wm_f).sum() / valid_count.clamp(min=1.0)
+    else:
+        cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean(dim=0)  # (B,)
+        wm_loss = 1 - (cos_sim * valid_wm_f).sum() / valid_count.clamp(min=1.0)
     return wm_loss
 
 
@@ -592,7 +596,7 @@ class ACTSimpleWithAWMHeadPolicy(PreTrainedPolicy):
         # WM loss.
         z_pred, z_target, decoded_curr, gt_curr_img, sigreg_loss = wm_tensors
         valid_wm = ~next_obs_is_pad[:, 1]  # (B,)
-        wm_loss = _compute_wm_loss(z_pred, z_target, valid_wm)
+        wm_loss = _compute_wm_loss(z_pred, z_target, valid_wm, use_mse=self.config.use_sigreg)
 
         if self.config.wm_warmup_steps > 0 and self.training:
             warmup_frac = min(self._train_step / self.config.wm_warmup_steps, 1.0)
@@ -980,13 +984,19 @@ class ACTSimpleWithAWMHead(nn.Module):
         actions_hat = self.action_head(decoder_out)  # (B, T, action_dim)
 
         # === World model decoder ===
-        # Target: encoder input tokens of the next observation (pre-transformer, stop-gradient).
+        _normalize = self.config.normalize_wm_representations
+
+        # Target: encoder input tokens of the next observation.
+        # Stop-gradient by default; when sigreg_detach_target=False, gradients flow through
+        # the target encoder and SIGReg is applied to it as well.
+        next_encoder_in: Tensor | None = None
         if self.config.use_ema_target:
             z_target = self._encode_ema(next_batch)
         else:
             _, _, _, next_encoder_in = self._encode(next_batch)
-            z_target = next_encoder_in.detach()  # (S, B, dim_model)
-        if self.config.normalize_wm_representations:
+            detach_target = not self.config.use_sigreg or self.config.sigreg_detach_target
+            z_target = next_encoder_in.detach() if detach_target else next_encoder_in
+        if _normalize:
             z_target = F.normalize(z_target, dim=-1)
 
         # WM input: [S query tokens, T continuous action tokens].
@@ -1005,19 +1015,22 @@ class ACTSimpleWithAWMHead(nn.Module):
         wm_cross_pos = encoder_pos  # (S, 1, dim_model)
         wm_out = self.wm_decoder(wm_in, wm_cross_kv, wm_cross_pos)  # (S+T, B, dim_model)
         z_pred = self.wm_proj_head(wm_out[:S])  # (S, B, dim_model)
-        if self.config.normalize_wm_representations:
+        if _normalize:
             z_pred = F.normalize(z_pred, dim=-1)
 
-        # SIGReg loss on predicted representations.
+        # SIGReg regularizer on encoder_in (vision bottleneck), not WM prediction.
+        # Paired with L2 normalization to keep the two losses consistent.
         sigreg_loss = None
         if self.config.use_sigreg:
-            sigreg_loss = self.sigreg(z_pred)
+            sigreg_loss = self.sigreg(encoder_in)
+            if next_encoder_in is not None and not self.config.sigreg_detach_target:
+                sigreg_loss = sigreg_loss + self.sigreg(next_encoder_in)
 
         # Image decoder.
         decoded_curr, gt_curr_img = None, None
         if hasattr(self, "wm_image_decoder") and OBS_IMAGES in batch:
             curr_img_z = encoder_in[self.n_1d_tokens : self.n_1d_tokens + self.img_tokens_per_cam]
-            if self.config.normalize_wm_representations:
+            if _normalize:
                 curr_img_z = F.normalize(curr_img_z, dim=-1)
             decoded_curr = self.wm_image_decoder(curr_img_z.detach())
             gt_curr_img = batch[OBS_IMAGES][0].detach()
