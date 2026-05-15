@@ -61,6 +61,12 @@ class ACTSimplePolicy(PreTrainedPolicy):
 
         self.model = ACT(config)
 
+        # Online-planning hook. Eval pipelines may attach a ``Planner`` (from
+        # ``lerobot.policies.act_simple.planning``) via ``attach_planner`` to
+        # switch ``predict_action_chunk`` into Q-scored MPPI/CEM/argmax mode.
+        # When ``None``, ``predict_action_chunk`` runs the deterministic BC forward.
+        self._planner = None
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -110,15 +116,32 @@ class ACTSimplePolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+        """Predict a chunk of actions given environment observations.
+
+        When ``enable_planning(...)`` has been called, candidate chunks are
+        sampled around the BC mean and ranked by a Q-function critic
+        (MPPI / CEM); the returned chunk is the planner's aggregate.
+        """
         self.eval()
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
+        if self._planner is not None:
+            return self._planner.plan(self, batch)
+
         actions = self.model(batch)
         return actions
+
+    def attach_planner(self, planner) -> None:
+        """Attach a ``Planner`` instance (from ``planning.py``) for Q-scored online planning.
+
+        The planner is fully configured externally — see
+        ``lerobot.policies.act_simple.planning.Planner.from_checkpoints``. Passing
+        ``None`` reverts to deterministic BC.
+        """
+        self._planner = planner
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""

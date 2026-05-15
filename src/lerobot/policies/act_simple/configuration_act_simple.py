@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.policies.act_simple.planning import PlanningConfig
 
 
 @PreTrainedConfig.register_subclass("act_simple")
@@ -113,6 +114,13 @@ class ACTSimpleConfig(PreTrainedConfig):
     optimizer_lr: float = 2e-4
     optimizer_weight_decay: float = 0.0
     optimizer_lr_backbone: float = 1e-5
+
+    # Test-time planning. Matches the AWM-head policy's interface: when
+    # ``use_planning=True``, ``lerobot-eval`` loads the Q-function from
+    # ``planning.q_checkpoint_path`` and threads MPPI/CEM/argmax over BC's
+    # chunk via ``attach_planner`` before running rollouts.
+    use_planning: bool = False
+    planning: PlanningConfig = field(default_factory=PlanningConfig)
 
     def __post_init__(self):
         super().__post_init__()

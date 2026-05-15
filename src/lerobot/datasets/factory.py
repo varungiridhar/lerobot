@@ -84,14 +84,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    # Decide single- vs multi-dataset path. ``repo_ids`` (list) takes precedence
+    # when non-empty; otherwise we use the single ``repo_id``.
+    repo_ids_list = cfg.dataset.repo_ids
+    repo_id_single = cfg.dataset.repo_id
+    if (repo_ids_list is None or len(repo_ids_list) == 0) and repo_id_single is None:
+        raise ValueError("DatasetConfig: must provide either `repo_id` (str) or `repo_ids` (list[str]).")
+
+    if (repo_ids_list is None or len(repo_ids_list) == 0):
         ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            repo_id_single, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id_single,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -102,7 +109,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
         else:
             dataset = StreamingLeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id_single,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -112,22 +119,66 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+        # Multi-dataset path: resolve delta_timestamps from the first sub-dataset's
+        # meta (assumes all sub-datasets share fps and feature schema, which is the
+        # standard MultiLeRobotDataset invariant).
+        if cfg.dataset.streaming:
+            raise NotImplementedError("StreamingLeRobotDataset is not supported with multiple repo_ids.")
+        from pathlib import Path as _Path
+        first_root = (
+            str(_Path(cfg.dataset.root) / repo_ids_list[0]) if cfg.dataset.root else None
+        )
+        first_meta = LeRobotDatasetMetadata(repo_ids_list[0], root=first_root)
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, first_meta) if cfg.policy is not None else None
         dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+            repo_ids_list,
+            root=cfg.dataset.root,
             image_transforms=image_transforms,
+            delta_timestamps=delta_timestamps,
             video_backend=cfg.dataset.video_backend,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
+        if cfg.dataset.use_imagenet_stats:
+            for sub in dataset._datasets:
+                for key in sub.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        sub.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+            # Re-aggregate after mutation so dataset.stats reflects the override.
+            from lerobot.datasets.utils import aggregate_stats
+            dataset.stats = aggregate_stats([sub.meta.stats for sub in dataset._datasets])
+        return _maybe_wrap_for_policy(dataset, cfg)
 
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
-    return dataset
+    return _maybe_wrap_for_policy(dataset, cfg)
+
+
+def _maybe_wrap_for_policy(dataset, cfg: TrainPipelineConfig):
+    """Apply policy-specific dataset wrappers (e.g. Q-function reward labelling).
+
+    For ``q_function``: wrap with ``QValueLabelDataset`` so each sample carries
+    the four Q keys (``q_reward_chunk_first``, ``q_reward_pad_first``,
+    ``q_bootstrap_valid``, ``q_bucket_index``). Reads required parameters
+    (``h``, ``step_reward``, ``terminal_bonuses``, ``reward_mode``,
+    ``quality_scalars``) directly off ``cfg.policy``.
+    """
+    if cfg.policy is None or getattr(cfg.policy, "type", None) != "q_function":
+        return dataset
+    from lerobot.policies.q_function.q_value_labels import QValueLabelDataset
+    wrapped = QValueLabelDataset(
+        dataset,
+        h=cfg.policy.h,
+        step_reward=cfg.policy.step_reward,
+        terminal_bonuses=cfg.policy.terminal_bonuses,
+        reward_mode=getattr(cfg.policy, "reward_mode", "sparse"),
+        quality_scalars=getattr(cfg.policy, "quality_scalars", None),
+        precache_root=getattr(cfg.policy, "precache_root", None),
+    )
+    logging.info(f"Wrapped dataset with QValueLabelDataset; bucket counts: {wrapped.bucket_counts()}")
+    return wrapped

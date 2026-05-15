@@ -112,7 +112,26 @@ def _load_init_states(path: str | Path) -> dict:
 
 
 class MimicGenEnv(gym.Env):
-    """Gymnasium wrapper around a MimicGen / robosuite environment."""
+    """Gymnasium wrapper around a MimicGen / robosuite environment.
+
+    NOTE — determinism leak when ``render_height/width != observation_height/width``:
+        ``env.step()`` produces the policy observation by calling MuJoCo's
+        ``sim.render(width=observation_width, height=observation_height, ...)``,
+        and ``env.render()`` produces the video frame at ``render_height/width``.
+        Both share the same EGL/GL context. When the two resolutions differ and
+        a video render is interleaved between simulation steps (as ``lerobot-eval``
+        does), MuJoCo's renderer does not fully reset GPU buffer state between
+        viewport switches and leaves a ~1e-7 relative perturbation in the next
+        observation render. BC alone absorbs this without flipping outcomes;
+        downstream consumers that amplify small perturbations (e.g.
+        ``ACTSimplePolicy`` with Q-scored argmax planning over many candidates)
+        can flip ~25 % of episode outcomes across runs that differ only in
+        ``--eval.max_episodes_rendered``.
+
+        Workaround for strict bit-determinism: set ``render_height/width`` equal
+        to ``observation_height/width`` (verified 0 chunk-level divergence at
+        N=10 on Threading_D0). Trade-off is low-res videos.
+    """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 20}
 
