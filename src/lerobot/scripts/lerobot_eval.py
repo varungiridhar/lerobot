@@ -574,6 +574,29 @@ def eval_main(cfg: EvalPipelineConfig):
         except ValueError as e:
             logging.warning(f"Planning requested but no goal provider available: {e}. Falling back to BC.")
 
+    # Q-scored online planning for policies that expose ``attach_planner``
+    # (currently act_simple). All Q-loading, validation, and planner state
+    # lives in the Planner class — the policy just holds a reference.
+    # The ``use_planning`` field name + ``planning`` sub-config mirror the AWM
+    # head policy's pattern so the CLI form is identical.
+    if (
+        getattr(policy.config, "use_planning", False)
+        and hasattr(policy, "attach_planner")
+    ):
+        from lerobot.policies.act_simple.planning import Planner
+
+        logging.info(
+            f"Q-planning enabled: loading Q-function from {policy.config.planning.q_checkpoint_path}"
+        )
+        planner = Planner.from_checkpoints(
+            cfg=policy.config.planning,
+            bc_post=postprocessor,
+            bc_chunk_size=int(policy.config.chunk_size),
+            device=device,
+        )
+        policy.attach_planner(planner)
+        logging.info(f"Q-planning configured: {policy.config.planning}")
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -583,7 +606,7 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,

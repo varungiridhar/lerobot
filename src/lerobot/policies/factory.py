@@ -37,6 +37,7 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.q_function.configuration_q_function import QFunctionConfig
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
@@ -137,6 +138,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
+    elif name == "q_function":
+        from lerobot.policies.q_function.modeling_q_function import QFunctionPolicy
+
+        return QFunctionPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
