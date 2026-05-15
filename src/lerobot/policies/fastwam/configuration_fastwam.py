@@ -123,6 +123,21 @@ class FastWAMConfig(PreTrainedConfig):
     wm_head_num_layers: int = 4
     wm_head_dropout: float = 0.0
 
+    # ---- Auxiliary Q-function ----
+    enable_q_function: bool = False
+    q_discount: float = 0.99
+    q_target_tau: float = 0.005
+    q_num_bins: int = 101
+    q_v_min: float = -100.0
+    q_v_max: float = 100.0
+    q_hl_gauss_sigma: float = 1.5
+    q_loss_weight: float = 1.0
+    q_head_dim: int = 1024
+    q_head_num_heads: int = 16
+    q_head_ffn_dim: int = 4096
+    q_head_num_layers: int = 4
+    q_head_dropout: float = 0.0
+
     # ---- Normalization ----
     # MIN_MAX for state+action (FastWAM training uses min/max norm).
     # IDENTITY for visual (VAE normalises images internally to [-1,1]).
@@ -164,6 +179,10 @@ class FastWAMConfig(PreTrainedConfig):
             )
         if self.dtype not in ("bfloat16", "float16", "float32"):
             raise ValueError(f"Invalid dtype '{self.dtype}'.")
+        if self.enable_q_function and not (self.q_v_min < self.q_v_max):
+            raise ValueError(
+                f"Expected q_v_min < q_v_max, got q_v_min={self.q_v_min}, q_v_max={self.q_v_max}."
+            )
         if self.n_obs_steps > 1:
             T = self.n_obs_steps
             if T % 4 != 1:
@@ -223,16 +242,25 @@ class FastWAMConfig(PreTrainedConfig):
         # With n_obs_steps > 1 the dataset returns T past frames as video for training.
         # T must satisfy T % 4 == 1 and action_horizon % (T-1) == 0.
         # Default n_obs_steps=1 → None (single frame, tiled to T=5 in _prepare_video_for_training).
+        if self.enable_q_function:
+            if self.n_obs_steps <= 1:
+                return [0, self.chunk_size]
+            step = self.chunk_size // (self.n_obs_steps - 1)
+            return [i * step for i in range(self.n_obs_steps)]
         if self.n_obs_steps <= 1:
             return None
         return list(range(self.n_obs_steps))
 
     @property
     def action_delta_indices(self) -> list[int]:
+        if self.enable_q_function:
+            return list(range(2 * self.chunk_size))
         return list(range(self.chunk_size))
 
     @property
-    def reward_delta_indices(self) -> None:
+    def reward_delta_indices(self) -> list[int] | None:
+        if self.enable_q_function:
+            return list(range(self.chunk_size))
         return None
 
     def get_video_dit_config(self) -> dict:

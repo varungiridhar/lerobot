@@ -34,7 +34,7 @@ os.environ.setdefault(
 
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, REWARD
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,22 @@ class FastWAMPolicy(PreTrainedPolicy):
             wm_action_horizon=config.chunk_size,
         )
 
+        if config.enable_q_function:
+            self.model.enable_q_function(
+                num_bins=config.q_num_bins,
+                v_min=config.q_v_min,
+                v_max=config.q_v_max,
+                discount=config.q_discount,
+                target_tau=config.q_target_tau,
+                hl_gauss_sigma=config.q_hl_gauss_sigma,
+                loss_weight=config.q_loss_weight,
+                dim_model=config.q_head_dim,
+                n_heads=config.q_head_num_heads,
+                dim_feedforward=config.q_head_ffn_dim,
+                n_layers=config.q_head_num_layers,
+                dropout=config.q_head_dropout,
+            )
+
         if config.freeze_vae:
             for p in self.model.vae.parameters():
                 p.requires_grad_(False)
@@ -183,6 +199,9 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._queue: deque[Tensor] = deque()
+
+    def update(self) -> None:
+        self.model.update()
 
     def get_optim_params(self) -> list[Tensor]:
         return [p for p in self.parameters() if p.requires_grad]
@@ -226,10 +245,41 @@ class FastWAMPolicy(PreTrainedPolicy):
         # build_inputs expects proprio as (B, T, D); add T dim if (B, D)
         if proprio is not None and proprio.dim() == 2:
             proprio = proprio.unsqueeze(1)
-        action = batch[ACTION].to(device=self.model.device, dtype=self.model.torch_dtype)
+        action_full = batch[ACTION].to(device=self.model.device, dtype=self.model.torch_dtype)
+        action = action_full[:, : self.config.chunk_size]
         action_is_pad = batch.get("action_is_pad", None)
         if action_is_pad is not None:
             action_is_pad = action_is_pad.to(device=self.model.device, dtype=torch.bool)
+        q_action_is_pad = action_is_pad
+        if q_action_is_pad is not None:
+            action_is_pad = q_action_is_pad[:, : self.config.chunk_size]
+
+        reward = batch.get(REWARD, None)
+        if reward is not None:
+            if not isinstance(reward, Tensor):
+                reward = torch.as_tensor(reward)
+            reward = reward.to(device=self.model.device, dtype=self.model.torch_dtype)
+        reward_is_pad = batch.get(f"{REWARD}_is_pad", None)
+        if reward_is_pad is not None:
+            if not isinstance(reward_is_pad, Tensor):
+                reward_is_pad = torch.as_tensor(reward_is_pad)
+            reward_is_pad = reward_is_pad.to(device=self.model.device, dtype=torch.bool)
+        # The processor injects a scalar default reward when the dataset does not
+        # actually provide reward features. Treat that placeholder as "no reward
+        # sequence available" so the auxiliary Q-function can fall back to its
+        # dataset-free shaping target.
+        if reward is not None and reward.ndim == 0 and reward_is_pad is None:
+            reward = None
+
+        q_bootstrap_state_is_pad = None
+        if self.config.enable_q_function:
+            pad_keys = [
+                (f"{OBS_IMAGES}.image" if i == 0 else f"{OBS_IMAGES}.image{i + 1}") + "_is_pad"
+                for i in range(self.config.num_cameras)
+            ]
+            camera_pad = [batch[key].to(device=self.model.device, dtype=torch.bool) for key in pad_keys if key in batch]
+            if camera_pad:
+                q_bootstrap_state_is_pad = torch.stack(camera_pad, dim=0).any(dim=0)[:, -1]
 
         sample = {
             "video": video,
@@ -238,6 +288,13 @@ class FastWAMPolicy(PreTrainedPolicy):
             "proprio": proprio,
             "action": action,
             "action_is_pad": action_is_pad,
+            "q_action": action_full if self.config.enable_q_function else None,
+            "q_action_is_pad": q_action_is_pad if self.config.enable_q_function else None,
+            "q_reward": reward if self.config.enable_q_function else None,
+            "q_reward_is_pad": reward_is_pad if self.config.enable_q_function else None,
+            "q_bootstrap_state_is_pad": (
+                q_bootstrap_state_is_pad if self.config.enable_q_function else None
+            ),
         }
         loss, loss_dict = self.model.training_loss(sample)
         return loss, {k: v.item() if isinstance(v, Tensor) else v for k, v in loss_dict.items()}
@@ -250,9 +307,11 @@ class FastWAMPolicy(PreTrainedPolicy):
         if proprio is not None and proprio.dim() == 2:
             proprio = proprio.unsqueeze(1)
         action = batch[ACTION].to(device=self.model.device, dtype=self.model.torch_dtype)
+        action = action[:, : self.config.chunk_size]
         action_is_pad = batch.get("action_is_pad", None)
         if action_is_pad is not None:
             action_is_pad = action_is_pad.to(device=self.model.device, dtype=torch.bool)
+            action_is_pad = action_is_pad[:, : self.config.chunk_size]
 
         sample = {
             "video": video[:n_pairs],
@@ -350,6 +409,10 @@ class FastWAMPolicy(PreTrainedPolicy):
             if v.dim() == 4:
                 # Single-frame: tile to T=5 (minimum T satisfying T%4==1, T>1)
                 v = v.unsqueeze(1).expand(-1, 5, -1, -1, -1)
+            elif v.dim() == 5 and (v.shape[1] <= 1 or v.shape[1] % 4 != 1):
+                target_t = max(5, ((v.shape[1] - 1 + 3) // 4) * 4 + 1)
+                index = torch.linspace(0, v.shape[1] - 1, target_t, device=v.device).round().long()
+                v = v.index_select(1, index)
             cam_videos.append(v)
 
         # Concat along W, then permute to (B, C, T, H, W*N)

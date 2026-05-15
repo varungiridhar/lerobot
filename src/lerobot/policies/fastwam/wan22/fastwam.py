@@ -1,3 +1,4 @@
+import copy
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -13,8 +14,11 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .wm_head import (
     FastWAMLatentWMHead,
+    FastWAMLatentQFunction,
     WMLatentImageDecoder,
     compute_image_reconstruction_metrics,
+    q_expected_value,
+    q_two_hot_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +131,15 @@ class FastWAM(torch.nn.Module):
             image_shape=self.image_shape,
             latent_hw=(latent_h, latent_w),
         ).to(torch_dtype)
+
+        self.q_function = None
+        self.q_target = None
+        self.register_buffer("_q_bin_centers", None, persistent=True)
+        self._q_discount = None
+        self._q_target_tau = None
+        self._q_hl_gauss_sigma = None
+        self._q_loss_weight = 0.0
+        self._q_action_horizon = int(wm_action_horizon)
 
         self.to(self.device)
 
@@ -248,6 +261,63 @@ class FastWAM(torch.nn.Module):
             self.text_encoder.to(*args, **kwargs)
         self.vae.to(*args, **kwargs)
         return self
+
+    def enable_q_function(
+        self,
+        num_bins: int,
+        v_min: float,
+        v_max: float,
+        discount: float,
+        target_tau: float,
+        hl_gauss_sigma: float,
+        loss_weight: float,
+        dim_model: int,
+        n_heads: int,
+        dim_feedforward: int,
+        n_layers: int,
+        dropout: float,
+    ) -> None:
+        latent_channels = int(self.vae.model.z_dim)
+        latent_h = self.image_shape[1] // int(self.vae.upsampling_factor)
+        latent_w = self.image_shape[2] // int(self.vae.upsampling_factor)
+        patch_h = int(self.video_expert.patch_size[1])
+        patch_w = int(self.video_expert.patch_size[2])
+
+        self.q_function = FastWAMLatentQFunction(
+            latent_channels=latent_channels,
+            latent_hw=(latent_h, latent_w),
+            action_dim=int(self.action_expert.action_dim),
+            action_horizon=int(self._q_action_horizon),
+            patch_size=(patch_h, patch_w),
+            dim_model=dim_model,
+            n_heads=n_heads,
+            dim_feedforward=dim_feedforward,
+            n_layers=n_layers,
+            num_bins=num_bins,
+            dropout=dropout,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        self.q_target = copy.deepcopy(self.q_function).to(device=self.device, dtype=self.torch_dtype)
+        for p in self.q_target.parameters():
+            p.requires_grad_(False)
+        self.register_buffer(
+            "_q_bin_centers",
+            torch.linspace(v_min, v_max, num_bins, dtype=torch.float32, device=self.device),
+            persistent=True,
+        )
+        self._q_discount = float(discount)
+        self._q_target_tau = float(target_tau)
+        self._q_hl_gauss_sigma = float(hl_gauss_sigma)
+        self._q_loss_weight = float(loss_weight)
+
+    @torch.no_grad()
+    def update(self) -> None:
+        if self.q_function is None or self.q_target is None or self._q_target_tau is None:
+            return
+        tau = float(self._q_target_tau)
+        for p_online, p_target in zip(self.q_function.parameters(), self.q_target.parameters()):
+            p_target.data.mul_(1.0 - tau).add_(p_online.data, alpha=tau)
+        for b_online, b_target in zip(self.q_function.buffers(), self.q_target.buffers()):
+            b_target.data.copy_(b_online.data)
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -559,6 +629,102 @@ class FastWAM(torch.nn.Module):
             action_is_pad=action_is_pad,
         )
 
+    def _compute_q_loss(
+        self,
+        current_latents: torch.Tensor,
+        next_latents: torch.Tensor,
+        q_action: torch.Tensor,
+        q_action_is_pad: Optional[torch.Tensor],
+        q_reward: Optional[torch.Tensor],
+        q_reward_is_pad: Optional[torch.Tensor],
+        q_bootstrap_state_is_pad: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if self.q_function is None or self.q_target is None:
+            zero = current_latents.new_zeros(())
+            return zero, {}
+        if self._q_bin_centers is None:
+            raise RuntimeError("Q-function bin centers are not initialized.")
+
+        h = int(self._q_action_horizon)
+        if q_action.shape[1] < 2 * h:
+            raise ValueError(
+                f"Q-function expects at least 2 * horizon={2 * h} actions, got {q_action.shape[1]}."
+            )
+
+        a_first = q_action[:, :h]
+        a_second = q_action[:, h : 2 * h]
+        a_first_is_pad = None if q_action_is_pad is None else q_action_is_pad[:, :h]
+        a_second_is_pad = None if q_action_is_pad is None else q_action_is_pad[:, h : 2 * h]
+
+        reward_is_pad = None
+        if q_reward is not None:
+            reward = q_reward
+            if reward.ndim == 3 and reward.shape[-1] == 1:
+                reward = reward.squeeze(-1)
+            if reward.ndim != 2 or reward.shape[1] < h:
+                raise ValueError(
+                    f"Q-function expects reward shape [B, >=h] or [B, >=h, 1], got {tuple(q_reward.shape)}."
+                )
+            reward = reward[:, :h]
+            if q_reward_is_pad is not None:
+                if q_reward_is_pad.ndim == 3 and q_reward_is_pad.shape[-1] == 1:
+                    q_reward_is_pad = q_reward_is_pad.squeeze(-1)
+                reward_is_pad = q_reward_is_pad[:, :h]
+                reward = reward.masked_fill(reward_is_pad, 0)
+            reward_source = 1.0
+        else:
+            if a_first_is_pad is not None:
+                reward_is_pad = a_first_is_pad
+                reward = (~a_first_is_pad).to(dtype=current_latents.dtype) * -1.0
+            else:
+                reward = torch.full(
+                    (current_latents.shape[0], h),
+                    -1.0,
+                    device=current_latents.device,
+                    dtype=current_latents.dtype,
+                )
+            reward_source = 0.0
+
+        logits_online = self.q_function(current_latents, a_first, a_first_is_pad)
+        with torch.no_grad():
+            target_logits = self.q_target(next_latents, a_second, a_second_is_pad)
+            q_next = q_expected_value(target_logits.float(), self._q_bin_centers)
+
+        discounts = torch.pow(
+            torch.full((h,), float(self._q_discount), device=reward.device, dtype=reward.dtype),
+            torch.arange(h, device=reward.device, dtype=reward.dtype),
+        )
+        discounted_rewards = (reward * discounts.unsqueeze(0)).sum(dim=-1)
+
+        bootstrap_valid = torch.ones(
+            current_latents.shape[0], device=current_latents.device, dtype=reward.dtype
+        )
+        if reward_is_pad is not None:
+            bootstrap_valid = bootstrap_valid * (~reward_is_pad[:, -1]).to(dtype=reward.dtype)
+        if q_bootstrap_state_is_pad is not None:
+            bootstrap_valid = bootstrap_valid * (~q_bootstrap_state_is_pad).to(dtype=reward.dtype)
+
+        gamma_h = float(self._q_discount) ** h
+        y = discounted_rewards + gamma_h * bootstrap_valid * q_next.to(dtype=reward.dtype)
+
+        target_probs = q_two_hot_target(y.float(), self._q_bin_centers, float(self._q_hl_gauss_sigma))
+        log_probs = F.log_softmax(logits_online.float(), dim=-1)
+        loss_q = -(target_probs * log_probs).sum(dim=-1).mean()
+
+        with torch.no_grad():
+            q_pred = q_expected_value(logits_online.float(), self._q_bin_centers)
+            td_abs_error = (q_pred - y.float()).abs().mean()
+            metrics = {
+                "loss_q": self._q_loss_weight * float(loss_q.detach().item()),
+                "q_pred_mean": float(q_pred.mean().item()),
+                "q_target_mean": float(y.float().mean().item()),
+                "q_bootstrap_frac": float(bootstrap_valid.mean().item()),
+                "q_reward_sum_mean": float(discounted_rewards.float().mean().item()),
+                "q_reward_from_dataset": reward_source,
+                "q_td_abs_error": float(td_abs_error.item()),
+            }
+        return loss_q, metrics
+
     @staticmethod
     def _compute_wm_image_metrics(
         decoded_curr: torch.Tensor,
@@ -591,6 +757,11 @@ class FastWAM(torch.nn.Module):
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
+        q_action = sample.get("q_action", None)
+        q_action_is_pad = sample.get("q_action_is_pad", None)
+        q_reward = sample.get("q_reward", None)
+        q_reward_is_pad = sample.get("q_reward_is_pad", None)
+        q_bootstrap_state_is_pad = sample.get("q_bootstrap_state_is_pad", None)
         current_wm_latents, target_wm_latents, current_wm_image, target_wm_image = (
             self._extract_wm_training_targets(
                 sample["video"].to(device=self.device, dtype=self.torch_dtype),
@@ -726,11 +897,38 @@ class FastWAM(torch.nn.Module):
         decoded_curr = self.wm_image_decoder(current_wm_latents.detach())
         loss_wm_decoder = F.mse_loss(decoded_curr.float(), current_wm_image.float())
 
+        if self.q_function is not None:
+            if q_action is None:
+                raise ValueError(
+                    "FastWAM Q-function training requires `sample['q_action']`."
+                )
+            loss_q, q_metrics = self._compute_q_loss(
+                current_latents=current_wm_latents,
+                next_latents=target_wm_latents,
+                q_action=q_action.to(device=self.device, dtype=self.torch_dtype),
+                q_action_is_pad=None
+                if q_action_is_pad is None
+                else q_action_is_pad.to(device=self.device, dtype=torch.bool),
+                q_reward=None
+                if q_reward is None
+                else q_reward.to(device=self.device, dtype=self.torch_dtype),
+                q_reward_is_pad=None
+                if q_reward_is_pad is None
+                else q_reward_is_pad.to(device=self.device, dtype=torch.bool),
+                q_bootstrap_state_is_pad=None
+                if q_bootstrap_state_is_pad is None
+                else q_bootstrap_state_is_pad.to(device=self.device, dtype=torch.bool),
+            )
+        else:
+            loss_q = action.new_zeros(())
+            q_metrics = {}
+
         loss_total = (
             self.loss_lambda_video * loss_video
             + self.loss_lambda_action * loss_action
             + self.loss_lambda_wm_latent * loss_wm_latent
             + self.loss_lambda_wm_decoder * loss_wm_decoder
+            + self._q_loss_weight * loss_q
         )
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
@@ -738,6 +936,8 @@ class FastWAM(torch.nn.Module):
             "loss_wm_latent": self.loss_lambda_wm_latent * float(loss_wm_latent.detach().item()),
             "loss_wm_decoder": self.loss_lambda_wm_decoder * float(loss_wm_decoder.detach().item()),
         }
+        if q_metrics:
+            loss_dict.update(q_metrics)
         with torch.no_grad():
             decoded_next = self.wm_image_decoder(pred_wm_latents.detach())
             loss_dict.update(

@@ -250,3 +250,126 @@ def compute_image_reconstruction_metrics(
     mse = F.mse_loss(pred.float(), target.float())
     psnr = -10.0 * torch.log10(mse.clamp(min=1e-8))
     return {f"{prefix}/mse": float(mse.item()), f"{prefix}/psnr": float(psnr.item())}
+
+
+def q_two_hot_target(values: torch.Tensor, bin_centers: torch.Tensor, sigma: float) -> torch.Tensor:
+    values = values.clamp(bin_centers[0], bin_centers[-1]).unsqueeze(-1)
+    d = (bin_centers.unsqueeze(0) - values) / sigma
+    logits = -0.5 * d.pow(2)
+    logits = logits - logits.max(dim=-1, keepdim=True).values
+    probs = torch.exp(logits)
+    return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def q_expected_value(logits: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+    probs = F.softmax(logits, dim=-1)
+    return (probs * bin_centers).sum(dim=-1)
+
+
+class FastWAMLatentQFunction(nn.Module):
+    """Chunk-value critic over WAN VAE latents and action chunks."""
+
+    def __init__(
+        self,
+        latent_channels: int,
+        latent_hw: tuple[int, int],
+        action_dim: int,
+        action_horizon: int,
+        patch_size: tuple[int, int],
+        dim_model: int,
+        n_heads: int,
+        dim_feedforward: int,
+        n_layers: int,
+        num_bins: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        latent_h, latent_w = latent_hw
+        patch_h, patch_w = patch_size
+        if latent_h % patch_h != 0 or latent_w % patch_w != 0:
+            raise ValueError(
+                "Latent spatial shape must be divisible by Q-function patch size, "
+                f"got ({latent_h}, {latent_w}) vs ({patch_h}, {patch_w})."
+            )
+
+        self.latent_channels = int(latent_channels)
+        self.latent_hw = (int(latent_h), int(latent_w))
+        self.patch_size = (int(patch_h), int(patch_w))
+        self.tokens_per_image = (latent_h // patch_h) * (latent_w // patch_w)
+        self.patch_dim = self.latent_channels * patch_h * patch_w
+
+        self.latent_in_proj = nn.Linear(self.patch_dim, dim_model)
+        self.action_proj = nn.Linear(action_dim, dim_model)
+        self.decoder = WMDecoder(
+            dim_model=dim_model,
+            n_heads=n_heads,
+            dim_feedforward=dim_feedforward,
+            n_layers=n_layers,
+            dropout=dropout,
+        )
+        self.action_pos_embed = nn.Embedding(action_horizon, dim_model)
+        self.cross_pos_embed = nn.Embedding(self.tokens_per_image, dim_model)
+        self.cls_query = nn.Parameter(torch.zeros(1, 1, dim_model))
+        self.cls_pos_embed = nn.Parameter(torch.zeros(1, 1, dim_model))
+        self.head = nn.Sequential(
+            nn.Linear(dim_model, dim_model),
+            nn.GELU(),
+            nn.Linear(dim_model, num_bins),
+        )
+        nn.init.trunc_normal_(self.cls_query, std=0.02)
+        nn.init.trunc_normal_(self.cls_pos_embed, std=0.02)
+
+    def _patchify(self, latents: torch.Tensor) -> torch.Tensor:
+        bsz, channels, height, width = latents.shape
+        if channels != self.latent_channels or (height, width) != self.latent_hw:
+            raise ValueError(
+                "Q-function latent shape mismatch: "
+                f"expected [B, {self.latent_channels}, {self.latent_hw[0]}, {self.latent_hw[1]}], "
+                f"got {tuple(latents.shape)}."
+            )
+        patch_h, patch_w = self.patch_size
+        latents = latents.view(
+            bsz,
+            channels,
+            height // patch_h,
+            patch_h,
+            width // patch_w,
+            patch_w,
+        )
+        latents = latents.permute(0, 2, 4, 1, 3, 5).contiguous()
+        return latents.view(bsz, self.tokens_per_image, self.patch_dim)
+
+    def forward(
+        self,
+        current_latents: torch.Tensor,
+        actions: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if current_latents.ndim != 4:
+            raise ValueError(
+                f"`current_latents` must be [B, C, H, W], got {tuple(current_latents.shape)}."
+            )
+        if actions.ndim != 3:
+            raise ValueError(f"`actions` must be [B, T, A], got {tuple(actions.shape)}.")
+        if actions.shape[1] > self.action_pos_embed.num_embeddings:
+            raise ValueError(
+                "Action horizon exceeds Q-function positional capacity: "
+                f"{actions.shape[1]} > {self.action_pos_embed.num_embeddings}."
+            )
+
+        if action_is_pad is not None:
+            actions = actions.masked_fill(action_is_pad.unsqueeze(-1), 0)
+
+        batch_size = current_latents.shape[0]
+        latent_tokens = self._patchify(current_latents)
+        cross_kv = self.latent_in_proj(latent_tokens).transpose(0, 1)
+        cross_pos = self.cross_pos_embed.weight[: self.tokens_per_image].unsqueeze(1)
+
+        action_tokens = self.action_proj(actions).transpose(0, 1)
+        action_tokens = action_tokens + self.action_pos_embed.weight[: actions.shape[1]].unsqueeze(1)
+
+        cls_query = self.cls_query.expand(-1, batch_size, -1)
+        cls_pos = self.cls_pos_embed.expand(-1, batch_size, -1)
+        q_in = torch.cat([cls_query + cls_pos, action_tokens], dim=0)
+        q_out = self.decoder(q_in, cross_kv, cross_pos)
+        return self.head(q_out[0])
