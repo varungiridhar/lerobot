@@ -113,6 +113,15 @@ class FastWAMConfig(PreTrainedConfig):
     # ---- Loss weights ----
     loss_lambda_video: float = 1.0
     loss_lambda_action: float = 1.0
+    loss_lambda_wm_latent: float = 1.0
+    loss_lambda_wm_decoder: float = 0.1
+
+    # ---- Auxiliary WM head ----
+    wm_head_dim: int = 1024
+    wm_head_num_heads: int = 16
+    wm_head_ffn_dim: int = 4096
+    wm_head_num_layers: int = 4
+    wm_head_dropout: float = 0.0
 
     # ---- Normalization ----
     # MIN_MAX for state+action (FastWAM training uses min/max norm).

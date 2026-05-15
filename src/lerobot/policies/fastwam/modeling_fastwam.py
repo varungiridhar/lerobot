@@ -22,6 +22,7 @@ from collections import deque
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 # Set default path to Wan2.2 pretrained weights on shared cluster storage so users
@@ -66,6 +67,26 @@ def _get_fastwam_cls(variant: str):
         raise ValueError(f"Unknown model_variant: {variant!r}")
 
 
+def _resolve_image_shape(config: FastWAMConfig) -> tuple[int, int, int]:
+    image_features = list(config.image_features.items())
+    if not image_features:
+        return (3, config.image_size[0], config.image_size[1] * config.num_cameras)
+
+    channels = image_features[0][1].shape[0]
+    height = image_features[0][1].shape[1]
+    widths: list[int] = []
+    for key, feature in image_features:
+        if len(feature.shape) != 3:
+            raise ValueError(f"Expected visual feature {key} to have shape [C, H, W], got {feature.shape}.")
+        if feature.shape[0] != channels or feature.shape[1] != height:
+            raise ValueError(
+                "All FastWAM camera inputs must share the same channel count and height, "
+                f"but {key} has shape {feature.shape}."
+            )
+        widths.append(int(feature.shape[2]))
+    return (int(channels), int(height), int(sum(widths)))
+
+
 class FastWAMPolicy(PreTrainedPolicy):
     """LeRobot policy wrapper for FastWAM.
 
@@ -95,6 +116,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             "Building FastWAM model: loading VAE + text encoder from wan22 pretrained; "
             "DiT weights will be filled by from_pretrained / checkpoint loading."
         )
+        image_shape = _resolve_image_shape(config)
 
         # Load VAE + text encoder from wan22 pretrained.
         # skip_dit_load_from_pretrain=True: build random DiT architecture only.
@@ -120,6 +142,15 @@ class FastWAMPolicy(PreTrainedPolicy):
             action_num_train_timesteps=config.action_num_train_timesteps,
             loss_lambda_video=config.loss_lambda_video,
             loss_lambda_action=config.loss_lambda_action,
+            loss_lambda_wm_latent=config.loss_lambda_wm_latent,
+            loss_lambda_wm_decoder=config.loss_lambda_wm_decoder,
+            wm_head_dim=config.wm_head_dim,
+            wm_head_num_heads=config.wm_head_num_heads,
+            wm_head_ffn_dim=config.wm_head_ffn_dim,
+            wm_head_num_layers=config.wm_head_num_layers,
+            wm_head_dropout=config.wm_head_dropout,
+            image_shape=image_shape,
+            wm_action_horizon=config.chunk_size,
         )
 
         if config.freeze_vae:
@@ -153,8 +184,8 @@ class FastWAMPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         self._queue: deque[Tensor] = deque()
 
-    def get_optim_params(self) -> dict[str, Any]:
-        return {n: p for n, p in self.named_parameters() if p.requires_grad}
+    def get_optim_params(self) -> list[Tensor]:
+        return [p for p in self.parameters() if p.requires_grad]
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the full action chunk (B, chunk_size, action_dim) for the current observation.
@@ -211,6 +242,28 @@ class FastWAMPolicy(PreTrainedPolicy):
         loss, loss_dict = self.model.training_loss(sample)
         return loss, {k: v.item() if isinstance(v, Tensor) else v for k, v in loss_dict.items()}
 
+    @torch.no_grad()
+    def visualize(self, batch: dict[str, Tensor], n_pairs: int = 12) -> dict[str, Tensor] | None:
+        video = self._prepare_video_for_training(batch)
+        context, context_mask = self._encode_text(batch)
+        proprio = self._get_proprio(batch)
+        if proprio is not None and proprio.dim() == 2:
+            proprio = proprio.unsqueeze(1)
+        action = batch[ACTION].to(device=self.model.device, dtype=self.model.torch_dtype)
+        action_is_pad = batch.get("action_is_pad", None)
+        if action_is_pad is not None:
+            action_is_pad = action_is_pad.to(device=self.model.device, dtype=torch.bool)
+
+        sample = {
+            "video": video[:n_pairs],
+            "context": context[:n_pairs],
+            "context_mask": context_mask[:n_pairs],
+            "proprio": None if proprio is None else proprio[:n_pairs],
+            "action": action[:n_pairs],
+            "action_is_pad": None if action_is_pad is None else action_is_pad[:n_pairs],
+        }
+        return self.model.visualize(sample, n_pairs=n_pairs)
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -262,6 +315,7 @@ class FastWAMPolicy(PreTrainedPolicy):
 
         image = torch.cat(imgs, dim=-1)      # concat along W: (B, C, H, W*N_cam)
         image = image * 2.0 - 1.0           # [0, 1] → [-1, 1]
+        image = self._resize_spatial_to_model_shape(image)
         return image.to(device=self.model.device, dtype=self.model.torch_dtype)
 
     def _get_proprio(self, batch: dict[str, Tensor]) -> Tensor | None:
@@ -302,4 +356,27 @@ class FastWAMPolicy(PreTrainedPolicy):
         video = torch.cat(cam_videos, dim=-1)   # (B, T, C, H, W*N)
         video = video.permute(0, 2, 1, 3, 4)   # (B, C, T, H, W*N)
         video = video * 2.0 - 1.0              # [0, 1] → [-1, 1]
+        video = self._resize_video_spatial_to_model_shape(video)
         return video.to(device=self.model.device, dtype=self.model.torch_dtype)
+
+    def _resize_spatial_to_model_shape(self, image: Tensor) -> Tensor:
+        """Resize BCHW image batches to the spatial shape FastWAM was built for."""
+        target_h, target_w = self.model.image_shape[1:]
+        if image.shape[-2:] == (target_h, target_w):
+            return image
+        return F.interpolate(image, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+    def _resize_video_spatial_to_model_shape(self, video: Tensor) -> Tensor:
+        """Resize BCTHW video batches framewise to the model's expected spatial shape."""
+        target_h, target_w = self.model.image_shape[1:]
+        if video.shape[-2:] == (target_h, target_w):
+            return video
+        b, c, t, h, w = video.shape
+        video_btchw = video.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        video_btchw = F.interpolate(
+            video_btchw,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return video_btchw.reshape(b, t, c, target_h, target_w).permute(0, 2, 1, 3, 4)

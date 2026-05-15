@@ -33,13 +33,26 @@ from datasets.features.features import register_feature
 from PIL import Image
 
 
+def _is_torchcodec_usable() -> bool:
+    """Return True only when torchcodec can actually import its native libs."""
+    if not importlib.util.find_spec("torchcodec"):
+        return False
+    try:
+        from torchcodec.decoders import VideoDecoder  # noqa: F401
+    except Exception as exc:
+        logging.warning(
+            "'torchcodec' is installed but unusable, falling back to 'pyav'. Error: %s",
+            exc,
+        )
+        return False
+    return True
+
+
 def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
+    if _is_torchcodec_usable():
         return "torchcodec"
     else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
+        logging.warning("Falling back to 'pyav' as the default video decoder")
         return "pyav"
 
 
@@ -66,7 +79,15 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        try:
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        except Exception as exc:
+            logging.warning(
+                "Failed to decode %s with torchcodec; falling back to pyav. Error: %s",
+                video_path,
+                exc,
+            )
+            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, "pyav")
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -180,10 +201,10 @@ class VideoDecoderCache:
 
     def get_decoder(self, video_path: str):
         """Get a cached decoder or create a new one."""
-        if importlib.util.find_spec("torchcodec"):
+        if _is_torchcodec_usable():
             from torchcodec.decoders import VideoDecoder
         else:
-            raise ImportError("torchcodec is required but not available.")
+            raise ImportError("torchcodec is required but not usable.")
 
         video_path = str(video_path)
 

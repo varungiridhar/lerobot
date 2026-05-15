@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import inspect
+import os
 from typing import Any
 
 import torch
@@ -129,6 +130,13 @@ def _resolve_configs(model_id: str, tokenizer_model_id: str, redirect_common_fil
     tokenizer_config = ModelConfig(model_id=tokenizer_model_id, origin_file_pattern="google/umt5-xxl/")
 
     if redirect_common_files:
+        # The old DiffSynth Hugging Face mirror for common Wan files is gone.
+        # When downloading from Hugging Face, keep using the official Wan-AI repos
+        # which host the original `.pth` assets directly.
+        download_source = os.environ.get("DIFFSYNTH_DOWNLOAD_SOURCE", "modelscope").lower()
+        if download_source == "huggingface":
+            return dit_config, text_config, vae_config, tokenizer_config
+
         redirect_dict = {
             "models_t5_umt5-xxl-enc-bf16.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "models_t5_umt5-xxl-enc-bf16.safetensors"),
             "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),

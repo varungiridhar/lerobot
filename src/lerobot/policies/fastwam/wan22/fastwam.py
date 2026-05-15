@@ -11,6 +11,11 @@ from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .wm_head import (
+    FastWAMLatentWMHead,
+    WMLatentImageDecoder,
+    compute_image_reconstruction_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,15 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_wm_latent: float = 1.0,
+        loss_lambda_wm_decoder: float = 0.1,
+        wm_head_dim: int = 1024,
+        wm_head_num_heads: int = 16,
+        wm_head_ffn_dim: int = 4096,
+        wm_head_num_layers: int = 4,
+        wm_head_dropout: float = 0.0,
+        image_shape: Optional[tuple[int, int, int]] = None,
+        wm_action_horizon: int = 32,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,6 +98,35 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_wm_latent = float(loss_lambda_wm_latent)
+        self.loss_lambda_wm_decoder = float(loss_lambda_wm_decoder)
+
+        if image_shape is None:
+            raise ValueError("`image_shape` is required to build the FastWAM WM image decoder.")
+        self.image_shape = tuple(int(v) for v in image_shape)
+
+        latent_h = self.image_shape[1] // int(self.vae.upsampling_factor)
+        latent_w = self.image_shape[2] // int(self.vae.upsampling_factor)
+        latent_channels = int(self.vae.model.z_dim)
+        patch_h = int(self.video_expert.patch_size[1])
+        patch_w = int(self.video_expert.patch_size[2])
+        self.wm_head = FastWAMLatentWMHead(
+            latent_channels=latent_channels,
+            latent_hw=(latent_h, latent_w),
+            action_dim=int(self.action_expert.action_dim),
+            action_horizon=int(wm_action_horizon),
+            patch_size=(patch_h, patch_w),
+            dim_model=wm_head_dim,
+            n_heads=wm_head_num_heads,
+            dim_feedforward=wm_head_ffn_dim,
+            n_layers=wm_head_num_layers,
+            dropout=wm_head_dropout,
+        ).to(torch_dtype)
+        self.wm_image_decoder = WMLatentImageDecoder(
+            latent_channels=latent_channels,
+            image_shape=self.image_shape,
+            latent_hw=(latent_h, latent_w),
+        ).to(torch_dtype)
 
         self.to(self.device)
 
@@ -111,6 +154,15 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_wm_latent: float = 1.0,
+        loss_lambda_wm_decoder: float = 0.1,
+        wm_head_dim: int = 1024,
+        wm_head_num_heads: int = 16,
+        wm_head_ffn_dim: int = 4096,
+        wm_head_num_layers: int = 4,
+        wm_head_dropout: float = 0.0,
+        image_shape: Optional[tuple[int, int, int]] = None,
+        wm_action_horizon: int = 32,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +220,15 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_wm_latent=loss_lambda_wm_latent,
+            loss_lambda_wm_decoder=loss_lambda_wm_decoder,
+            wm_head_dim=wm_head_dim,
+            wm_head_num_heads=wm_head_num_heads,
+            wm_head_ffn_dim=wm_head_ffn_dim,
+            wm_head_num_layers=wm_head_num_layers,
+            wm_head_dropout=wm_head_dropout,
+            image_shape=image_shape,
+            wm_action_horizon=wm_action_horizon,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -263,6 +324,32 @@ class FastWAM(torch.nn.Module):
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
         return z
+
+    @torch.no_grad()
+    def _encode_image_frame_latents(
+        self,
+        images: torch.Tensor,
+        tiled: bool = False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    ) -> torch.Tensor:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(f"`images` must be [B, 3, H, W], got {tuple(images.shape)}")
+        image_list = [img.to(device=self.device).unsqueeze(1) for img in images]
+        z = self.vae.encode(
+            image_list,
+            device=self.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        if isinstance(z, list):
+            z = torch.stack(z, dim=0)
+        if z.ndim != 5:
+            raise ValueError(f"Expected encoded image latents to be [B, C, T, H, W], got {tuple(z.shape)}")
+        if z.shape[2] != 1:
+            raise ValueError(f"Single-image latent encode must have T=1, got {z.shape[2]}")
+        return z[:, :, 0]
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -445,6 +532,56 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
+    @staticmethod
+    def _to_visual_01(image: torch.Tensor) -> torch.Tensor:
+        return ((image.detach().float() + 1.0) * 0.5).clamp(0.0, 1.0)
+
+    def _extract_wm_training_targets(
+        self,
+        video: torch.Tensor,
+        tiled: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        curr_image = video[:, :, 0]
+        future_image = video[:, :, -1]
+        curr_latents = self._encode_image_frame_latents(curr_image, tiled=tiled).detach()
+        future_latents = self._encode_image_frame_latents(future_image, tiled=tiled).detach()
+        return curr_latents, future_latents, curr_image, future_image
+
+    def _run_wm_head(
+        self,
+        current_latents: torch.Tensor,
+        action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.wm_head(
+            current_latents=current_latents,
+            actions=action,
+            action_is_pad=action_is_pad,
+        )
+
+    @staticmethod
+    def _compute_wm_image_metrics(
+        decoded_curr: torch.Tensor,
+        current_wm_image: torch.Tensor,
+        decoded_next: torch.Tensor,
+        target_wm_image: torch.Tensor,
+        valid_future: Optional[torch.Tensor],
+    ) -> dict[str, float]:
+        metrics = compute_image_reconstruction_metrics(
+            decoded_curr.detach(),
+            current_wm_image.detach(),
+            prefix="wm_curr",
+        )
+        metrics.update(
+            compute_image_reconstruction_metrics(
+                decoded_next.detach(),
+                target_wm_image.detach(),
+                prefix="wm_next",
+                valid_mask=valid_future,
+            )
+        )
+        return metrics
+
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -454,6 +591,12 @@ class FastWAM(torch.nn.Module):
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
+        current_wm_latents, target_wm_latents, current_wm_image, target_wm_image = (
+            self._extract_wm_training_targets(
+                sample["video"].to(device=self.device, dtype=self.torch_dtype),
+                tiled=tiled,
+            )
+        )
 
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
@@ -560,12 +703,72 @@ class FastWAM(torch.nn.Module):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        pred_wm_latents = self._run_wm_head(
+            current_latents=current_wm_latents,
+            action=action,
+            action_is_pad=action_is_pad,
+        )
+        wm_latent_loss_per_sample = F.mse_loss(
+            pred_wm_latents.float(),
+            target_wm_latents.float(),
+            reduction="none",
+        ).mean(dim=(1, 2, 3))
+
+        if image_is_pad is not None:
+            valid_future = ~image_is_pad[:, -1]
+            valid_future_f = valid_future.to(dtype=wm_latent_loss_per_sample.dtype)
+            valid_future_sum = valid_future_f.sum().clamp(min=1.0)
+            loss_wm_latent = (wm_latent_loss_per_sample * valid_future_f).sum() / valid_future_sum
+        else:
+            valid_future = None
+            loss_wm_latent = wm_latent_loss_per_sample.mean()
+
+        decoded_curr = self.wm_image_decoder(current_wm_latents.detach())
+        loss_wm_decoder = F.mse_loss(decoded_curr.float(), current_wm_image.float())
+
+        loss_total = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+            + self.loss_lambda_wm_latent * loss_wm_latent
+            + self.loss_lambda_wm_decoder * loss_wm_decoder
+        )
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_wm_latent": self.loss_lambda_wm_latent * float(loss_wm_latent.detach().item()),
+            "loss_wm_decoder": self.loss_lambda_wm_decoder * float(loss_wm_decoder.detach().item()),
         }
+        with torch.no_grad():
+            decoded_next = self.wm_image_decoder(pred_wm_latents.detach())
+            loss_dict.update(
+                self._compute_wm_image_metrics(
+                    decoded_curr=decoded_curr,
+                    current_wm_image=current_wm_image,
+                    decoded_next=decoded_next,
+                    target_wm_image=target_wm_image,
+                    valid_future=valid_future,
+                )
+            )
         return loss_total, loss_dict
+
+    @torch.no_grad()
+    def visualize(self, sample, n_pairs: int = 12):
+        inputs = self.build_inputs(sample)
+        n = min(int(n_pairs), int(inputs["action"].shape[0]))
+        current_wm_latents, _, current_wm_image, target_wm_image = self._extract_wm_training_targets(
+            sample["video"][:n].to(device=self.device, dtype=self.torch_dtype),
+            tiled=False,
+        )
+        pred_wm_latents = self._run_wm_head(
+            current_latents=current_wm_latents,
+            action=inputs["action"][:n],
+            action_is_pad=None if inputs["action_is_pad"] is None else inputs["action_is_pad"][:n],
+        )
+        decoded_curr = self.wm_image_decoder(current_wm_latents.detach())
+        decoded_next = self.wm_image_decoder(pred_wm_latents.detach())
+        curr = torch.cat([self._to_visual_01(current_wm_image), self._to_visual_01(decoded_curr)], dim=3)
+        next_ = torch.cat([self._to_visual_01(target_wm_image), self._to_visual_01(decoded_next)], dim=3)
+        return {"curr": curr.cpu(), "next": next_.cpu()}
 
     @torch.no_grad()
     def _predict_joint_noise(

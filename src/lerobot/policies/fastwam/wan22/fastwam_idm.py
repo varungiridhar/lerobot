@@ -219,11 +219,57 @@ class FastWAMIDM(FastWAMJoint):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        current_wm_latents, target_wm_latents, current_wm_image, target_wm_image = (
+            self._extract_wm_training_targets(
+                sample["video"].to(device=self.device, dtype=self.torch_dtype),
+                tiled=tiled,
+            )
+        )
+        pred_wm_latents = self._run_wm_head(
+            current_latents=current_wm_latents,
+            action=action,
+            action_is_pad=action_is_pad,
+        )
+        wm_latent_loss_per_sample = F.mse_loss(
+            pred_wm_latents.float(),
+            target_wm_latents.float(),
+            reduction="none",
+        ).mean(dim=(1, 2, 3))
+        if image_is_pad is not None:
+            valid_future = ~image_is_pad[:, -1]
+            valid_future_f = valid_future.to(dtype=wm_latent_loss_per_sample.dtype)
+            valid_future_sum = valid_future_f.sum().clamp(min=1.0)
+            loss_wm_latent = (wm_latent_loss_per_sample * valid_future_f).sum() / valid_future_sum
+        else:
+            valid_future = None
+            loss_wm_latent = wm_latent_loss_per_sample.mean()
+
+        decoded_curr = self.wm_image_decoder(current_wm_latents.detach())
+        loss_wm_decoder = F.mse_loss(decoded_curr.float(), current_wm_image.float())
+
+        loss_total = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+            + self.loss_lambda_wm_latent * loss_wm_latent
+            + self.loss_lambda_wm_decoder * loss_wm_decoder
+        )
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_wm_latent": self.loss_lambda_wm_latent * float(loss_wm_latent.detach().item()),
+            "loss_wm_decoder": self.loss_lambda_wm_decoder * float(loss_wm_decoder.detach().item()),
         }
+        with torch.no_grad():
+            decoded_next = self.wm_image_decoder(pred_wm_latents.detach())
+            loss_dict.update(
+                self._compute_wm_image_metrics(
+                    decoded_curr=decoded_curr,
+                    current_wm_image=current_wm_image,
+                    decoded_next=decoded_next,
+                    target_wm_image=target_wm_image,
+                    valid_future=valid_future,
+                )
+            )
         return loss_total, loss_dict
 
     @torch.no_grad()
