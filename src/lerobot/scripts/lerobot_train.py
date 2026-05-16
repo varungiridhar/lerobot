@@ -84,6 +84,21 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
         wandb_logger.log_images(viz, step)
 
 
+def _log_q_visualizations(policy, dataset, step, wandb_logger, device):
+    """Log Q-function episode Q-value videos if the policy is a QFunctionPolicy.
+
+    Accesses the raw inner LeRobotDataset via dataset.dataset (unwrapped from
+    QValueLabelDataset). No-op for any other policy type.
+    """
+    from lerobot.policies.q_function.modeling_q_function import QFunctionPolicy
+    if not isinstance(policy, QFunctionPolicy):
+        return
+    # QValueLabelDataset wraps the raw LeRobotDataset; unwrap it.
+    raw_dataset = getattr(dataset, "dataset", dataset)
+    from lerobot.policies.q_function.q_vis import log_q_visualizations
+    log_q_visualizations(policy, raw_dataset, step, wandb_logger, device=device)
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -480,6 +495,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             # Log WM image reconstructions at eval frequency (no-op for non-AWM policies or state-only configs).
             _log_wm_visualizations(
                 accelerator.unwrap_model(policy), batch, step, cfg.output_dir, wandb_logger
+            )
+            # Log Q-function episode videos at eval frequency (no-op for non-QFunction policies).
+            _log_q_visualizations(
+                accelerator.unwrap_model(policy), dataset, step, wandb_logger, device
             )
 
         if cfg.save_checkpoint and is_saving_step:
