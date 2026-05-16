@@ -155,6 +155,14 @@ class QFunctionConfig(PreTrainedConfig):
     optimizer_lr_backbone: float = 3e-5   # lower LR for DINOv2 weights
     optimizer_weight_decay: float = 1e-4
 
+    # ── LR schedule (optional) ────────────────────────────────────────────
+    # Set lr_scheduler="cosine_decay_with_warmup" to enable. Other fields are
+    # ignored when lr_scheduler is None (constant LR).
+    lr_scheduler: str | None = None
+    lr_warmup_steps: int = 0        # linear warmup steps (e.g. 5% of total)
+    lr_decay_steps: int = 0         # cosine decay steps; typically == total steps
+    lr_decay_min: float = 1e-6      # final LR after full decay
+
     def __post_init__(self):
         super().__post_init__()
         if self.num_bins < 3:
@@ -239,6 +247,14 @@ class QFunctionConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self) -> LRSchedulerConfig | None:
+        if self.lr_scheduler == "cosine_decay_with_warmup":
+            from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+            return CosineDecayWithWarmupSchedulerConfig(
+                num_warmup_steps=self.lr_warmup_steps,
+                num_decay_steps=self.lr_decay_steps,
+                peak_lr=self.optimizer_lr,
+                decay_lr=self.lr_decay_min,
+            )
         return None
 
     def validate_features(self) -> None:
