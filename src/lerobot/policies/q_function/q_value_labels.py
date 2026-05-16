@@ -146,11 +146,14 @@ class QValueLabelDataset(Dataset):
         quality_scalars: dict[str, float] | None = None,
         load_preencoded: bool = True,
         precache_root: str | Path | None = None,
+        terminal_bonus_uniform: float = 1.0,
     ):
         if h <= 0:
             raise ValueError(f"h must be positive, got {h}")
-        if reward_mode not in ("sparse", "time_to_go"):
-            raise ValueError(f"reward_mode must be 'sparse' or 'time_to_go', got {reward_mode!r}")
+        if reward_mode not in ("sparse", "time_to_go", "all_success"):
+            raise ValueError(
+                f"reward_mode must be 'sparse', 'time_to_go', or 'all_success', got {reward_mode!r}"
+            )
 
         self.dataset = dataset
         self.h = int(h)
@@ -160,24 +163,27 @@ class QValueLabelDataset(Dataset):
         self._bucket_to_ordinal = {b: i for i, b in enumerate(self.bucket_order)}
         self.reward_mode = reward_mode
         self.quality_scalars = dict(quality_scalars) if quality_scalars is not None else {}
+        self.terminal_bonus_uniform = float(terminal_bonus_uniform)
+        self._all_success = reward_mode == "all_success"
 
-        repo_ids = _repo_ids_of(dataset)
-        self._dataset_index_to_bucket: list[str] = [parse_bucket_from_repo_id(r) for r in repo_ids]
+        if not self._all_success:
+            repo_ids = _repo_ids_of(dataset)
+            self._dataset_index_to_bucket: list[str] = [parse_bucket_from_repo_id(r) for r in repo_ids]
 
-        missing_bonuses = set(self._dataset_index_to_bucket) - set(self.terminal_bonuses.keys())
-        if missing_bonuses:
-            raise ValueError(
-                f"terminal_bonuses missing entries for buckets present in the data: "
-                f"{sorted(missing_bonuses)}"
-            )
-        if self.reward_mode == "time_to_go":
-            needed = {b for b in self._dataset_index_to_bucket if b != "play"}
-            missing_scalars = needed - set(self.quality_scalars.keys())
-            if missing_scalars:
+            missing_bonuses = set(self._dataset_index_to_bucket) - set(self.terminal_bonuses.keys())
+            if missing_bonuses:
                 raise ValueError(
-                    "reward_mode='time_to_go' requires quality_scalars for all non-play "
-                    f"buckets; missing: {sorted(missing_scalars)}"
+                    f"terminal_bonuses missing entries for buckets present in the data: "
+                    f"{sorted(missing_bonuses)}"
                 )
+            if self.reward_mode == "time_to_go":
+                needed = {b for b in self._dataset_index_to_bucket if b != "play"}
+                missing_scalars = needed - set(self.quality_scalars.keys())
+                if missing_scalars:
+                    raise ValueError(
+                        "reward_mode='time_to_go' requires quality_scalars for all non-play "
+                        f"buckets; missing: {sorted(missing_scalars)}"
+                    )
 
         # Episode boundaries over the combined (possibly multi-) dataset.
         self._ep_from, self._ep_to = _build_global_episode_index(dataset)
@@ -301,38 +307,42 @@ class QValueLabelDataset(Dataset):
         ep_end = int(self._ep_to[ep_pos].item())
         ep_length = ep_end - ep_start
         frame_in_ep = idx - ep_start
-
-        ds_idx = int(self._dataset_idx_by_frame[idx].item())
-        bucket = self._dataset_index_to_bucket[ds_idx]
-        terminal_bonus = float(self.terminal_bonuses[bucket])
         terminal_idx_in_ep = ep_length - 1
-
-        use_time_to_go = (self.reward_mode == "time_to_go") and (bucket != "play")
-        scalar = self.quality_scalars.get(bucket, 1.0) if use_time_to_go else 0.0
 
         reward_chunk = torch.zeros(self.h, dtype=torch.float32)
         reward_pad = torch.zeros(self.h, dtype=torch.bool)
-        for i in range(self.h):
-            f = frame_in_ep + i
-            if f < ep_length:
-                if use_time_to_go:
-                    r = scalar * -(ep_length - f)
+
+        if self._all_success:
+            for i in range(self.h):
+                f = frame_in_ep + i
+                if f < ep_length:
+                    reward_chunk[i] = self.terminal_bonus_uniform if f == terminal_idx_in_ep else 0.0
                 else:
-                    r = self.step_reward
-                if f == terminal_idx_in_ep:
-                    r += terminal_bonus
-                reward_chunk[i] = r
-            else:
-                reward_pad[i] = True
+                    reward_pad[i] = True
+            bucket_index = 0
+        else:
+            ds_idx = int(self._dataset_idx_by_frame[idx].item())
+            bucket = self._dataset_index_to_bucket[ds_idx]
+            terminal_bonus = float(self.terminal_bonuses[bucket])
+            use_time_to_go = (self.reward_mode == "time_to_go") and (bucket != "play")
+            scalar = self.quality_scalars.get(bucket, 1.0) if use_time_to_go else 0.0
+            for i in range(self.h):
+                f = frame_in_ep + i
+                if f < ep_length:
+                    r = scalar * -(ep_length - f) if use_time_to_go else self.step_reward
+                    if f == terminal_idx_in_ep:
+                        r += terminal_bonus
+                    reward_chunk[i] = r
+                else:
+                    reward_pad[i] = True
+            bucket_index = self._bucket_to_ordinal.get(bucket, -1)
 
         bootstrap_valid = (frame_in_ep + self.h) < (ep_length - 1)
 
         item["q_reward_chunk_first"] = reward_chunk
         item["q_reward_pad_first"] = reward_pad
         item["q_bootstrap_valid"] = torch.tensor(bool(bootstrap_valid))
-        item["q_bucket_index"] = torch.tensor(
-            self._bucket_to_ordinal.get(bucket, -1), dtype=torch.long
-        )
+        item["q_bucket_index"] = torch.tensor(bucket_index, dtype=torch.long)
 
         # ── Pre-encoded features at delta indices [0, h] ───────────────────
         # We mirror the underlying dataset's observation_delta_indices=[0, h]
@@ -342,6 +352,7 @@ class QValueLabelDataset(Dataset):
         # contribution out at the loss level, so the cached feature value
         # there is don't-care.
         if self._preencoded_mmaps is not None:
+            ds_idx = int(self._dataset_idx_by_frame[idx].item())
             sub_offset = self._cum_offsets[ds_idx]
             local_idx_t = idx - sub_offset
             ep_end_global = ep_end - 1                         # last valid in-ep frame
@@ -422,6 +433,8 @@ class QValueLabelDataset(Dataset):
     # ── Diagnostics ────────────────────────────────────────────────────────
 
     def bucket_counts(self) -> dict[str, int]:
+        if self._all_success:
+            return {"success": len(self)}
         counts: dict[str, int] = {b: 0 for b in self.bucket_order}
         for ds_idx, bucket in enumerate(self._dataset_index_to_bucket):
             n = int((self._dataset_idx_by_frame == ds_idx).sum().item())

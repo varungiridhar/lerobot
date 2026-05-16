@@ -45,6 +45,7 @@ _Q_KEYS = (
     "q_reward_pad_first",
     "q_bootstrap_valid",
     "q_bucket_index",
+    "task",   # language instruction string; must survive batch↔transition without normalisation
 )
 
 

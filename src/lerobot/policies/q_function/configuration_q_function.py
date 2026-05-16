@@ -2,17 +2,14 @@
 
 A categorical h-step TD critic for offline BC data, inspired by Q-chunking
 (https://arxiv.org/abs/2507.07969). Scores an action chunk a_{t:t+h} at state s_t
-using camera views encoded by DINOv2-small (finetuned end-to-end).
+using camera views encoded by DINOv2-large (finetuned end-to-end).
 
 Output head is an HL-Gauss categorical critic (num_bins logits over [v_min, v_max]).
 Loss is h-step TD with Polyak target network: see modeling_q_function.py.
 
-This is the LeRobot port of the original ``imitation/policies/q_function/`` config,
-adapted for the v1 MimicGen sim dataset:
-  * 2 camera views (agentview + robot0_eye_in_hand) instead of the real-robot's 3
-  * 84x84 images (DINOv2-patch-aligned at p=14 → 6x6 = 36 tokens / view)
-  * 7-dim actions, no tail to drop (real-world had a 3-dim mobile base trailer)
-  * 3 buckets in our v1 dataset: q5, q3_termjitter, play
+Defaults target the LIBERO multi-task dataset (HuggingFaceVLA/libero,
+yilin-wu/libero-100): all-success demonstrations, sparse +1.0 terminal bonus,
+language-conditioned via a frozen T5 text encoder.
 """
 
 import logging
@@ -26,10 +23,9 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 logger = logging.getLogger(__name__)
 
 
-# Default 2-camera set for the MimicGen LeRobot dataset format.
-# These match what scripts/convert_mimicgen_to_lerobot.py emits:
+# Default 2-camera set. Matches both LIBERO (HuggingFaceVLA/libero) and MimicGen:
 #   agentview        → observation.images.image
-#   robot0_eye_in_hand → observation.images.image2
+#   eye_in_hand      → observation.images.image2
 _DEFAULT_CAMERA_KEYS = (
     "observation.images.image",
     "observation.images.image2",
@@ -39,21 +35,19 @@ _DEFAULT_CAMERA_KEYS = (
 @PreTrainedConfig.register_subclass("q_function")
 @dataclass
 class QFunctionConfig(PreTrainedConfig):
-    """Q-function for h-step TD on offline BC data (sim, MimicGen v1 dataset)."""
+    """Q-function for h-step TD on offline BC data (LIBERO multi-task datasets)."""
 
     # ── Problem shapes ─────────────────────────────────────────────────────
     n_obs_steps: int = 1
     h: int = 20                       # action chunk length / TD horizon
     gamma: float = 0.99               # TD discount
-    drop_action_tail: int = 0         # sim has 7-d EEF action, no mobile base trailer
+    drop_action_tail: int = 0
     camera_keys: tuple[str, ...] = _DEFAULT_CAMERA_KEYS
 
     # ── Image preprocessing (handled inside the model, on-device) ──────────
-    # MG v1 frames are 84x84. DINOv2 patch_size = 14, and 84 = 14*6, so the
-    # native resolution is already patch-aligned. Each view yields 6*6 = 36
-    # patch tokens (well below the 312/view the real-robot config used).
-    image_resize_h: int = 84
-    image_resize_w: int = 84
+    # LIBERO frames are 224×224. DINOv2 patch_size=14 → 16×16=256 patch tokens/view.
+    image_resize_h: int = 224
+    image_resize_w: int = 224
 
     # Normalisation for inputs (only visual is used; state is ignored).
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -69,7 +63,7 @@ class QFunctionConfig(PreTrainedConfig):
     vision_backbone: str = "dinov2"
 
     # ── DINOv2 backbone settings (used when vision_backbone == "dinov2") ───
-    dino_model_name: str = "facebook/dinov2-small"  # 384-dim, patch 14, ~22M params
+    dino_model_name: str = "facebook/dinov2-large"  # 1024-dim, patch 14, ~307M params
     freeze_backbone: bool = False  # finetune end-to-end
 
     # ── Cached-feature settings (used when vision_backbone == "resnet18_cached") ──
@@ -98,12 +92,19 @@ class QFunctionConfig(PreTrainedConfig):
     # bc_post → q_pre round-trip distortion at inference.
     action_stats_path: str | None = None
 
+    # ── Text conditioning ─────────────────────────────────────────────────
+    # Frozen T5 encoder produces token embeddings projected into the decoder's
+    # cross-attention context alongside DINOv2 patch tokens.
+    use_text_conditioning: bool = True
+    text_encoder_model: str = "google/t5-v1_1-base"  # frozen, 768-dim, ~250M params
+    language_key: str = "task"   # key in the batch dict holding the task string
+
     # ── Transformer decoder body ───────────────────────────────────────────
-    dim_model: int = 384
-    n_heads: int = 6
-    dim_feedforward: int = 1536
+    dim_model: int = 1024
+    n_heads: int = 16
+    dim_feedforward: int = 4096
     feedforward_activation: str = "gelu"
-    n_decoder_layers: int = 4
+    n_decoder_layers: int = 18   # 18 × ~16.8M ≈ 302M params
     dropout: float = 0.1
     pre_norm: bool = True
 
@@ -111,17 +112,25 @@ class QFunctionConfig(PreTrainedConfig):
     pool: str = "cls"                 # "cls" or "mean"
 
     # ── HL-Gauss categorical critic ────────────────────────────────────────
-    # Worst-case sparse return on a 250-step ep with the most-negative bucket bonus:
-    #   sum_t step_reward + terminal_bonus = -250 + -500 = -750.
-    # v_min=-800 leaves a small margin; bin width = 800/100 = 8.
-    v_min: float = -800.0
-    v_max: float = 0.0
+    # For LIBERO all-success: step_reward=0, terminal_bonus=+1.0.
+    # Q values lie in (0, 1.0]; bin_width ≈ 0.011, sigma ≈ 2 bins.
+    v_min: float = -0.05
+    v_max: float = 1.1
     num_bins: int = 101
-    hl_gauss_sigma: float = 6.0       # ~0.75 * bin_width
+    hl_gauss_sigma: float = 0.02
 
-    # ── Terminal-reward bonuses by quality bucket ──────────────────────────
-    # Applied at the terminal step, unscaled, in both reward modes.
-    # Keys must match the buckets emitted by experiments/mg_dataset_v1/q_dataset.py.
+    # ── Reward mode ────────────────────────────────────────────────────────
+    # "all_success" — all demos are successes; uniform terminal bonus, zero step reward.
+    #                 No bucket parsing. Use terminal_bonus_uniform.
+    # "sparse"      — per-step reward = step_reward + terminal_bonuses[bucket].
+    # "time_to_go"  — quality-scaled shaping per bucket.
+    reward_mode: str = "all_success"
+
+    # Used in all_success mode: reward given at the terminal frame of every episode.
+    terminal_bonus_uniform: float = 1.0
+    step_reward: float = 0.0
+
+    # ── Per-bucket bonuses (sparse / time_to_go modes only) ───────────────
     terminal_bonuses: dict[str, float] = field(
         default_factory=lambda: {
             "q5":            0.0,
@@ -129,23 +138,13 @@ class QFunctionConfig(PreTrainedConfig):
             "play":          -500.0,
         }
     )
-    step_reward: float = -1.0
-
-    # ── Reward shaping mode ────────────────────────────────────────────────
-    # "sparse"     — per-step reward = step_reward everywhere + terminal bonus.
-    # "time_to_go" — for quality buckets, per-step reward = quality_scalars[bucket]
-    #                * -(T - t); play bucket is always sparsely labelled.
-    # We default to sparse for v1 (the user's pick); time_to_go retained as an option.
-    reward_mode: str = "sparse"
     quality_scalars: dict[str, float] = field(
         default_factory=lambda: {
             "q5":            1.0,
             "q3_termjitter": 2.0,
-            "play":          5.0,  # unused when play is forced to sparse
+            "play":          5.0,
         }
     )
-    # Conservative upper bound on episode length, used for v_min auto-sizing
-    # in time_to_go mode. v1 caps episodes at 200 (q5/q3_term mean ~150-220, play ~200).
     max_ep_length_hint: int = 250
 
     # ── Target network (Polyak) ────────────────────────────────────────────
@@ -168,17 +167,19 @@ class QFunctionConfig(PreTrainedConfig):
             raise ValueError(
                 f"vision_backbone must be 'dinov2' or 'resnet18_cached', got {self.vision_backbone!r}"
             )
-        if self.reward_mode not in ("sparse", "time_to_go"):
+        if self.reward_mode not in ("sparse", "time_to_go", "all_success"):
             raise ValueError(
-                f"reward_mode must be 'sparse' or 'time_to_go', got {self.reward_mode!r}"
+                f"reward_mode must be 'sparse', 'time_to_go', or 'all_success', got {self.reward_mode!r}"
             )
         if self.max_ep_length_hint <= 0:
             raise ValueError(f"max_ep_length_hint must be > 0, got {self.max_ep_length_hint}")
-        missing_scalars = set(self.terminal_bonuses) - set(self.quality_scalars)
-        if missing_scalars:
-            raise ValueError(
-                f"quality_scalars missing entries for buckets: {sorted(missing_scalars)}"
-            )
+
+        if self.reward_mode != "all_success":
+            missing_scalars = set(self.terminal_bonuses) - set(self.quality_scalars)
+            if missing_scalars:
+                raise ValueError(
+                    f"quality_scalars missing entries for buckets: {sorted(missing_scalars)}"
+                )
 
         # Auto-size v_min for time_to_go mode when the user-supplied value is too tight.
         if self.reward_mode == "time_to_go":

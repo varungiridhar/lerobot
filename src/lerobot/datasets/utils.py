@@ -124,6 +124,16 @@ def load_nested_dataset(
         # When no filtering needed, Dataset uses memory-mapped loading for efficiency
         # PyArrow loads the entire dataset into memory
         if episodes is None:
+            if features is None:
+                # Read via pyarrow and strip HF schema metadata before constructing Dataset.
+                # datasets 3.6+ dropped "List" as a feature type; older HF datasets use it,
+                # causing Features.from_arrow_schema to raise. Stripping the "huggingface"
+                # key from the arrow schema metadata bypasses that parsing entirely.
+                table = pa_ds.dataset([str(p) for p in paths], format="parquet").to_table()
+                clean_meta = {k: v for k, v in (table.schema.metadata or {}).items()
+                              if k != b"huggingface"}
+                table = table.replace_schema_metadata(clean_meta)
+                return Dataset(table)
             return Dataset.from_parquet([str(path) for path in paths], features=features)
 
         arrow_dataset = pa_ds.dataset(paths, format="parquet")

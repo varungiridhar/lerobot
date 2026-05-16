@@ -3,25 +3,25 @@
 Overview
 ========
 
-A **Q(s_t, a_{t:t+h})** critic that maps (multi-view image state, h-step action chunk)
-to a scalar value via a categorical HL-Gauss head. Trained with the h-step TD loss
-from the Q-chunking paper (Eq. 4):
+A **Q(s_t, a_{t:t+h}, l)** critic that maps (multi-view image state, h-step action
+chunk, language instruction) to a scalar value via a categorical HL-Gauss head.
+Trained with the h-step TD loss from the Q-chunking paper (Eq. 4):
 
-    L(θ) = E_D [ ( Q_θ(s_t, a_{t:t+h})
+    L(θ) = E_D [ ( Q_θ(s_t, a_{t:t+h}, l)
                    - Σ_{t'=1..h} γ^{t'-1} r_{t+t'-1}
-                   - γ^h · Q_{θ̄}(s_{t+h}, a_{t+h:t+2h}) )² ]
+                   - γ^h · Q_{θ̄}(s_{t+h}, a_{t+h:t+2h}, l) )² ]
 
 with the following twists:
 
 * Targets are embedded into a two-hot (HL-Gauss) histogram over ``num_bins`` bins
   in [v_min, v_max]. Loss is cross-entropy of predicted logits against the target.
 * Target network θ̄ is a Polyak-averaged copy of θ.
-* Reward labeling happens at dataload time (see ``experiments/mg_dataset_v1/q_dataset.py``);
+* Reward labeling happens at dataload time (QValueLabelDataset);
   this module just reads ``q_reward_chunk_first`` / ``q_bootstrap_valid`` from the batch.
 
-The backbone is **DINOv2-small, finetuned end-to-end**. Patch tokens from the V
-views are concatenated along the sequence dim with a learned view embedding, and
-cross-attended to by the h-step action-chunk queries.
+The vision backbone is **DINOv2-large, finetuned end-to-end**. Patch tokens from the
+V views are concatenated with projected T5 text tokens as cross-attention context for
+the h-step action-chunk queries.
 
 Note (LeRobot port): unlike the original ``imitation/policies/q_function/`` source,
 this module does NOT do internal normalization. LeRobot routes normalization through
@@ -85,6 +85,65 @@ class _DINOv2FinetunableBackbone(nn.Module):
         """(B*V, 3, H, W) → (B*V, N_patches, D_hidden) — CLS token stripped."""
         outs = self.model(pixel_values=pixel_values)
         return outs.last_hidden_state[:, 1:, :]
+
+
+# ── T5 text encoder (frozen) ──────────────────────────────────────────────────
+
+class T5TextEncoder(nn.Module):
+    """Frozen T5 encoder that maps task strings to token embeddings.
+
+    Uses a lazy per-string cache: with ~130 unique LIBERO tasks the cache
+    fills quickly and all subsequent lookups are free.
+
+    Input  : list[str] of length B (one task description per batch element)
+    Output : (B, seq_len, hidden_size) float tensor on the requested device
+    """
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        try:
+            from transformers import T5EncoderModel, T5Tokenizer  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "transformers is required for T5TextEncoder; install 'transformers'."
+            ) from e
+        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+        self.model = T5EncoderModel.from_pretrained(model_name)
+        self.hidden_size: int = int(self.model.config.d_model)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        # Cache: text string → (seq_len, hidden_size) CPU tensor
+        self._cache: dict[str, Tensor] = {}
+
+    @torch.no_grad()
+    def encode(self, texts: list[str], device: torch.device | str) -> Tensor:
+        """Encode a batch of strings, using the cache where possible.
+
+        Returns (B, seq_len, hidden_size) on ``device``.
+        """
+        unique = list(dict.fromkeys(texts))   # preserve order, deduplicate
+        missing = [t for t in unique if t not in self._cache]
+        if missing:
+            enc = self.tokenizer(
+                missing, return_tensors="pt", padding=True, truncation=True, max_length=128
+            )
+            input_ids = enc["input_ids"].to(next(self.model.parameters()).device)
+            attention_mask = enc["attention_mask"].to(input_ids.device)
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            embeddings = out.last_hidden_state.cpu()   # (N_missing, seq_len, D)
+            for i, text in enumerate(missing):
+                self._cache[text] = embeddings[i]
+
+        # Gather batch in original order; pad to common seq_len
+        seqs = [self._cache[t] for t in texts]
+        max_len = max(s.shape[0] for s in seqs)
+        padded = torch.zeros(len(texts), max_len, self.hidden_size)
+        for i, s in enumerate(seqs):
+            padded[i, : s.shape[0]] = s
+        return padded.to(device=device)
+
+    def forward(self, texts: list[str], device: torch.device | str) -> Tensor:
+        return self.encode(texts, device)
 
 
 # ── HL-Gauss two-hot target + decode ─────────────────────────────────────────
@@ -281,14 +340,19 @@ def _make_image_encoder(config: QFunctionConfig) -> nn.Module:
 # ── Inner Q-network ──────────────────────────────────────────────────────────
 
 class QFunction(nn.Module):
-    """Q_θ(s_t, a_{t:t+h}) as a categorical histogram over ``num_bins`` bins."""
+    """Q_θ(s_t, a_{t:t+h}, l) as a categorical histogram over ``num_bins`` bins."""
 
-    def __init__(self, config: QFunctionConfig, action_dim_effective: int):
+    def __init__(self, config: QFunctionConfig, action_dim_effective: int, t5_hidden_size: int = 0):
         super().__init__()
         self.config = config
         self.action_dim_effective = action_dim_effective
 
         self.image_encoder = _make_image_encoder(config)
+
+        # Optional text projection: T5 hidden_size → dim_model
+        self.use_text = config.use_text_conditioning and t5_hidden_size > 0
+        if self.use_text:
+            self.text_proj = nn.Linear(t5_hidden_size, config.dim_model)
 
         self.action_proj = nn.Linear(action_dim_effective, config.dim_model)
         self.query_pos_embed = nn.Parameter(torch.zeros(config.h, config.dim_model))
@@ -312,12 +376,24 @@ class QFunction(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, images: Tensor, action_chunk: Tensor) -> Tensor:
+    def forward(self, images: Tensor, action_chunk: Tensor, text_tokens: Tensor | None = None) -> Tensor:
+        """
+        images       : (B, V, 3, H, W)
+        action_chunk : (B, h, action_dim)
+        text_tokens  : (B, T_text, t5_hidden_size) or None
+        Returns      : (B, num_bins) logits
+        """
         B, h, _ = action_chunk.shape
         if h != self.config.h:
             raise ValueError(f"Expected action chunk length {self.config.h}, got {h}.")
 
-        context = self.image_encoder(images)                       # (S, B, D)
+        context = self.image_encoder(images)                       # (S_img, B, D)
+
+        if self.use_text and text_tokens is not None:
+            # project and prepend to context: (T_text, B, D)
+            text_ctx = self.text_proj(text_tokens)                 # (B, T_text, D)
+            text_ctx = text_ctx.transpose(0, 1).contiguous()      # (T_text, B, D)
+            context = torch.cat([text_ctx, context], dim=0)        # (T_text + S_img, B, D)
 
         queries = self.action_proj(action_chunk)                   # (B, h, D)
         queries = queries.transpose(0, 1).contiguous()             # (h, B, D)
@@ -366,7 +442,14 @@ class QFunctionPolicy(PreTrainedPolicy):
                 f"leaves non-positive effective dim."
             )
 
-        self.q_online = QFunction(config, self.action_dim_effective)
+        # Frozen text encoder (lives on same device as the policy).
+        self.text_encoder: T5TextEncoder | None = None
+        t5_hidden_size = 0
+        if config.use_text_conditioning:
+            self.text_encoder = T5TextEncoder(config.text_encoder_model)
+            t5_hidden_size = self.text_encoder.hidden_size
+
+        self.q_online = QFunction(config, self.action_dim_effective, t5_hidden_size=t5_hidden_size)
         self.q_target = copy.deepcopy(self.q_online)
         for p in self.q_target.parameters():
             p.requires_grad = False
@@ -378,18 +461,26 @@ class QFunctionPolicy(PreTrainedPolicy):
 
         num_params = sum(p.numel() for p in self.parameters())
         num_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        num_text = (
+            sum(p.numel() for p in self.text_encoder.parameters())
+            if self.text_encoder is not None else 0
+        )
         logger.info(
-            f"Q-function: {num_params:,} total, {num_trainable:,} trainable "
+            f"Q-function: {num_params:,} total, {num_trainable:,} trainable, "
+            f"{num_text:,} frozen text encoder "
             f"(target network duplicated, non-trainable)"
         )
 
-    # ── Param groups: lower LR for live backbone (DINOv2 path only) ───────
+    # ── Param groups: lower LR for DINOv2 backbone; text encoder excluded (frozen) ───
     def get_optim_params(self) -> list[dict]:
         backbone_prefix = "q_online.image_encoder.backbone."
+        text_prefix = "text_encoder."
         head_params, backbone_params = [], []
         for n, p in self.named_parameters():
             if not p.requires_grad:
                 continue
+            if n.startswith(text_prefix):
+                continue   # frozen, never trained
             if n.startswith(backbone_prefix):
                 backbone_params.append(p)
             else:
@@ -416,6 +507,23 @@ class QFunctionPolicy(PreTrainedPolicy):
     def _truncate_action(self, actions: Tensor) -> Tensor:
         d = self.config.drop_action_tail
         return actions if d == 0 else actions[..., : -d]
+
+    def _encode_language(self, batch: dict[str, Any]) -> Tensor | None:
+        """Return (B, T_text, D_t5) text tokens, or None if conditioning is off."""
+        if self.text_encoder is None:
+            return None
+        key = self.config.language_key
+        if key not in batch:
+            logger.warning("language_key=%r not found in batch; skipping text conditioning.", key)
+            return None
+        raw = batch[key]
+        # batch[key] may be a list of strings or a single string
+        if isinstance(raw, str):
+            texts = [raw]
+        else:
+            texts = list(raw)
+        device = next(self.q_online.parameters()).device
+        return self.text_encoder.encode(texts, device=device)
 
     def _stack_camera_views(self, batch: dict[str, Tensor], delta_idx: int) -> Tensor:
         use_cached = self.config.vision_backbone == "resnet18_cached"
@@ -454,10 +562,12 @@ class QFunctionPolicy(PreTrainedPolicy):
         imgs_t = self._stack_camera_views(batch, delta_idx=0)
         imgs_tph = self._stack_camera_views(batch, delta_idx=1)
 
-        logits_online = self.q_online(imgs_t, a_first)
+        text_tokens = self._encode_language(batch)
+
+        logits_online = self.q_online(imgs_t, a_first, text_tokens=text_tokens)
 
         with torch.no_grad():
-            target_logits = self.q_target(imgs_tph, a_second)
+            target_logits = self.q_target(imgs_tph, a_second, text_tokens=text_tokens)
             q_next = _expected_value(target_logits, self.bin_centers)
 
         reward_chunk = batch[REWARD_CHUNK_FIRST].to(dtype=q_next.dtype)  # (B, h)
@@ -511,7 +621,7 @@ class QFunctionPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return the scalar Q(s_t, a_{t:t+h}) prediction. Shape (B,)."""
+        """Return the scalar Q(s_t, a_{t:t+h}, l) prediction. Shape (B,)."""
         self.eval()
         actions = batch[ACTION]
         if actions.dim() == 3 and actions.shape[1] >= self.config.h:
@@ -521,7 +631,8 @@ class QFunctionPolicy(PreTrainedPolicy):
         else:
             raise RuntimeError(f"predict_value: bad action shape {tuple(actions.shape)}")
         imgs_t = self._stack_camera_views(batch, delta_idx=0)
-        logits = self.q_online(imgs_t, a_first)
+        text_tokens = self._encode_language(batch)
+        logits = self.q_online(imgs_t, a_first, text_tokens=text_tokens)
         return _expected_value(logits, self.bin_centers)
 
     # ── Inference interfaces required by PreTrainedPolicy ────────────────
