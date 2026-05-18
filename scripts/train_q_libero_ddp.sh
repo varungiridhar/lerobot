@@ -7,8 +7,8 @@
 #SBATCH -t 8:00:00
 #SBATCH --gres=gpu:h200:4
 #SBATCH -p gpu-h200
-#SBATCH -o /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/logs/%j.out
-#SBATCH -e /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/logs/%j.err
+#SBATCH -o logs/%j.out
+#SBATCH -e logs/%j.err
 
 # Activate conda environment
 source /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/miniconda3/etc/profile.d/conda.sh
