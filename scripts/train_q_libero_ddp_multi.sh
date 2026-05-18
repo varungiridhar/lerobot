@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -A gts-agarg35
+#SBATCH -A gts-agarg35-ideasci23_dgx
 #SBATCH -N1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem-per-gpu=64G
-#SBATCH -q embers
+#SBATCH -q inferno
 #SBATCH -t 8:00:00
-#SBATCH --gres=gpu:h200:4
-#SBATCH -p gpu-h200
+#SBATCH --gres=gpu:h100:4
+#SBATCH -p gpu-h100
 #SBATCH -o logs/%j.out
 #SBATCH -e logs/%j.err
 
@@ -43,12 +43,19 @@
 #     export HF_HOME=/storage/project/.../.cache/huggingface
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV:-lerobot}"
+conda activate "${CONDA_ENV:-lerobot-q}"
 
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+# Under sbatch, SLURM stages the script to /var/spool/slurmd/jobN/slurm_script,
+# so ${BASH_SOURCE[0]} points THERE rather than the original file path — a plain
+# `dirname "${BASH_SOURCE[0]}"/..` would cd to /var/spool/slurmd and any relative
+# output paths (outputs/, logs/) would land in that dir and vanish at job end.
+# $SLURM_SUBMIT_DIR is set by SLURM to the directory from which sbatch was invoked
+# (the repo root if you submitted from there). The BASH_SOURCE fallback covers
+# the case where the script is run interactively via `bash scripts/...`.
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}" || exit 1
 
 accelerate launch \
     --num_processes=4 \
@@ -78,20 +85,21 @@ accelerate launch \
     --policy.h=32 \
     --policy.gamma=0.99 \
     --policy.target_tau=0.005 \
-    --policy.optimizer_lr=1.4e-4 \
-    --policy.optimizer_lr_backbone=4.2e-5 \
+    --policy.optimizer_lr=3e-4 \
+    --policy.optimizer_lr_backbone=9e-5 \
     --policy.optimizer_weight_decay=1e-4 \
     --policy.lr_scheduler=cosine_decay_with_warmup \
-    --policy.lr_warmup_steps=5000 \
-    --policy.lr_decay_steps=100000 \
+    --policy.lr_warmup_steps=500 \
+    --policy.lr_decay_steps=20000 \
     --policy.lr_decay_min=1e-6 \
     --dataset.repo_ids='[HuggingFaceVLA/libero,VarunGiridhar3/libero40_libero_object_play,VarunGiridhar3/libero40_libero_10_play,VarunGiridhar3/libero40_libero_goal_play,VarunGiridhar3/libero40_libero_spatial_play]' \
-    --batch_size=16 \
-    --steps=100000 \
+    --dataset.root="$HOME/scratch/hf_cache/lerobot" \
+    --batch_size=100 \
+    --steps=20000 \
     --log_freq=50 \
-    --save_freq=1000 \
+    --save_freq=500 \
     --eval_freq=1000 \
-    --num_workers=6 \
+    --num_workers=8 \
     --cudnn_deterministic=false \
     --wandb.enable=true \
     --wandb.project=awm

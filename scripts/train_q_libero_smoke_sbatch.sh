@@ -15,4 +15,10 @@
 #
 # Submit from the repo root (so SBATCH's relative log path resolves to
 # <repo>/logs/) and ensure ./logs/ exists:  mkdir -p logs
-exec bash "$(dirname "${BASH_SOURCE[0]}")/train_q_libero_smoke.sh"
+#
+# Under sbatch, SLURM stages this script to /var/spool/slurmd/jobN/slurm_script
+# (without the sibling train_q_libero_smoke.sh). Resolve the inner script's path
+# via $SLURM_SUBMIT_DIR — the dir from which sbatch was invoked — with a
+# BASH_SOURCE fallback for the case where this wrapper is run interactively.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+exec bash "${REPO_ROOT}/scripts/train_q_libero_smoke.sh"
