@@ -14,8 +14,8 @@
 #      HF_LEROBOT_HOME (defaults to $HF_HOME/lerobot)
 #   3. MultiLeRobotDataset's fps + feature-key strict-equality check passes
 #      (or fails with a clear message naming the divergent repo)
-#   4. QValueLabelDataset resolves HuggingFaceVLA/libero → q5 via the override
-#      and the four *_play repos → play via the regex
+#   4. QValueLabelDataset assigns every sub-dataset to its bucket via the
+#      explicit --policy.bucket_overrides map; missing entries would raise here
 #   5. A few training steps run end-to-end with reward_mode=sparse
 #
 # Override the conda env via the CONDA_ENV env var if you keep a different one,
@@ -64,7 +64,7 @@ accelerate launch \
     --policy.reward_mode=sparse \
     --policy.step_reward=0.0 \
     --policy.terminal_bonuses='{q5: 1.0, play: 0.0}' \
-    --policy.bucket_overrides='{HuggingFaceVLA/libero: q5}' \
+    --policy.bucket_overrides='{HuggingFaceVLA/libero: q5, VarunGiridhar3/libero40_libero_object_play: play, VarunGiridhar3/libero40_libero_10_play: play, VarunGiridhar3/libero40_libero_goal_play: play, VarunGiridhar3/libero40_libero_spatial_play: play}' \
     --policy.v_min=-0.01 \
     --policy.v_max=1.01 \
     --policy.hl_gauss_sigma=0.0075 \

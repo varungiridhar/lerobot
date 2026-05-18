@@ -18,16 +18,17 @@ Reward modes
   ``t`` of an episode of length ``T`` receives ``quality_scalars[bucket] * -(T - t)``;
   terminal bonus is added unscaled. Play always falls back to sparse.
 
-Bucket inference
-----------------
-Bucket is parsed from the source dataset's ``repo_id`` at wrapper-construction
-time. The MimicGen v1 convention used by this repo is:
+Bucket assignment
+-----------------
+Bucket is assigned **explicitly** via the ``bucket_overrides`` dict passed at
+wrapper-construction time (sourced from ``policy.bucket_overrides`` in the
+config). Every sub-dataset's ``repo_id`` must appear as a key in
+``bucket_overrides``; the wrapper maps ``dataset_index`` to its bucket via
+this dict, so each frame's reward synthesis uses the right terminal bonus
+and quality scalar. Missing entries raise at construction time.
 
-    mg_<task>_<bucket>     # e.g. mg_coffee_q5, mg_coffee_q3_termjitter, mg_coffee_play
-
-The wrapper maps ``dataset_index`` (provided by ``MultiLeRobotDataset.__getitem__``)
-to a bucket via this parse, so each frame's reward synthesis uses the right
-terminal bonus and quality scalar.
+No implicit bucket inference from repo_id — pass everything explicitly so
+the assignment is auditable from the launch script alone.
 
 Multi-dataset episode boundaries
 --------------------------------
@@ -39,7 +40,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -51,41 +51,26 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, MultiLeRobotDataset
 
 log = logging.getLogger(__name__)
 
-# v1 sim-data buckets, in the canonical order used for ``q_bucket_index``.
+# Canonical bucket-name ordering for the ``q_bucket_index`` field logged with
+# each batch. New bucket labels can be added at the tail.
 DEFAULT_BUCKET_ORDER: tuple[str, ...] = ("q5", "q3_termjitter", "play")
 
-# Repo_id pattern: "mg_<task>_<bucket>" where bucket ∈ DEFAULT_BUCKET_ORDER.
-# Match the LONGEST suffix that's a known bucket so e.g. "mg_coffee_q3_termjitter"
-# resolves to bucket="q3_termjitter" and not "q3" (we don't even have a q3 bucket
-# but someone might add one later).
-_BUCKETS_BY_LENGTH = sorted(DEFAULT_BUCKET_ORDER, key=len, reverse=True)
-_REPO_ID_BUCKET_RE = re.compile(
-    r"_(" + "|".join(re.escape(b) for b in _BUCKETS_BY_LENGTH) + r")$"
-)
 
+def resolve_bucket(repo_id: str, bucket_overrides: dict[str, str]) -> str:
+    """Look up the bucket label for ``repo_id`` in ``bucket_overrides``.
 
-def parse_bucket_from_repo_id(repo_id: str) -> str:
-    """Return the bucket label implied by the trailing portion of ``repo_id``.
-
-    Accepts e.g. ``mg_coffee_q5`` → ``q5``, ``mg_coffee_q3_termjitter`` →
-    ``q3_termjitter``, ``mg_coffee_play`` → ``play``.
+    Explicit-only: every repo_id must have an entry. There is no implicit
+    inference from the repo_id suffix anymore — pass everything explicitly
+    via ``policy.bucket_overrides`` so the assignment is auditable from the
+    launch script.
     """
-    stripped = repo_id.rstrip("/").split("/")[-1]
-    m = _REPO_ID_BUCKET_RE.search(stripped)
-    if m:
-        return m.group(1)
-    raise ValueError(
-        f"Cannot infer bucket from repo_id {repo_id!r}. "
-        f"Expected suffix to be one of {DEFAULT_BUCKET_ORDER}, "
-        f"or pass an explicit mapping via policy.bucket_overrides."
-    )
-
-
-def resolve_bucket(repo_id: str, bucket_overrides: dict[str, str] | None) -> str:
-    """Override map wins; otherwise fall back to the repo_id suffix regex."""
-    if bucket_overrides and repo_id in bucket_overrides:
-        return bucket_overrides[repo_id]
-    return parse_bucket_from_repo_id(repo_id)
+    if repo_id not in bucket_overrides:
+        raise ValueError(
+            f"Repo {repo_id!r} has no bucket assignment. Add it to "
+            f"policy.bucket_overrides. Currently set: "
+            f"{sorted(bucket_overrides.keys())}."
+        )
+    return bucket_overrides[repo_id]
 
 
 def _episode_bounds(sub_dataset) -> tuple[torch.Tensor, torch.Tensor]:

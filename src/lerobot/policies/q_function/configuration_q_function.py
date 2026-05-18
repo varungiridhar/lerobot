@@ -145,11 +145,12 @@ class QFunctionConfig(PreTrainedConfig):
             "play":          5.0,
         }
     )
-    # Explicit ``repo_id → bucket`` overrides for sparse/time_to_go modes.
-    # Consulted before the repo_id suffix regex (q_value_labels.parse_bucket_from_repo_id),
-    # which only matches the MimicGen ``_<bucket>$`` convention. Use this for repos you
-    # can't rename (third-party datasets like ``HuggingFaceVLA/libero``). Each value must
-    # also appear as a key in ``terminal_bonuses`` (and ``quality_scalars`` for time_to_go).
+    # Explicit ``repo_id → bucket`` map for sparse/time_to_go modes.
+    # Every repo_id in ``dataset.repo_ids`` (or the single ``dataset.repo_id``)
+    # MUST appear as a key here — there is no implicit inference. Missing
+    # entries raise at QValueLabelDataset construction time. Each value must
+    # also appear as a key in ``terminal_bonuses`` (and ``quality_scalars``
+    # for time_to_go).
     bucket_overrides: dict[str, str] = field(default_factory=dict)
     max_ep_length_hint: int = 250
 

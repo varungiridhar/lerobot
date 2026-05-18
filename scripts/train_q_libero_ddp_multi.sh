@@ -26,10 +26,11 @@
 #     terminal bonuses apply.
 #   * --policy.terminal_bonuses gives BC (q5) +1.0 at the terminal
 #     frame, play 0.0 (no success signal for play episodes).
-#   * --policy.bucket_overrides maps the third-party HuggingFaceVLA/libero
-#     -> q5 explicitly, since it doesn't match the
-#     _q5|_q3_termjitter|_play$ regex used otherwise. Play repos are
-#     named *_play and resolve via the regex automatically.
+#   * --policy.bucket_overrides explicitly assigns a bucket to EVERY
+#     repo in --dataset.repo_ids (no implicit inference). Missing
+#     entries raise at QValueLabelDataset construction time. Bucket
+#     names must appear as keys in --policy.terminal_bonuses (and
+#     --policy.quality_scalars for time_to_go).
 #   * --dataset.video_backend=pyav — the play splits store frames as
 #     MP4 videos, decoded at load time. pyav works in the stock
 #     `lerobot` env. For faster decoding switch to torchcodec, which
@@ -67,7 +68,7 @@ accelerate launch \
     --policy.reward_mode=sparse \
     --policy.step_reward=0.0 \
     --policy.terminal_bonuses='{q5: 1.0, play: 0.0}' \
-    --policy.bucket_overrides='{HuggingFaceVLA/libero: q5}' \
+    --policy.bucket_overrides='{HuggingFaceVLA/libero: q5, VarunGiridhar3/libero40_libero_object_play: play, VarunGiridhar3/libero40_libero_10_play: play, VarunGiridhar3/libero40_libero_goal_play: play, VarunGiridhar3/libero40_libero_spatial_play: play}' \
     --policy.v_min=-0.01 \
     --policy.v_max=1.01 \
     --policy.hl_gauss_sigma=0.0075 \
@@ -85,12 +86,11 @@ accelerate launch \
     --policy.lr_decay_steps=100000 \
     --policy.lr_decay_min=1e-6 \
     --dataset.repo_ids='[HuggingFaceVLA/libero,VarunGiridhar3/libero40_libero_object_play,VarunGiridhar3/libero40_libero_10_play,VarunGiridhar3/libero40_libero_goal_play,VarunGiridhar3/libero40_libero_spatial_play]' \
-    --dataset.video_backend=pyav \
     --batch_size=16 \
     --steps=100000 \
     --log_freq=50 \
-    --save_freq=10000 \
-    --eval_freq=0 \
+    --save_freq=1000 \
+    --eval_freq=1000 \
     --num_workers=6 \
     --cudnn_deterministic=false \
     --wandb.enable=true \
