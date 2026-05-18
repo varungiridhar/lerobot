@@ -583,12 +583,17 @@ def eval_main(cfg: EvalPipelineConfig):
         getattr(policy.config, "use_planning", False)
         and hasattr(policy, "attach_planner")
     ):
-        from lerobot.policies.act_simple.planning import Planner
+        from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
+
+        if isinstance(policy, FastWAMPolicy):
+            from lerobot.policies.fastwam.planning import FastWAMPlanner as PlannerCls
+        else:
+            from lerobot.policies.act_simple.planning import Planner as PlannerCls  # type: ignore[assignment]
 
         logging.info(
             f"Q-planning enabled: loading Q-function from {policy.config.planning.q_checkpoint_path}"
         )
-        planner = Planner.from_checkpoints(
+        planner = PlannerCls.from_checkpoints(
             cfg=policy.config.planning,
             bc_post=postprocessor,
             bc_chunk_size=int(policy.config.chunk_size),

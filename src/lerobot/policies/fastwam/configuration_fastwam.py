@@ -20,6 +20,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.act_simple.planning import PlanningConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
@@ -129,6 +130,10 @@ class FastWAMConfig(PreTrainedConfig):
     freeze_vae: bool = True
     freeze_text_encoder: bool = True
     freeze_video_dit: bool = False
+
+    # ---- Online Q-planning (eval only) ----
+    use_planning: bool = False
+    planning: PlanningConfig = field(default_factory=PlanningConfig)
 
     # ---- Optimizer ----
     optimizer_lr: float = 1e-4

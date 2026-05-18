@@ -152,6 +152,10 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._queue: deque[Tensor] = deque()
+        self._planner = None  # set by attach_planner() at eval time
+
+    def attach_planner(self, planner) -> None:
+        self._planner = planner
 
     def get_optim_params(self) -> dict[str, Any]:
         return {n: p for n, p in self.named_parameters() if p.requires_grad}
@@ -182,8 +186,10 @@ class FastWAMPolicy(PreTrainedPolicy):
         ``n_action_steps`` actions from the current observation.
         """
         if not self._queue:
-            chunk = self.predict_action_chunk(batch)  # (B, chunk_size, action_dim)
-            # Queue steps as (B, action_dim) tensors, matching ACT convention.
+            if self._planner is not None:
+                chunk = self._planner.plan(self, batch)  # (1, h, A) on device
+            else:
+                chunk = self.predict_action_chunk(batch)  # (B, chunk_size, action_dim) on CPU
             self._queue.extend(chunk[:, : self.config.n_action_steps].transpose(0, 1))
         return self._queue.popleft()  # (B, action_dim)
 
