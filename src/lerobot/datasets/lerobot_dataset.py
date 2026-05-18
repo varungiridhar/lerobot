@@ -1059,9 +1059,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
             try:
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+                values = self.hf_dataset[relative_indices][key]
             except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+                col = self.hf_dataset[key]
+                values = [col[i] for i in relative_indices]
+            # Skip keys where any row has a None value (e.g., optional features absent in
+            # some datasets like play splits that lack success labels).
+            if any(v is None for v in values):
+                continue
+            result[key] = torch.stack(values)
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
