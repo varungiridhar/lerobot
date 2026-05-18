@@ -26,10 +26,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _NUM_EPISODES = 10
-_NUM_PERTURB = 20
+_NUM_PERTURB = 8
 _PERTURB_STD = 0.3
 _VIS_FPS = 10
-_CHUNK_T = 1   # timesteps per inference chunk; keep low — DINOv2-large leaves little headroom
+_CHUNK_T = 8   # timesteps batched per forward pass (batch = _CHUNK_T * (1 + _NUM_PERTURB))
+_STRIDE = 4    # evaluate Q every Nth frame; values between strides are linearly interpolated
 
 
 def _normalize_actions(actions: Tensor, stats: dict) -> Tensor:
@@ -86,9 +87,14 @@ def compute_episode_q_values(
     ep_idx: int,
     num_perturb: int = _NUM_PERTURB,
     perturb_std: float = _PERTURB_STD,
+    stride: int = _STRIDE,
     device: torch.device | None = None,
 ) -> dict:
-    """Compute Q(s_t, a_true) and Q(s_t, a_perturbed) for every timestep in episode ep_idx.
+    """Compute Q(s_t, a_true) and Q(s_t, a_perturbed) for an episode.
+
+    Frames are collected at every timestep (smooth video). Q-values are computed
+    only at every `stride` timesteps and linearly interpolated in between, reducing
+    forward passes by stride× while keeping visual continuity.
 
     Returns dict with:
       frames:    (T, H, W, 3) uint8 numpy — camera frames for video
@@ -105,72 +111,68 @@ def compute_episode_q_values(
     T = to_idx - from_idx
     h = policy.config.h
     action_stats = raw_dataset.meta.stats["action"]
-    cam_key_vis = policy.config.camera_keys[0]  # first camera for video frames
+    cam_key_vis = policy.config.camera_keys[0]
 
-    q_true = np.zeros(T, dtype=np.float32)
-    q_perturb_arr = np.zeros((T, num_perturb), dtype=np.float32)
     frames_list: list[np.ndarray] = []
-
-    # Collect all raw items first so we can chunk inference
+    # Only collect imgs/actions at strided timesteps for inference
+    strided_ts: list[int] = []
     raw_imgs: dict[str, list[Tensor]] = {ck: [] for ck in policy.config.camera_keys}
     raw_actions: list[Tensor] = []
     task_str = ""
+
+    dummy_img = torch.zeros(3, policy.config.image_resize_h, policy.config.image_resize_w)
+    dummy_frame = np.zeros((policy.config.image_resize_h, policy.config.image_resize_w, 3), dtype=np.uint8)
 
     for t in range(T):
         try:
             item = raw_dataset[from_idx + t]
         except Exception:
-            # Pad with zeros if index is out of bounds
-            dummy_img = torch.zeros(3, policy.config.image_resize_h, policy.config.image_resize_w)
-            for ck in policy.config.camera_keys:
-                raw_imgs[ck].append(dummy_img)
-            raw_actions.append(torch.zeros(h, policy.full_action_dim))
-            frames_list.append(np.zeros((policy.config.image_resize_h, policy.config.image_resize_w, 3), dtype=np.uint8))
+            frames_list.append(dummy_frame)
+            if t % stride == 0:
+                strided_ts.append(t)
+                for ck in policy.config.camera_keys:
+                    raw_imgs[ck].append(dummy_img)
+                raw_actions.append(torch.zeros(h, policy.full_action_dim))
             continue
 
-        # Frame for video: first camera, first delta, convert to uint8
         img_vis = item[cam_key_vis]
         if img_vis.dim() == 4:
             img_vis = img_vis[0]
-        frame_np = (img_vis.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
-        frames_list.append(frame_np)
+        frames_list.append((img_vis.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8))
 
-        for ck in policy.config.camera_keys:
-            ci = item[ck]
-            if ci.dim() == 4:
-                ci = ci[0]  # (3, H, W)
-            raw_imgs[ck].append(ci)
-
-        action = item["action"]  # (2h, D)
-        if action.dim() == 2:
-            action = action[:h]  # (h, D) — use current chunk only
-        raw_actions.append(action)
+        if t % stride == 0:
+            strided_ts.append(t)
+            for ck in policy.config.camera_keys:
+                ci = item[ck]
+                if ci.dim() == 4:
+                    ci = ci[0]
+                raw_imgs[ck].append(ci)
+            action = item["action"]
+            if action.dim() == 2:
+                action = action[:h]
+            raw_actions.append(action)
 
         if not task_str:
             ts = item.get("task", "")
             task_str = ts[0] if isinstance(ts, list) else str(ts)
 
-    # Process in chunks to control peak VRAM
-    for chunk_start in range(0, T, _CHUNK_T):
-        chunk_end = min(chunk_start + _CHUNK_T, T)
-        ct = chunk_end - chunk_start  # actual chunk size
+    S = len(strided_ts)
+    q_true_s = np.zeros(S, dtype=np.float32)
+    q_perturb_s = np.zeros((S, num_perturb), dtype=np.float32)
 
-        # Build (ct * (1+N), ...) batch
-        # a_true_stack: (ct, h, D)
-        a_true_stack = torch.stack(raw_actions[chunk_start:chunk_end], dim=0)
+    # Chunked inference over strided timesteps: batch = _CHUNK_T * (1 + num_perturb)
+    for chunk_start in range(0, S, _CHUNK_T):
+        chunk_end = min(chunk_start + _CHUNK_T, S)
+        ct = chunk_end - chunk_start
+
+        a_true_stack = torch.stack(raw_actions[chunk_start:chunk_end], dim=0)  # (ct, h, D)
         D = a_true_stack.shape[-1]
 
-        # Perturbed: (ct, N, h, D)
         noise_p = torch.randn(ct, num_perturb, h, D) * perturb_std
         a_perturb = (a_true_stack.unsqueeze(1) + noise_p).clamp(-3, 3)
-
-        # Layout: first slot = true action, remaining N = perturbed
-        a_all = torch.cat([a_true_stack.unsqueeze(1), a_perturb], dim=1)  # (ct, 1+N, h, D)
-        a_all = a_all.reshape(ct * (1 + num_perturb), h, D)
-
+        a_all = torch.cat([a_true_stack.unsqueeze(1), a_perturb], dim=1).reshape(ct * (1 + num_perturb), h, D)
         a_norm = _normalize_actions(a_all, action_stats).to(device)
 
-        # Images: repeat each timestep's image (1+N) times
         imgs_chunk: dict[str, Tensor] = {}
         for ck in policy.config.camera_keys:
             img_stack = torch.stack(raw_imgs[ck][chunk_start:chunk_end], dim=0)  # (ct, 3, H, W)
@@ -184,10 +186,16 @@ def compute_episode_q_values(
         with torch.no_grad():
             q_vals = _compute_chunk_q_values(policy, imgs_chunk, a_norm, task_str).cpu()
 
-        # q_vals shape: (ct * (1+N),) — reshape to (ct, 1+N)
         q_vals_2d = q_vals.reshape(ct, 1 + num_perturb).numpy()
-        q_true[chunk_start:chunk_end] = q_vals_2d[:, 0]
-        q_perturb_arr[chunk_start:chunk_end] = q_vals_2d[:, 1:]
+        q_true_s[chunk_start:chunk_end] = q_vals_2d[:, 0]
+        q_perturb_s[chunk_start:chunk_end] = q_vals_2d[:, 1:]
+
+    # Interpolate Q-values from strided positions back to all T timesteps
+    all_ts = np.arange(T)
+    q_true = np.interp(all_ts, strided_ts, q_true_s).astype(np.float32)
+    q_perturb_arr = np.stack(
+        [np.interp(all_ts, strided_ts, q_perturb_s[:, n]) for n in range(num_perturb)], axis=1
+    ).astype(np.float32)
 
     return {
         "frames": np.array(frames_list),
