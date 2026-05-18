@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A gts-agarg35
 #SBATCH -N1
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-gpu=6
 #SBATCH --mem-per-gpu=64G
 #SBATCH -q embers
 #SBATCH -t 8:00:00
