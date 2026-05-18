@@ -26,7 +26,7 @@ accelerate launch \
     --mixed_precision=bf16 \
     --multi_gpu \
     $(which lerobot-train) \
-    --job_name=qf_libero_ddp4_bsz8 \
+    --job_name=qf_libero_ddp4_bsz16 \
     --policy.type=q_function \
     --policy.push_to_hub=false \
     --policy.dino_model_name=facebook/dinov2-large \
@@ -48,8 +48,8 @@ accelerate launch \
     --policy.h=32 \
     --policy.gamma=0.99 \
     --policy.target_tau=0.005 \
-    --policy.optimizer_lr=1e-4 \
-    --policy.optimizer_lr_backbone=3e-5 \
+    --policy.optimizer_lr=1.4e-4 \
+    --policy.optimizer_lr_backbone=4.2e-5 \
     --policy.optimizer_weight_decay=1e-4 \
     --policy.lr_scheduler=cosine_decay_with_warmup \
     --policy.lr_warmup_steps=5000 \
@@ -57,7 +57,7 @@ accelerate launch \
     --policy.lr_decay_min=1e-6 \
     --dataset.repo_id=HuggingFaceVLA/libero \
     --dataset.root="${DATA_ROOT}/HuggingFaceVLA/libero" \
-    --batch_size=8 \
+    --batch_size=16 \
     --steps=100000 \
     --log_freq=50 \
     --save_freq=10000 \
