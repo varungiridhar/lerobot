@@ -15,8 +15,8 @@ conda activate lerobot
 
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
-# Arrow cache: redirect away from the 20GB-capped home dir
-export HF_DATASETS_CACHE=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/.cache/huggingface/datasets
+# Redirect ALL HuggingFace caches (hub/models, datasets, tokenizers) away from the 20GB-capped home dir
+export HF_HOME=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/.cache/huggingface
 # Override accelerate default config (which has num_processes=4, MULTI_GPU) for single-GPU jobs
 export ACCELERATE_NUM_PROCESSES=1
 

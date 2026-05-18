@@ -15,7 +15,8 @@ conda activate lerobot
 
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
-export HF_DATASETS_CACHE=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/.cache/huggingface/datasets
+# Redirect ALL HuggingFace caches (hub/models, datasets, tokenizers) away from the 20GB-capped home dir
+export HF_HOME=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/.cache/huggingface
 
 cd /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/lerobot
 
