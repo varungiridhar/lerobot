@@ -16,7 +16,7 @@
 import logging
 from pprint import pformat
 
-import torch
+import numpy as np
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -145,16 +145,16 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             for sub in dataset._datasets:
                 for key in sub.meta.camera_keys:
                     for stats_type, stats in IMAGENET_STATS.items():
-                        sub.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                        sub.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
             # Re-aggregate after mutation so dataset.stats reflects the override.
-            from lerobot.datasets.utils import aggregate_stats
+            from lerobot.datasets.compute_stats import aggregate_stats
             dataset.stats = aggregate_stats([sub.meta.stats for sub in dataset._datasets])
         return _maybe_wrap_for_policy(dataset, cfg)
 
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
 
     return _maybe_wrap_for_policy(dataset, cfg)
 

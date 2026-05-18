@@ -81,6 +81,48 @@ CODEBASE_VERSION = "v3.0"
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1"}
 
 
+def _promote_image_keys_with_video_data(info: dict, root: Path) -> list[str]:
+    """In-place: re-classify ``dtype="image"`` features as ``"video"`` when the
+    dataset is actually video-backed but mislabelled.
+
+    A feature is promoted iff ALL three conditions hold:
+      1. ``dtype == "image"`` in info.json
+      2. The feature carries a ``info: {"video.codec": ..., ...}`` sub-dict
+         (the canonical v3 video metadata bundle, written by the LeRobot video
+         encoder regardless of the top-level dtype field)
+      3. ``<root>/videos/<key>/`` exists and contains at least one ``.mp4``
+         (i.e. the actual frames really are on disk as videos)
+
+    True inline-image datasets fail (2) and (3); true video datasets are already
+    ``dtype="video"`` so they fail (1). So this is a no-op for both
+    well-formed cases — it only fires for the malformed-but-recoverable case
+    we hit with the LIBERO play splits.
+
+    Returns the list of promoted feature keys (for logging).
+    """
+    if "features" not in info:
+        return []
+    promoted: list[str] = []
+    for key, ft in info["features"].items():
+        if ft.get("dtype") != "image":
+            continue
+        ft_info = ft.get("info") or {}
+        if "video.codec" not in ft_info:
+            continue
+        video_dir = root / "videos" / key
+        if not video_dir.is_dir():
+            continue
+        try:
+            has_mp4 = any(video_dir.rglob("*.mp4"))
+        except OSError:
+            has_mp4 = False
+        if not has_mp4:
+            continue
+        ft["dtype"] = "video"
+        promoted.append(key)
+    return promoted
+
+
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -161,6 +203,15 @@ class LeRobotDatasetMetadata:
     def load_metadata(self):
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
+        promoted = _promote_image_keys_with_video_data(self.info, self.root)
+        if promoted:
+            logging.warning(
+                "Dataset %r declares dtype='image' for %s but ships actual frames as "
+                "MP4 videos under videos/<key>/. Auto-promoting these features to "
+                "dtype='video' for this session. To make this permanent, edit info.json "
+                "on the Hub repo.",
+                self.repo_id, promoted,
+            )
         self.tasks = load_tasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
@@ -1654,25 +1705,28 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             for repo_id in repo_ids
         ]
 
-        # Disable any data keys that are not common across all of the datasets. Note: we may relax this
-        # restriction in future iterations of this class. For now, this is necessary at least for being able
-        # to use PyTorch's default DataLoader collate function.
+        # All sub-datasets must agree on fps and on the full set of feature keys. The
+        # downstream consumers (collate, normalisation stats, Q reward labelling) all
+        # assume schema-uniform sub-datasets, so silent intersect-and-drop hides bugs.
+        ref_fps = self._datasets[0].meta.info["fps"]
+        ref_features = set(self._datasets[0].features)
+        for repo_id, ds in zip(self.repo_ids[1:], self._datasets[1:], strict=True):
+            sub_fps = ds.meta.info["fps"]
+            if sub_fps != ref_fps:
+                raise ValueError(
+                    f"MultiLeRobotDataset: fps mismatch between {self.repo_ids[0]!r} "
+                    f"(fps={ref_fps}) and {repo_id!r} (fps={sub_fps})."
+                )
+            sub_features = set(ds.features)
+            if sub_features != ref_features:
+                extra = sub_features - ref_features
+                missing = ref_features - sub_features
+                raise ValueError(
+                    f"MultiLeRobotDataset: feature-key mismatch between {self.repo_ids[0]!r} "
+                    f"and {repo_id!r}. Extra in {repo_id}: {sorted(extra)}; "
+                    f"missing in {repo_id}: {sorted(missing)}."
+                )
         self.disabled_features = set()
-        intersection_features = set(self._datasets[0].features)
-        for ds in self._datasets:
-            intersection_features.intersection_update(ds.features)
-        if len(intersection_features) == 0:
-            raise RuntimeError(
-                "Multiple datasets were provided but they had no keys common to all of them. "
-                "The multi-dataset functionality currently only keeps common keys."
-            )
-        for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True):
-            extra_keys = set(ds.features).difference(intersection_features)
-            logging.warning(
-                f"keys {extra_keys} of {repo_id} were disabled as they are not contained in all the "
-                "other datasets."
-            )
-            self.disabled_features.update(extra_keys)
 
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
@@ -1693,7 +1747,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     def fps(self) -> int:
         """Frames per second used during data collection.
 
-        NOTE: Fow now, this relies on a check in __init__ to make sure all sub-datasets have the same info.
+        Safe to read from the first sub-dataset: __init__ raises if sub-datasets disagree on info.
         """
         return self._datasets[0].meta.info["fps"]
 
@@ -1703,7 +1757,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
 
         Returns False if it only loads images from png files.
 
-        NOTE: Fow now, this relies on a check in __init__ to make sure all sub-datasets have the same info.
+        Safe to read from the first sub-dataset: __init__ raises if sub-datasets disagree on info.
         """
         return self._datasets[0].meta.info.get("video", False)
 
