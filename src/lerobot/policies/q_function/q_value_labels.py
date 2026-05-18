@@ -76,8 +76,16 @@ def parse_bucket_from_repo_id(repo_id: str) -> str:
         return m.group(1)
     raise ValueError(
         f"Cannot infer bucket from repo_id {repo_id!r}. "
-        f"Expected suffix to be one of {DEFAULT_BUCKET_ORDER}."
+        f"Expected suffix to be one of {DEFAULT_BUCKET_ORDER}, "
+        f"or pass an explicit mapping via policy.bucket_overrides."
     )
+
+
+def resolve_bucket(repo_id: str, bucket_overrides: dict[str, str] | None) -> str:
+    """Override map wins; otherwise fall back to the repo_id suffix regex."""
+    if bucket_overrides and repo_id in bucket_overrides:
+        return bucket_overrides[repo_id]
+    return parse_bucket_from_repo_id(repo_id)
 
 
 def _episode_bounds(sub_dataset) -> tuple[torch.Tensor, torch.Tensor]:
@@ -147,6 +155,7 @@ class QValueLabelDataset(Dataset):
         load_preencoded: bool = True,
         precache_root: str | Path | None = None,
         terminal_bonus_uniform: float = 1.0,
+        bucket_overrides: dict[str, str] | None = None,
     ):
         if h <= 0:
             raise ValueError(f"h must be positive, got {h}")
@@ -166,9 +175,13 @@ class QValueLabelDataset(Dataset):
         self.terminal_bonus_uniform = float(terminal_bonus_uniform)
         self._all_success = reward_mode == "all_success"
 
+        self.bucket_overrides = dict(bucket_overrides) if bucket_overrides else {}
+
         if not self._all_success:
             repo_ids = _repo_ids_of(dataset)
-            self._dataset_index_to_bucket: list[str] = [parse_bucket_from_repo_id(r) for r in repo_ids]
+            self._dataset_index_to_bucket: list[str] = [
+                resolve_bucket(r, self.bucket_overrides) for r in repo_ids
+            ]
 
             missing_bonuses = set(self._dataset_index_to_bucket) - set(self.terminal_bonuses.keys())
             if missing_bonuses:

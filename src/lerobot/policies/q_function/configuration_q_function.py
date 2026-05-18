@@ -145,6 +145,12 @@ class QFunctionConfig(PreTrainedConfig):
             "play":          5.0,
         }
     )
+    # Explicit ``repo_id → bucket`` overrides for sparse/time_to_go modes.
+    # Consulted before the repo_id suffix regex (q_value_labels.parse_bucket_from_repo_id),
+    # which only matches the MimicGen ``_<bucket>$`` convention. Use this for repos you
+    # can't rename (third-party datasets like ``HuggingFaceVLA/libero``). Each value must
+    # also appear as a key in ``terminal_bonuses`` (and ``quality_scalars`` for time_to_go).
+    bucket_overrides: dict[str, str] = field(default_factory=dict)
     max_ep_length_hint: int = 250
 
     # ── Target network (Polyak) ────────────────────────────────────────────
@@ -187,6 +193,12 @@ class QFunctionConfig(PreTrainedConfig):
             if missing_scalars:
                 raise ValueError(
                     f"quality_scalars missing entries for buckets: {sorted(missing_scalars)}"
+                )
+            unknown_override_buckets = set(self.bucket_overrides.values()) - set(self.terminal_bonuses)
+            if unknown_override_buckets:
+                raise ValueError(
+                    f"bucket_overrides reference buckets not in terminal_bonuses: "
+                    f"{sorted(unknown_override_buckets)}"
                 )
 
         # Auto-size v_min for time_to_go mode when the user-supplied value is too tight.
