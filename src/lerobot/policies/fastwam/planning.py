@@ -125,8 +125,10 @@ def plan_chunk_fastwam(
     _, h, A = bc_mean.shape
     N = cfg.n_samples
 
-    # Raw camera images — Q's DINOv2 encoder handles normalization internally.
+    # Raw camera images + task text — Q uses DINOv2 + T5 text conditioning.
     img_feats = {cam_key: batch[cam_key] for cam_key in ctx.q_camera_keys}
+    if "task" in batch:
+        img_feats["task"] = batch["task"]
 
     noise = _sample_noise(
         (N, h, A), cfg.noise_std, cfg.clip_to, device, bc_mean.dtype,
