@@ -12,13 +12,14 @@
 
 # ---- Configurable args (override via --export on sbatch) ----
 FASTWAM_CKPT=${FASTWAM_CKPT:-/storage/project/r-agarg35-0/shared/awm/fastwam_checkpoint}
-Q_CKPT=${Q_CKPT:-/storage/scratch1/6/vgiridhar6/lerobot/outputs/train/2026-05-19/01-30-19_qf_libero_ddp2_bsz48_bc_plus_play_h200/checkpoints/last/pretrained_model}
+Q_CKPT=${Q_CKPT:-/storage/scratch1/6/vgiridhar6/lerobot/outputs/train/2026-05-19/23-54-42_qf_libero_ddp2_bsz48_bc_h200/checkpoints/last/pretrained_model}
 LIBERO_TASK=${LIBERO_TASK:-libero_10}
 N_EPISODES=${N_EPISODES:-20}
 NOISE_STD=${NOISE_STD:-0.3}
 N_SAMPLES=${N_SAMPLES:-64}
 PLANNER=${PLANNER:-mppi}
 TEMPERATURE=${TEMPERATURE:-1.0}
+N_ITERS=${N_ITERS:-1}
 NUM_INFER_STEPS=${NUM_INFER_STEPS:-10}
 SEED=${SEED:-42}
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
@@ -37,7 +38,7 @@ echo "  FASTWAM_CKPT:  $FASTWAM_CKPT"
 echo "  Q_CKPT:        $Q_CKPT"
 echo "  LIBERO_TASK:   $LIBERO_TASK"
 echo "  N_EPISODES:    $N_EPISODES"
-echo "  PLANNER:       $PLANNER  noise_std=$NOISE_STD  n_samples=$N_SAMPLES  temperature=$TEMPERATURE"
+echo "  PLANNER:       $PLANNER  noise_std=$NOISE_STD  n_samples=$N_SAMPLES  n_iters=$N_ITERS  temperature=$TEMPERATURE"
 echo "  OUTPUT_DIR:    $OUTPUT_DIR"
 echo "================================="
 
@@ -57,6 +58,7 @@ echo N | lerobot-eval \
     --policy.planning.q_checkpoint_path="$Q_CKPT" \
     --policy.planning.planner_type="$PLANNER" \
     --policy.planning.n_samples="$N_SAMPLES" \
+    --policy.planning.n_iters="$N_ITERS" \
     --policy.planning.noise_std="$NOISE_STD" \
     --policy.planning.temperature="$TEMPERATURE" \
     --output_dir="$OUTPUT_DIR" \

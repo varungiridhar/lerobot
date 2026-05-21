@@ -185,20 +185,30 @@ def plan_chunk_fastwam(
     if "task" in batch:
         img_feats["task"] = batch["task"]
 
+    def _spread(q: Tensor) -> tuple[float, float, float, float]:
+        return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
+
+    if cfg.planner_type == "mppi":
+        # Iterative MPPI: re-center on weighted mean each iteration for convergence.
+        # n_iters=1 reproduces standard single-pass MPPI.
+        mean = bc_mean.clone()
+        q_values = None
+        for _ in range(max(1, cfg.n_iters)):
+            noise = _sample_noise(
+                (N, h, A), cfg.noise_std, cfg.clip_to, device, mean.dtype,
+                generator, smooth_sigma_t=cfg.noise_smooth_sigma_t,
+            )
+            candidates = mean.expand(N, h, A) + noise
+            q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=mean.dtype)
+            weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
+            mean = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
+        return mean, _spread(q_values), q_values
+
     noise = _sample_noise(
         (N, h, A), cfg.noise_std, cfg.clip_to, device, bc_mean.dtype,
         generator, smooth_sigma_t=cfg.noise_smooth_sigma_t,
     )
     candidates = bc_mean.expand(N, h, A) + noise
-
-    def _spread(q: Tensor) -> tuple[float, float, float, float]:
-        return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
-
-    if cfg.planner_type == "mppi":
-        q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
-        weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
-        planned = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
-        return planned, _spread(q_values), q_values
 
     if cfg.planner_type == "argmax":
         q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
