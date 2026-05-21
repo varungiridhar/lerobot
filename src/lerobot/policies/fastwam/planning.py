@@ -12,10 +12,13 @@ Key difference from act_simple planning:
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
+
+logger = logging.getLogger(__name__)
 
 from lerobot.policies.act_simple.planning import (
     PlannerContext,
@@ -98,6 +101,11 @@ class FastWAMPlanner:
         """Return planned chunk ``(1, h, A)`` in FastWAM-normalized space."""
         result, spread = plan_chunk_fastwam(bc_policy, batch, self.ctx, self.cfg, self.generator)
         self.last_q_spread = spread
+        if spread is not None:
+            logger.info(
+                "Q-planning chunk: planner=%s  q_min=%.4f  q_max=%.4f  q_mean=%.4f  q_std=%.4f",
+                self.cfg.planner_type, spread[0], spread[1], spread[2], spread[3],
+            )
         return result
 
 

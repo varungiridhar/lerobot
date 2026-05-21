@@ -314,6 +314,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_episode_s = []  # wall-clock seconds per episode
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -349,6 +350,7 @@ def eval_policy(
             seeds = range(
                 start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
             )
+        batch_start_t = time.time()
         rollout_data = rollout(
             env=env,
             policy=policy,
@@ -361,6 +363,7 @@ def eval_policy(
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             goal_provider=goal_provider,
         )
+        batch_ep_s = (time.time() - batch_start_t) / env.num_envs
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -378,6 +381,7 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        all_episode_s.extend([batch_ep_s] * env.num_envs)
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -442,13 +446,15 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "episode_s": episode_s,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, episode_s) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_episode_s[:n_episodes],
                     strict=True,
                 )
             )

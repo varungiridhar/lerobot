@@ -190,8 +190,8 @@ def _score_candidates(
     """Unnormalize → renormalize → Q-score N candidate chunks. Returns (N,)."""
     N, h, A = candidates_norm.shape
     flat_norm = candidates_norm.reshape(N * h, A)
-    # bc_post is a PolicyProcessorPipeline that expects a dict; wrap/unwrap ACTION.
-    flat_raw = ctx.bc_post({ACTION: flat_norm})[ACTION]
+    # bc_post is a PolicyProcessorPipeline[PolicyAction, PolicyAction]; PolicyAction = Tensor.
+    flat_raw = ctx.bc_post(flat_norm)
     candidates_raw = flat_raw.reshape(N, h, A).to(candidates_norm.device)
 
     q_batch: dict[str, object] = {ACTION: candidates_raw}

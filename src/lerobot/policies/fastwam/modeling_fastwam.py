@@ -152,7 +152,8 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._queue: deque[Tensor] = deque()
-        self._planner = None  # set by attach_planner() at eval time
+        if not hasattr(self, "_planner"):
+            self._planner = None  # first-time init; preserved across episode resets
 
     def attach_planner(self, planner) -> None:
         self._planner = planner
