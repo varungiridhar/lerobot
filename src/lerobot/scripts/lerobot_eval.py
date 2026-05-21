@@ -337,6 +337,10 @@ def eval_policy(
         episode_data: dict | None = None
 
     # we dont want progress bar when we use slurm, since it clutters the logs
+    # Planning vis: check once whether the policy has a planner that supports vis recording.
+    _planner = getattr(policy, "_planner", None)
+    _has_vis = _planner is not None and hasattr(_planner, "end_episode")
+
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
@@ -364,6 +368,10 @@ def eval_policy(
             goal_provider=goal_provider,
         )
         batch_ep_s = (time.time() - batch_start_t) / env.num_envs
+
+        # Finalise per-episode planning vis data (planner accumulated it during rollout).
+        if _has_vis:
+            _planner.end_episode()
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -427,6 +435,28 @@ def eval_policy(
                 )
                 thread.start()
                 threads.append(thread)
+
+                # Also save planning vis video (Q-value spotlight animation).
+                if _has_vis:
+                    vis_chunks = _planner.pop_completed_episode()
+                    if vis_chunks:
+                        from lerobot.policies.fastwam.planning_vis import make_planning_vis_video
+                        vis_path = videos_dir / f"eval_episode_{n_episodes_rendered}_planning_vis.mp4"
+                        video_paths.append(str(vis_path))
+                        chunk_frames = [c["frame"] for c in vis_chunks if c.get("frame") is not None]
+                        q_candidates = [c["q_candidates"] for c in vis_chunks]
+                        q_selected = [c["q_selected"] for c in vis_chunks]
+                        q_cfg = getattr(_planner.ctx.q_policy, "config", None)
+                        v_min = float(getattr(q_cfg, "v_min", 0.0))
+                        v_max = float(getattr(q_cfg, "v_max", 1.0))
+                        t_vis = threading.Thread(
+                            target=make_planning_vis_video,
+                            args=(chunk_frames, q_candidates, q_selected, vis_path),
+                            kwargs={"v_min": v_min, "v_max": v_max},
+                        )
+                        t_vis.start()
+                        threads.append(t_vis)
+
                 n_episodes_rendered += 1
 
         progbar.set_postfix(

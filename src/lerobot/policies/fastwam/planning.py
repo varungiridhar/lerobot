@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -49,6 +50,9 @@ class FastWAMPlanner:
         self.ctx = ctx
         self.generator = generator
         self.last_q_spread: tuple[float, float, float, float] | None = None
+        # Vis recording state (populated when start_episode() is called)
+        self._vis_chunks: list[dict] | None = None   # None = not recording
+        self._completed_episodes: list[list[dict]] = []
 
     @classmethod
     def from_checkpoints(
@@ -96,16 +100,53 @@ class FastWAMPlanner:
         )
         return cls(cfg=cfg, ctx=ctx, generator=gen)
 
+    def start_episode(self) -> None:
+        """Begin accumulating vis data for a new episode."""
+        self._vis_chunks = []
+
+    def end_episode(self) -> list[dict] | None:
+        """Finalise the current episode and return its chunk data (or None if not recording)."""
+        chunks = self._vis_chunks
+        if chunks is not None and chunks:
+            self._completed_episodes.append(chunks)
+        self._vis_chunks = None
+        return chunks
+
+    def pop_completed_episode(self) -> list[dict] | None:
+        """Return and remove the oldest completed episode's vis data."""
+        return self._completed_episodes.pop(0) if self._completed_episodes else None
+
     @torch.no_grad()
     def plan(self, bc_policy: "FastWAMPolicy", batch: dict[str, Tensor]) -> Tensor:
         """Return planned chunk ``(1, h, A)`` in FastWAM-normalized space."""
-        result, spread = plan_chunk_fastwam(bc_policy, batch, self.ctx, self.cfg, self.generator)
+        result, spread, q_vals_raw = plan_chunk_fastwam(
+            bc_policy, batch, self.ctx, self.cfg, self.generator
+        )
         self.last_q_spread = spread
         if spread is not None:
             logger.info(
                 "Q-planning chunk: planner=%s  q_min=%.4f  q_max=%.4f  q_mean=%.4f  q_std=%.4f",
                 self.cfg.planner_type, spread[0], spread[1], spread[2], spread[3],
             )
+
+        # Accumulate vis data when recording
+        if self._vis_chunks is not None and q_vals_raw is not None:
+            from lerobot.policies.fastwam.planning_vis import _obs_frame_to_uint8
+            from lerobot.utils.constants import OBS_IMAGES
+            cam_key = f"{OBS_IMAGES}.image"
+            frame = _obs_frame_to_uint8(batch[cam_key]) if cam_key in batch else None
+            q_np = q_vals_raw.cpu().float().numpy()
+            N = len(q_np)
+            # MPPI weighted mean of Q values ≈ Q of the selected action
+            if self.cfg.planner_type == "mppi" and spread is not None:
+                weights = torch.softmax(
+                    (q_vals_raw - q_vals_raw.max()) / self.cfg.temperature, dim=0
+                )
+                q_sel = float((weights * q_vals_raw).sum())
+            else:
+                q_sel = float(q_np.max())  # argmax / CEM: use best candidate Q
+            self._vis_chunks.append({"frame": frame, "q_candidates": q_np, "q_selected": q_sel})
+
         return result
 
 
@@ -116,11 +157,12 @@ def plan_chunk_fastwam(
     ctx: PlannerContext,
     cfg: PlanningConfig,
     generator: torch.Generator | None = None,
-) -> tuple[Tensor, tuple[float, float, float, float] | None]:
-    """Return ``(planned_chunk, q_spread)`` for one chunk in FastWAM-norm space.
+) -> tuple[Tensor, tuple[float, float, float, float] | None, Tensor | None]:
+    """Return ``(planned_chunk, q_spread, q_values)`` for one chunk in FastWAM-norm space.
 
     ``planned_chunk`` shape: ``(1, h, A)`` — ready to drop into FastWAM's action queue.
     ``q_spread``: ``(q_min, q_max, q_mean, q_std)`` across candidate scores.
+    ``q_values``: raw ``(N,)`` Q scores for all candidates (for vis / logging).
     """
     device = next(bc_policy.parameters()).device
     # Run FastWAM diffusion once → MIN_MAX-normalized actions, returned on CPU.
@@ -151,17 +193,18 @@ def plan_chunk_fastwam(
         q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
         weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
         planned = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
-        return planned, _spread(q_values)
+        return planned, _spread(q_values), q_values
 
     if cfg.planner_type == "argmax":
         q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
         best = int(torch.argmax(q_values))
-        return candidates[best : best + 1], _spread(q_values)
+        return candidates[best : best + 1], _spread(q_values), q_values
 
-    # CEM
+    # CEM — return q_values from last iteration
     mean = bc_mean.clone()
     std = torch.full_like(mean, cfg.noise_std).clamp_min(1e-3)
     spread = None
+    q_values = None
     for _ in range(cfg.n_iters):
         noise_it = _sample_noise(
             (N, h, A), 1.0, cfg.clip_to, device, bc_mean.dtype, generator,
@@ -174,4 +217,4 @@ def plan_chunk_fastwam(
         elites = cands.index_select(0, elite_idx)
         mean = elites.mean(dim=0, keepdim=True)
         std = elites.std(dim=0, keepdim=True).clamp_min(1e-3)
-    return mean, spread
+    return mean, spread, q_values
