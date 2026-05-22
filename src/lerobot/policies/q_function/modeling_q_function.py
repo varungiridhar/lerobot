@@ -383,6 +383,43 @@ class QFunction(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def encode_context(self, images: Tensor, text_tokens: Tensor | None = None) -> Tensor:
+        """Encode image (and optional text) into cross-attention context tokens.
+
+        Returns (S, B, D) context for use with forward_with_context().
+        Separating encoding from action scoring enables reuse across N planning candidates.
+        """
+        context = self.image_encoder(images)                       # (S_img, B, D)
+        if self.use_text and text_tokens is not None:
+            text_ctx = self.text_proj(text_tokens)                 # (B, T_text, D)
+            text_ctx = text_ctx.transpose(0, 1).contiguous()      # (T_text, B, D)
+            context = torch.cat([text_ctx, context], dim=0)        # (T_text + S_img, B, D)
+        return context
+
+    def forward_with_context(self, context: Tensor, action_chunk: Tensor) -> Tensor:
+        """Score action chunks using pre-encoded context — skips image encoder.
+
+        context      : (S, B, D) from encode_context(); B must match action_chunk B
+        action_chunk : (B, h, action_dim)
+        Returns      : (B, num_bins) logits
+        """
+        B, h, _ = action_chunk.shape
+        queries = self.action_proj(action_chunk)                   # (B, h, D)
+        queries = queries.transpose(0, 1).contiguous()             # (h, B, D)
+        query_pos = self.query_pos_embed.unsqueeze(1)              # (h, 1, D)
+        if self.config.pool == "cls":
+            cls = self.cls_query.unsqueeze(1).expand(-1, B, -1)
+            queries = torch.cat([cls, queries], dim=0)
+            cls_pos = torch.zeros(1, 1, self.config.dim_model,
+                                   device=queries.device, dtype=queries.dtype)
+            query_pos = torch.cat([cls_pos, query_pos], dim=0)
+        x = queries
+        for layer in self.layers:
+            x = layer(x, context, query_pos=query_pos, context_pos=None)
+        x = self.out_norm(x)
+        pooled = x[0] if self.config.pool == "cls" else x.mean(dim=0)
+        return self.head(pooled)
+
     def forward(self, images: Tensor, action_chunk: Tensor, text_tokens: Tensor | None = None) -> Tensor:
         """
         images       : (B, V, 3, H, W)
@@ -394,36 +431,8 @@ class QFunction(nn.Module):
         if h != self.config.h:
             raise ValueError(f"Expected action chunk length {self.config.h}, got {h}.")
 
-        context = self.image_encoder(images)                       # (S_img, B, D)
-
-        if self.use_text and text_tokens is not None:
-            # project and prepend to context: (T_text, B, D)
-            text_ctx = self.text_proj(text_tokens)                 # (B, T_text, D)
-            text_ctx = text_ctx.transpose(0, 1).contiguous()      # (T_text, B, D)
-            context = torch.cat([text_ctx, context], dim=0)        # (T_text + S_img, B, D)
-
-        queries = self.action_proj(action_chunk)                   # (B, h, D)
-        queries = queries.transpose(0, 1).contiguous()             # (h, B, D)
-        query_pos = self.query_pos_embed.unsqueeze(1)              # (h, 1, D)
-
-        if self.config.pool == "cls":
-            cls = self.cls_query.unsqueeze(1).expand(-1, B, -1)
-            queries = torch.cat([cls, queries], dim=0)
-            cls_pos = torch.zeros(1, 1, self.config.dim_model,
-                                   device=queries.device, dtype=queries.dtype)
-            query_pos = torch.cat([cls_pos, query_pos], dim=0)
-
-        x = queries
-        for layer in self.layers:
-            x = layer(x, context, query_pos=query_pos, context_pos=None)
-        x = self.out_norm(x)
-
-        if self.config.pool == "cls":
-            pooled = x[0]
-        else:
-            pooled = x.mean(dim=0)
-
-        return self.head(pooled)
+        context = self.encode_context(images, text_tokens)         # (S, B, D)
+        return self.forward_with_context(context, action_chunk)
 
 
 # ── Policy wrapper (LeRobot PreTrainedPolicy) ────────────────────────────────
@@ -625,6 +634,19 @@ class QFunctionPolicy(PreTrainedPolicy):
             }
 
         return loss, loss_dict
+
+    @torch.no_grad()
+    def encode_obs_context(self, preprocessed_batch: dict[str, Tensor]) -> Tensor:
+        """Encode observation to context tokens (S, 1, D) for reuse across N planning candidates.
+
+        preprocessed_batch must have already been through q_pre (NormalizerProcessorStep runs on
+        images too, so raw images give different DINOv2 inputs than q_pre-normalized images).
+        Caller should run q_pre on a single-item obs batch before calling this.
+        """
+        self.eval()
+        imgs = self._stack_camera_views(preprocessed_batch, delta_idx=0)  # (1, V, 3, H, W)
+        text_tokens = self._encode_language(preprocessed_batch)
+        return self.q_online.encode_context(imgs, text_tokens)             # (S, 1, D)
 
     @torch.no_grad()
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:

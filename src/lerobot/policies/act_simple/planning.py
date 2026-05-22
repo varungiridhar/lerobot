@@ -208,6 +208,42 @@ def _score_candidates(
     return ctx.q_policy.predict_value(q_batch)
 
 
+def _score_candidates_fast(
+    candidates_norm: Tensor,
+    precomputed_context: Tensor,
+    ctx: PlannerContext,
+    img_feats: dict | None = None,
+) -> Tensor:
+    """Like _score_candidates but reuses pre-encoded obs context — 1 DINOv2 call total.
+
+    precomputed_context : (S, 1, D) from q_policy.encode_obs_context(); expanded to (S, N, D) here.
+    img_feats           : raw images/task dict (needed so q_pre can pixel-normalize; DINOv2 is skipped).
+    """
+    from lerobot.policies.q_function.modeling_q_function import _expected_value
+    N, h, A = candidates_norm.shape
+    flat_norm = candidates_norm.reshape(N * h, A)
+    flat_raw = ctx.bc_post(flat_norm)
+    candidates_raw = flat_raw.reshape(N, h, A).to(candidates_norm.device)
+
+    # Run q_pre for action + pixel normalization (cheap); DINOv2 is skipped below.
+    q_batch: dict = {ACTION: candidates_raw}
+    if img_feats:
+        for key, feat in img_feats.items():
+            if isinstance(feat, Tensor):
+                q_batch[key] = feat.expand(N, *feat.shape[1:]).contiguous()
+            elif isinstance(feat, (list, tuple)):
+                q_batch[key] = list(feat[:1]) * N if len(feat) == 1 else list(feat) * N
+            else:
+                q_batch[key] = feat
+    q_batch = ctx.q_pre(q_batch)
+    actions = ctx.q_policy._truncate_action(q_batch[ACTION][:, : ctx.horizon, :])
+
+    # Skip DINOv2 — use pre-encoded context expanded to N candidates.
+    context_N = precomputed_context.expand(-1, N, -1).contiguous()  # (S, N, D)
+    logits = ctx.q_policy.q_online.forward_with_context(context_N, actions)
+    return _expected_value(logits, ctx.q_policy.bin_centers)
+
+
 def _gaussian_kernel_1d(sigma: float, device: torch.device, dtype: torch.dtype) -> Tensor:
     """1D Gaussian kernel, length ~ 6*sigma+1, normalized to sum to 1."""
     radius = max(1, int(round(3.0 * sigma)))

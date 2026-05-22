@@ -26,7 +26,9 @@ from lerobot.policies.act_simple.planning import (
     PlanningConfig,
     _sample_noise,
     _score_candidates,
+    _score_candidates_fast,
 )
+from lerobot.utils.constants import ACTION
 
 if TYPE_CHECKING:
     from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
@@ -189,8 +191,13 @@ def plan_chunk_fastwam(
         return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
 
     if cfg.planner_type == "mppi":
-        # Iterative MPPI: re-center on weighted mean each iteration for convergence.
-        # n_iters=1 reproduces standard single-pass MPPI.
+        # Encode obs once — reused across all N candidates and all n_iters.
+        # Run q_pre on a single-item batch first so image normalization matches
+        # the full _score_candidates path (NormalizerProcessorStep normalizes images too).
+        single_batch = {ACTION: bc_mean, **img_feats}
+        single_preprocessed = ctx.q_pre(single_batch)
+        obs_context = ctx.q_policy.encode_obs_context(single_preprocessed)  # (S, 1, D)
+
         mean = bc_mean.clone()
         q_values = None
         for _ in range(max(1, cfg.n_iters)):
@@ -199,7 +206,7 @@ def plan_chunk_fastwam(
                 generator, smooth_sigma_t=cfg.noise_smooth_sigma_t,
             )
             candidates = mean.expand(N, h, A) + noise
-            q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=mean.dtype)
+            q_values = _score_candidates_fast(candidates, obs_context, ctx, img_feats).to(device=device, dtype=mean.dtype)
             weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
             mean = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
         return mean, _spread(q_values), q_values
