@@ -526,6 +526,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    # Disable accelerate's per-iteration RNG-sync on the train loader. Its
+    # DataLoaderShard.__iter__ runs `if self.rng_types is not None:
+    # synchronize_rng_states(...)` -- a cross-rank NCCL broadcast -- every time
+    # the loader is (re-)iterated. The train loop wraps the loader in cycle(),
+    # so that broadcast fires at every epoch boundary, and it deadlocks against
+    # the other rank's gradient all-reduce whenever the two ranks cross the
+    # boundary on different steps. Setting rng_types=None makes __iter__ skip
+    # the broadcast entirely, leaving only the per-step training collectives
+    # (which are inherently in lockstep). Each rank then shuffles independently,
+    # which is correct for data-parallel training.
+    if hasattr(dataloader, "rng_types"):
+        dataloader.rng_types = None
+
     dl_iter = cycle(dataloader)
 
     policy.train()
