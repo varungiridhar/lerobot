@@ -13,6 +13,7 @@
 # limitations under the License.
 import builtins
 import datetime as dt
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,17 @@ class TrainPipelineConfig(HubMixin):
     rabc_epsilon: float = 1e-6  # Small constant for numerical stability
     rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
 
+    # Train-test split + test-metric logging (currently used by Q-function training).
+    # When test_split_ratio > 0 the dataset wrapper carves out a fixed per-bucket
+    # holdout of episodes (stratified by repo/bucket, seeded from cfg.seed), and a
+    # second DataLoader is built over those frames. At every `test_freq` step we
+    # forward `test_n_batches` batches and log loss + sub-metrics under wandb prefix
+    # `test/`. test_freq=0 disables the cadence (split itself is still constructed
+    # if test_split_ratio>0, but no metrics are emitted).
+    test_split_ratio: float = 0.0
+    test_freq: int = 0
+    test_n_batches: int = 1
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
@@ -120,10 +132,22 @@ class TrainPipelineConfig(HubMixin):
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
         if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
+            # The requested output_dir already exists. Rather than aborting the
+            # run — painful when the collision only surfaces after a long queue
+            # wait — append a timestamp to the job name and output_dir so the
+            # job proceeds into a fresh, unique directory instead of failing.
+            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            new_output_dir = self.output_dir.parent / f"{self.output_dir.name}_{timestamp}"
+            logging.warning(
+                "Output directory %s already exists and resume is False. "
+                "Appending timestamp: job_name -> %s_%s, output_dir -> %s",
+                self.output_dir,
+                self.job_name,
+                timestamp,
+                new_output_dir,
             )
+            self.job_name = f"{self.job_name}_{timestamp}"
+            self.output_dir = new_output_dir
         elif not self.output_dir:
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"

@@ -141,6 +141,8 @@ class QValueLabelDataset(Dataset):
         precache_root: str | Path | None = None,
         terminal_bonus_uniform: float = 1.0,
         bucket_overrides: dict[str, str] | None = None,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int | None = None,
     ):
         if h <= 0:
             raise ValueError(f"h must be positive, got {h}")
@@ -162,8 +164,17 @@ class QValueLabelDataset(Dataset):
 
         self.bucket_overrides = dict(bucket_overrides) if bucket_overrides else {}
 
+        self.holdout_fraction = float(holdout_fraction)
+        self.holdout_seed = holdout_seed
+        if self.holdout_fraction < 0.0 or self.holdout_fraction >= 1.0:
+            raise ValueError(
+                f"holdout_fraction must be in [0.0, 1.0), got {self.holdout_fraction!r}"
+            )
+
+        repo_ids_for_split: list[str] | None = None
         if not self._all_success:
             repo_ids = _repo_ids_of(dataset)
+            repo_ids_for_split = repo_ids
             self._dataset_index_to_bucket: list[str] = [
                 resolve_bucket(r, self.bucket_overrides) for r in repo_ids
             ]
@@ -214,6 +225,59 @@ class QValueLabelDataset(Dataset):
         self._dataset_idx_by_frame = dataset_idx_by_frame
         self._cum_offsets = cum_offsets   # length = num_sub_datasets + 1
 
+        # ── Optional episode-level train/test split ───────────────────────────
+        # Stratified per (repo_id, bucket): the same fraction of episodes is
+        # carved out from every sub-dataset, deterministically seeded so the
+        # split survives resumes and re-launches with the same cfg.seed.
+        # Train/test selection happens at the sampler layer (see
+        # ``train_frame_indices`` / ``test_frame_indices``); __getitem__ is
+        # unchanged so a single wrapper instance serves both loaders.
+        self._frame_indices_train: list[int] = []
+        self._frame_indices_test: list[int] = []
+        self._train_episode_global_ids: list[int] = []
+        self._test_episode_global_ids: list[int] = []
+        if self.holdout_fraction > 0.0:
+            if self._all_success or repo_ids_for_split is None:
+                raise ValueError(
+                    "holdout_fraction>0 requires non-all_success mode (the wrapper "
+                    "needs per-repo bucket assignments to stratify the split). "
+                    "Disable the holdout or switch reward_mode."
+                )
+            import random as _random
+            sub_iter = (
+                dataset._datasets if isinstance(dataset, MultiLeRobotDataset) else [dataset]
+            )
+            offset = 0
+            global_ep_idx = 0
+            for ds_idx, sub in enumerate(sub_iter):
+                repo_id = repo_ids_for_split[ds_idx]
+                bucket = self._dataset_index_to_bucket[ds_idx]
+                ep_from_local, ep_to_local = _episode_bounds(sub)
+                local_n = int(ep_from_local.shape[0])
+                rng = _random.Random(hash((self.holdout_seed, repo_id, bucket)) & 0xFFFFFFFF)
+                order = list(range(local_n))
+                rng.shuffle(order)
+                n_test = max(1, int(round(local_n * self.holdout_fraction)))
+                n_test = min(n_test, local_n - 1)   # keep >=1 train ep per repo
+                test_local = set(order[:n_test])
+                for local_ep_id in range(local_n):
+                    f = int(ep_from_local[local_ep_id].item())
+                    t = int(ep_to_local[local_ep_id].item())
+                    gids = list(range(offset + f, offset + t))
+                    if local_ep_id in test_local:
+                        self._test_episode_global_ids.append(global_ep_idx)
+                        self._frame_indices_test.extend(gids)
+                    else:
+                        self._train_episode_global_ids.append(global_ep_idx)
+                        self._frame_indices_train.extend(gids)
+                    global_ep_idx += 1
+                offset += int(sub.num_frames)
+                log.info(
+                    f"[q-split] repo={repo_id} bucket={bucket} "
+                    f"train_eps={local_n - n_test} test_eps={n_test} "
+                    f"(holdout={self.holdout_fraction:.0%}, seed={self.holdout_seed})"
+                )
+
         # ── Optional pre-encoded feature cache ─────────────────────────────
         # When ``precache_root`` is provided, look for
         # ``<precache_root>/<sub_repo_id>/meta.json`` per sub-dataset. All
@@ -225,6 +289,32 @@ class QValueLabelDataset(Dataset):
         self._precache_root = Path(precache_root) if precache_root is not None else None
         if load_preencoded and self._precache_root is not None:
             self._preencoded_mmaps = self._maybe_load_preencoded(dataset)
+
+    # ── Train/test split accessors ─────────────────────────────────────────
+
+    @property
+    def train_frame_indices(self) -> list[int]:
+        """Global frame indices belonging to train episodes (empty if no holdout)."""
+        return self._frame_indices_train
+
+    @property
+    def test_frame_indices(self) -> list[int]:
+        """Global frame indices belonging to held-out test episodes."""
+        return self._frame_indices_test
+
+    @property
+    def test_episode_ids(self) -> list[int]:
+        """Global episode indices held out as the test split (empty if no holdout).
+
+        Index into ``self._ep_from`` / ``self._ep_to`` to get a test episode's
+        global frame range — used by the test-set Q-value visualization.
+        """
+        return self._test_episode_global_ids
+
+    @property
+    def has_holdout(self) -> bool:
+        """True if a non-empty episode-level holdout was carved at construction."""
+        return self.holdout_fraction > 0.0 and len(self._frame_indices_test) > 0
 
     # ── Pre-encoded feature cache ──────────────────────────────────────────
 

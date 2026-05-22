@@ -84,19 +84,70 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
         wandb_logger.log_images(viz, step)
 
 
-def _log_q_visualizations(policy, dataset, step, wandb_logger, device):
-    """Log Q-function episode Q-value videos if the policy is a QFunctionPolicy.
+def _log_q_visualizations(policy, dataset, preprocessor, step, wandb_logger, device):
+    """Log Q-function visualizations on held-out test episodes.
 
-    Accesses the raw inner LeRobotDataset via dataset.dataset (unwrapped from
-    QValueLabelDataset). No-op for any other policy type.
+    For a QFunctionPolicy, walks a sample of the dataset's held-out test
+    episodes and renders side-by-side Q-value videos. No-op for non-Q policies
+    or when the dataset has no test holdout (``test_split_ratio=0``).
     """
     from lerobot.policies.q_function.modeling_q_function import QFunctionPolicy
+
     if not isinstance(policy, QFunctionPolicy):
         return
-    # QValueLabelDataset wraps the raw LeRobotDataset; unwrap it.
-    raw_dataset = getattr(dataset, "dataset", dataset)
-    from lerobot.policies.q_function.q_vis import log_q_visualizations
-    log_q_visualizations(policy, raw_dataset, step, wandb_logger, device=device)
+    from lerobot.policies.q_function.q_vis import log_q_test_visualizations
+
+    log_q_test_visualizations(
+        policy=policy,
+        dataset=dataset,
+        preprocessor=preprocessor,
+        step=step,
+        wandb_logger=wandb_logger,
+        device=device,
+    )
+
+
+@torch.no_grad()
+def _compute_test_metrics(
+    policy,
+    test_dl_iter,
+    n_batches: int,
+    preprocessor,
+    accelerator: Accelerator,
+) -> dict[str, float]:
+    """Forward ``n_batches`` held-out batches and average loss + sub-metrics.
+
+    Uses the same ``policy.forward(batch) -> (loss, dict)`` interface as the
+    train step (see ``update_policy``), so test metrics mirror train ones
+    one-for-one. Unwraps the DDP wrapper to avoid registering backward hooks
+    during the no-grad forward.
+    """
+    inner = accelerator.unwrap_model(policy)
+    was_training = inner.training
+    inner.eval()
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    try:
+        for _ in range(max(1, int(n_batches))):
+            batch = next(test_dl_iter)
+            batch = preprocessor(batch)
+            with accelerator.autocast():
+                loss, output_dict = inner.forward(batch)
+            sums["loss"] = sums.get("loss", 0.0) + float(loss.item())
+            counts["loss"] = counts.get("loss", 0) + 1
+            for k, v in (output_dict or {}).items():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    sums[k] = sums.get(k, 0.0) + float(v)
+                    counts[k] = counts.get(k, 0) + 1
+                elif torch.is_tensor(v) and v.numel() == 1:
+                    sums[k] = sums.get(k, 0.0) + float(v.item())
+                    counts[k] = counts.get(k, 0) + 1
+    finally:
+        if was_training:
+            inner.train()
+    return {k: sums[k] / counts[k] for k in sums}
 
 
 def update_policy(
@@ -372,6 +423,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    # Environment processors are only needed for env-based eval (non-Q
+    # policies). Q-function training evaluates on held-out test episodes
+    # instead, so it never touches these.
+    env_preprocessor = None
+    env_postprocessor = None
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
@@ -390,6 +447,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    has_holdout = (
+        getattr(cfg, "test_split_ratio", 0.0) > 0.0
+        and hasattr(dataset, "has_holdout")
+        and getattr(dataset, "has_holdout", False)
+    )
+    train_dataset = dataset
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -399,12 +462,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
         )
+    elif has_holdout:
+        # Hold out the test frames by training over a Subset of just the train
+        # frames with standard shuffling -- NOT a custom SubsetRandomSampler.
+        # A custom sampler bypasses accelerate's even_batches DDP guarantee, so
+        # the two ranks get unequal batch counts per epoch and reach the epoch
+        # boundary at different global steps; the rank that wraps first runs the
+        # dataloader's synchronize_rng_states broadcast, which then deadlocks
+        # against the other rank's gradient all-reduce (NCCL collective desync).
+        # A plain Subset + shuffle uses the standard, even-batches sharding path.
+        # The complementary test frames feed a separate, rank-0-only loader below.
+        train_dataset = torch.utils.data.Subset(dataset, dataset.train_frame_indices)
+        shuffle = True
+        sampler = None
     else:
         shuffle = True
         sampler = None
 
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming,
@@ -413,6 +489,37 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
+
+    # Test/holdout DataLoader (rank-0 only; not handed to accelerator.prepare).
+    # When the wrapper carved a holdout but test_freq is 0, we still skip the
+    # loader since no logging will happen.
+    test_dataloader = None
+    test_dl_iter = None
+    if (
+        has_holdout
+        and getattr(cfg, "test_freq", 0) > 0
+        and is_main_process
+        and not cfg.dataset.streaming
+    ):
+        from torch.utils.data import SubsetRandomSampler
+        test_dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=max(1, cfg.num_workers // 2),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            sampler=SubsetRandomSampler(dataset.test_frame_indices),
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+        logging.info(
+            "Test dataloader enabled: %d test frames (across %d test episodes), "
+            "test_freq=%d, test_n_batches=%d",
+            len(dataset.test_frame_indices),
+            len(getattr(dataset, "_test_episode_global_ids", [])),
+            cfg.test_freq,
+            cfg.test_n_batches,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -471,6 +578,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_test_step = (
+            getattr(cfg, "test_freq", 0) > 0
+            and test_dataloader is not None
+            and step % cfg.test_freq == 0
+            and is_main_process
+        )
 
         if is_log_step:
             logging.info(train_tracker)
@@ -491,14 +604,40 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        if is_test_step:
+            if test_dl_iter is None:
+                test_dl_iter = cycle(test_dataloader)
+            test_dict = _compute_test_metrics(
+                policy,
+                test_dl_iter,
+                cfg.test_n_batches,
+                preprocessor,
+                accelerator,
+            )
+            if wandb_logger:
+                wandb_logger.log_dict(test_dict, step, mode="test")
+            logging.info(
+                "Test metrics @ step %d: %s",
+                step,
+                ", ".join(f"{k}={v:.4f}" for k, v in sorted(test_dict.items())),
+            )
+
         if is_eval_step and is_main_process:
             # Log WM image reconstructions at eval frequency (no-op for non-AWM policies or state-only configs).
             _log_wm_visualizations(
                 accelerator.unwrap_model(policy), batch, step, cfg.output_dir, wandb_logger
             )
-            # Log Q-function episode videos at eval frequency (no-op for non-QFunction policies).
+            # Log Q-function visualizations on held-out test episodes at eval
+            # frequency (no-op for non-QFunction policies or when there is no
+            # test holdout). The in-training Q scores each test episode's
+            # recorded action chunk + random perturbations of it.
             _log_q_visualizations(
-                accelerator.unwrap_model(policy), dataset, step, wandb_logger, device
+                accelerator.unwrap_model(policy),
+                dataset,
+                preprocessor,
+                step,
+                wandb_logger,
+                device,
             )
 
         if cfg.save_checkpoint and is_saving_step:
@@ -521,7 +660,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             accelerator.wait_for_everyone()
 
-        if cfg.env and is_eval_step:
+        # Env-based eval runs for non-Q policies only. QFunctionPolicy is
+        # evaluated on held-out test episodes instead — _compute_test_metrics
+        # (scalar test loss at test_freq) and _log_q_visualizations (test-set
+        # Q-value videos at eval_freq) — so it never builds or steps an env.
+        if cfg.env and is_eval_step and cfg.policy.type != "q_function":
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")

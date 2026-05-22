@@ -181,6 +181,8 @@ def _maybe_wrap_for_policy(dataset, cfg: TrainPipelineConfig):
         precache_root=getattr(cfg.policy, "precache_root", None),
         terminal_bonus_uniform=getattr(cfg.policy, "terminal_bonus_uniform", 1.0),
         bucket_overrides=getattr(cfg.policy, "bucket_overrides", None),
+        holdout_fraction=getattr(cfg, "test_split_ratio", 0.0),
+        holdout_seed=getattr(cfg, "seed", None),
     )
     logging.info(f"Wrapped dataset with QValueLabelDataset; counts: {wrapped.bucket_counts()}")
     return wrapped
