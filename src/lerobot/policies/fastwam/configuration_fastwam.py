@@ -44,6 +44,8 @@ class FastWAMConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 32      # action_horizon passed to infer_action
     n_action_steps: int = 10  # replan_steps in original sim_libero.yaml
+    num_video_frames: int = 33           # video length used during training (T)
+    action_video_freq_ratio: int = 4     # action steps per video frame
 
     # ---- Image / cameras ----
     image_size: tuple[int, int] = (224, 224)  # per-camera (H, W)
@@ -63,6 +65,7 @@ class FastWAMConfig(PreTrainedConfig):
     wan22_pretrained_path: str = "Wan-AI/Wan2.2-TI2V-5B"
     tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B"
     load_text_encoder: bool = True
+    load_wan22_weights: bool = True      # kept for checkpoint compat; not used at runtime
     redirect_common_files: bool = True  # use DiffSynth safetensors mirrors
     action_dit_pretrained_path: str | None = None
 

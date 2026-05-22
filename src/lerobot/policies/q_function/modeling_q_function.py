@@ -275,7 +275,13 @@ class DINOv2ImageEncoder(nn.Module):
         else:
             self.backbone_proj = nn.Identity()
         self.view_embed = nn.Embedding(len(config.camera_keys), config.dim_model)
-        self._patch_pos_embed: nn.Parameter | None = None
+        # Pre-register patch positional embedding with known shape so it survives checkpoint
+        # save/load. DINOv2 patch_size=14; N_patches = (H/14)*(W/14).
+        V = len(config.camera_keys)
+        N_patches = (config.image_resize_h // 14) * (config.image_resize_w // 14)
+        pe = nn.Parameter(torch.zeros(V, N_patches, config.dim_model))
+        nn.init.normal_(pe, std=0.02)
+        self._patch_pos_embed = pe
 
     def forward(self, images: Tensor) -> Tensor:
         B, V, C, H, W = images.shape
@@ -285,12 +291,13 @@ class DINOv2ImageEncoder(nn.Module):
         tokens = self.backbone_proj(tokens)
         N_patches = tokens.shape[1]
 
-        if self._patch_pos_embed is None or self._patch_pos_embed.shape[1] != N_patches:
-            dev, dtype = tokens.device, tokens.dtype
-            pe = nn.Parameter(torch.zeros(V, N_patches, self.config.dim_model, device=dev, dtype=dtype))
+        # Fall back to dynamic re-init if image size changed (e.g. different eval resolution).
+        if self._patch_pos_embed.shape[1] != N_patches:
+            V_cfg = len(self.config.camera_keys)
+            pe = nn.Parameter(torch.zeros(V_cfg, N_patches, self.config.dim_model,
+                                          device=tokens.device, dtype=tokens.dtype))
             nn.init.normal_(pe, std=0.02)
             self._patch_pos_embed = pe
-            self.register_parameter("_patch_pos_embed_param", pe)
 
         view_ids = torch.arange(V, device=tokens.device)
         view_vec = self.view_embed(view_ids).unsqueeze(1).expand(V, N_patches, -1)

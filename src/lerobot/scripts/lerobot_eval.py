@@ -816,6 +816,11 @@ def eval_policy_all(
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+            # Print per-task result immediately after it completes.
+            n_suc = sum(1 for s in metrics.get("successes", []) if s)
+            n_ep = len(metrics.get("successes", []))
+            pct = 100 * n_suc / max(n_ep, 1)
+            print(f"[task done] {tg} task_id={tid}: {n_suc}/{n_ep} ({pct:.0f}%)", flush=True)
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:

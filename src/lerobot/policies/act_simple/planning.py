@@ -190,12 +190,19 @@ def _score_candidates(
     """Unnormalize → renormalize → Q-score N candidate chunks. Returns (N,)."""
     N, h, A = candidates_norm.shape
     flat_norm = candidates_norm.reshape(N * h, A)
-    flat_raw = ctx.bc_post(flat_norm)
+    # bc_post is a PolicyProcessorPipeline that expects a dict; wrap/unwrap ACTION.
+    flat_raw = ctx.bc_post({ACTION: flat_norm})[ACTION]
     candidates_raw = flat_raw.reshape(N, h, A).to(candidates_norm.device)
 
-    q_batch: dict[str, Tensor] = {ACTION: candidates_raw}
-    for cam_key, feat in img_feats.items():
-        q_batch[cam_key] = feat.expand(N, *feat.shape[1:]).contiguous()
+    q_batch: dict[str, object] = {ACTION: candidates_raw}
+    for key, feat in img_feats.items():
+        if isinstance(feat, Tensor):
+            q_batch[key] = feat.expand(N, *feat.shape[1:]).contiguous()
+        elif isinstance(feat, (list, tuple)):
+            # e.g. task strings: broadcast single obs to all N candidates
+            q_batch[key] = list(feat[:1]) * N if len(feat) == 1 else list(feat) * N
+        else:
+            q_batch[key] = feat
 
     q_batch = ctx.q_pre(q_batch)
     return ctx.q_policy.predict_value(q_batch)
