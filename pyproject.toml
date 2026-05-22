@@ -166,6 +166,19 @@ mimicgen = [
     "h5py>=3.10",
     "scipy>=1.10",
 ]
+# RoboTwin: SAPIEN-based bimanual sim. This extra holds only the conflict-free
+# Python deps. The SAPIEN sim stack itself (sapien, mplib, toppra, transforms3d,
+# trimesh, open3d, and the CUDA-compiled curobo/pytorch3d) is installed by
+# scripts/setup_robotwin_env.sh in a separate staged resolve — a single combined
+# `pip install` of all of it against LeRobot's full tree is not resolvable.
+# torch/torchvision/gymnasium are intentionally not pinned here so LeRobot's own
+# pins win; RoboTwin's sim libs are torch-version-agnostic or compiled on install.
+robotwin = [
+    "lerobot[transformers-dep]",
+    "numpy>=1.26.4,<2.0",  # RoboTwin's SAPIEN sim stack predates numpy 2
+    "h5py>=3.10",
+    "scipy>=1.10",
+]
 
 # All
 all = [
@@ -192,6 +205,7 @@ all = [
     "lerobot[libero]",
     "lerobot[metaworld]",
     "lerobot[mimicgen]",
+    "lerobot[robotwin]",
     "lerobot[sarm]",
     "lerobot[q_function]",
     "lerobot[peft]",
