@@ -90,7 +90,12 @@ class WandBLogger:
             save_code=False,
             # TODO(rcadene): split train and eval, and run async eval with job_type="eval"
             job_type="train_eval",
-            resume="must" if cfg.resume else None,
+            # "allow" rather than "must": a --resume job may pass a fresh
+            # wandb.run_id to start a clean wandb run (the original run already
+            # logged steps past the checkpoint, and re-logging them violates
+            # wandb's monotonic-step rule). "must" crashes on a brand-new id;
+            # "allow" resumes an existing id and otherwise starts a new run.
+            resume="allow" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
         )
         run_id = wandb.run.id

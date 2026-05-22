@@ -268,15 +268,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from datetime import timedelta
+
+        from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # Env eval (eval_policy_all) and the Q-rollout viz run on the main
+        # process only; the other ranks idle at accelerator.wait_for_everyone().
+        # That barrier is a NCCL collective whose default timeout is 10 min — a
+        # BC-driven LIBERO eval easily exceeds that and the watchdog then aborts
+        # the waiting ranks (SIGABRT). Extend the process-group timeout so the
+        # barrier survives a long eval; SLURM's wall clock remains the real bound.
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, pg_kwargs],
             cpu=force_cpu,
         )
 
@@ -350,10 +359,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
-    # Create processors - only provide dataset_stats if not resuming from saved processors
+    # Create processors - only provide dataset_stats if not resuming from saved processors.
+    # q_function's processor pipeline carries custom batch<->transition functions
+    # (_q_batch_to_transition / _q_transition_to_batch) that smuggle the q_* reward
+    # keys + the task string through complementary_data. Those function references
+    # cannot be serialized, so PolicyProcessorPipeline.from_pretrained always
+    # restores the pipeline with the *standard* transition, which drops those keys
+    # -> KeyError('q_reward_chunk_first') at the first forward. The processor has no
+    # state beyond dataset-derived stats, so for q_function we always rebuild it
+    # from cfg/dataset rather than loading the (un-restorable) saved one.
+    processor_pretrained_path = cfg.policy.pretrained_path
+    if cfg.policy.type == "q_function":
+        processor_pretrained_path = None
+
     processor_kwargs = {}
     postprocessor_kwargs = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
@@ -361,7 +382,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.type == "sarm":
         processor_kwargs["dataset_meta"] = dataset.meta
 
-    if cfg.policy.pretrained_path is not None:
+    if processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
@@ -383,7 +404,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
+        pretrained_path=processor_pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
