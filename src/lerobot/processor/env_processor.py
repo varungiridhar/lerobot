@@ -262,3 +262,46 @@ class FastWAMGripperRemapStep(ActionProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="robotwin_processor")
+class RoboTwinProcessorStep(ObservationProcessorStep):
+    """Concatenate RoboTwin's 3 cameras into FastWAM's single input frame.
+
+    The RoboTwin env emits three raw cameras (``observation.images.head_camera``,
+    ``observation.images.left_camera``, ``observation.images.right_camera``).
+    FastWAM's RoboTwin checkpoint was trained on a single concatenated
+    [3, 384, 320] frame (head on top, left+right wrists side-by-side below).
+    This step collapses the three cameras into ``observation.images.image``
+    using the shared ``build_robotwin_image`` helper, so the eval-time layout is
+    bit-identical to the layout the training dataset is re-packed into.
+
+    If the three camera keys are absent (e.g. a non-RoboTwin obs), the
+    observation is passed through unchanged.
+    """
+
+    def _process_observation(self, observation):
+        from lerobot.envs.robotwin import build_robotwin_image
+
+        head_key = f"{OBS_IMAGES}.head_camera"
+        left_key = f"{OBS_IMAGES}.left_camera"
+        right_key = f"{OBS_IMAGES}.right_camera"
+        if not all(k in observation for k in (head_key, left_key, right_key)):
+            return observation
+
+        processed = dict(observation)
+        head = processed.pop(head_key)
+        left = processed.pop(left_key)
+        right = processed.pop(right_key)
+        processed[f"{OBS_IMAGES}.image"] = build_robotwin_image(head, left, right)
+        return processed
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Identity — policy image features come from the policy/dataset config."""
+        return features
+
+    def observation(self, observation):
+        return self._process_observation(observation)

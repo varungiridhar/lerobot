@@ -1,0 +1,121 @@
+# RoboTwin
+
+[RoboTwin 2.0](https://github.com/RoboTwin-Platform/RoboTwin) is a SAPIEN-based **bimanual** robotic-manipulation benchmark with strong domain randomization. It ships 50+ dual-arm tasks (`beat_block_hammer`, `place_empty_cup`, `handover_block`, …) on an `aloha-agilex` embodiment.
+
+- 📄 [RoboTwin 2.0 paper](https://arxiv.org/abs/2506.18088)
+- 💻 [RoboTwin-Platform/RoboTwin repo](https://github.com/RoboTwin-Platform/RoboTwin)
+
+LeRobot wraps RoboTwin tasks through `lerobot.envs.robotwin.RoboTwinEnv`, exposing a standard `gymnasium.Env` interface so RoboTwin slots into the same train / eval pipeline as Libero, MimicGen, etc. The wrapper drives RoboTwin's per-task lifecycle (`setup_demo` → `get_obs` / `take_action` → `close_env`) behind `reset()` / `step()`.
+
+## Installation
+
+> **Use a dedicated conda env for RoboTwin.** RoboTwin's `requirements.txt` pins `torch==2.4.1` / `gymnasium==0.29.1`, which conflict with LeRobot's stack. Its SAPIEN sim libraries are torch-version agnostic, though, so the env is built by **cloning a working `lerobot` conda env** (LeRobot 0.4.4 + torch 2.7.1) and layering RoboTwin's sim dependencies on top — RoboTwin's torch/gymnasium pins are dropped. This matches how the upstream FastWAM repo (also torch 2.7.1) runs RoboTwin.
+
+The RoboTwin integration has three parts:
+
+1. The RoboTwin repository itself — cloned, **not** on PyPI. Its `envs/<task>.py` modules are imported at runtime.
+2. The SAPIEN sim stack (`sapien`, `mplib`, `toppra`, `transforms3d`, `trimesh`, `open3d`) plus the CUDA-compiled `curobo` motion planner.
+3. RoboTwin's assets (robot URDFs, object meshes, background textures) — ~16 GB, downloaded from the Hugging Face Hub.
+
+### Setup
+
+```bash
+# 1. Clone RoboTwin (large — put it on a roomy volume)
+git clone https://github.com/RoboTwin-Platform/RoboTwin.git /path/to/RoboTwin
+
+# 2. Build the conda env + sim stack + curobo, and run the SAPIEN render test.
+#    This is a SLURM job — it needs a GPU node for CUDA compilation and the
+#    Vulkan render check. curobo is REQUIRED (RoboTwin hard-imports it).
+WITH_PLANNERS=1 sbatch scripts/setup_robotwin_env.sh
+
+# 3. Download RoboTwin's assets (~16 GB) on a compute node — snapshot_download
+#    OOM-kills on shared login nodes.
+sbatch outputs/debug/download_robotwin_assets.sh
+```
+
+`scripts/setup_robotwin_env.sh` is staged: it clones the `lerobot` env, repoints the editable install at this worktree (`pip install -e . --no-deps`), installs the SAPIEN sim stack in a separate resolve, builds `curobo` from source, patches `sapien`/`mplib` (per RoboTwin's `script/_install.sh`), and finishes with a diagnostic import block + the `script/test_render.py` Vulkan check.
+
+Three non-obvious things to know:
+
+- **`curobo` is mandatory, `pytorch3d` is optional.** RoboTwin's `envs/robot/robot.py` hard-imports `CuroboPlanner`, which is undefined unless `curobo` imports cleanly — so without it *no* RoboTwin task can be imported. `pytorch3d` is only used for point-cloud farthest-point-sampling inside a `try/except`; it is skipped unless `WITH_PYTORCH3D=1`.
+- **`numpy` is pinned `<2`.** RoboTwin's SAPIEN sim libraries predate numpy 2; installing them downgrades the cloned env's numpy. The rest of the scientific stack (torch, scipy, pandas) still imports fine on numpy 1.26.
+- **Use `python -m pip`, not bare `pip`.** On shared/cluster machines a `~/.local/bin/pip` can shadow the env's pip and silently install into the wrong Python.
+
+### Headless rendering
+
+SAPIEN renders via Vulkan. On headless GPU nodes SAPIEN provides a fallback ICD automatically (you may see a `Failed to find Vulkan ICD file` warning — `script/test_render.py` still prints `Render Well`). No extra environment variable is required.
+
+## Quick start — evaluate the released FastWAM checkpoint
+
+FastWAM publishes a RoboTwin checkpoint, `robotwin_uncond_3cam_384.pt`, on [yuanty/fastwam](https://huggingface.co/yuanty/fastwam). It is in FastWAM's native format; convert it to a LeRobot checkpoint directory:
+
+```bash
+python scripts/convert_fastwam_robotwin_checkpoint.py \
+    --pt    /path/robotwin_uncond_3cam_384.pt \
+    --stats /path/robotwin_uncond_3cam_384_dataset_stats.json \
+    --out   /path/fastwam_robotwin_lerobot
+```
+
+The converter builds a `FastWAMPolicy` with the RoboTwin preset (single pre-concatenated `[3,384,320]` camera frame, 14-D bimanual qpos state/action, z-score normalization), loads the fine-tuned MoT + proprio-encoder weights, attaches the released stats, and writes a standard LeRobot checkpoint.
+
+Then evaluate it in the RoboTwin simulator:
+
+```bash
+lerobot-eval \
+    --policy.path=/path/fastwam_robotwin_lerobot \
+    --env.type=robotwin \
+    --env.task=beat_block_hammer \
+    --env.robotwin_root=/path/to/RoboTwin \
+    --env.task_config=demo_randomized \
+    --eval.n_episodes=10 \
+    --eval.batch_size=1
+```
+
+Notes:
+
+- `--env.robotwin_root` points at the cloned RoboTwin repo; it can also be set via the `ROBOTWIN_ROOT` environment variable.
+- `--env.task` accepts a single RoboTwin task name or a comma-separated list.
+- `--env.task_config` is `demo_randomized` (domain-randomized) or `demo_clean`.
+- The wrapper exposes the three raw RoboTwin cameras; `RoboTwinProcessorStep` concatenates them into FastWAM's single `[3,384,320]` input frame.
+
+## Train on RoboTwin data
+
+The preprocessed RoboTwin dataset is published as a LeRobot `v2.1` dataset at
+[yuanty/robotwin2.0-fastwam](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
+(27,500 episodes; 8 split `.tar.gz` archives, ~79 GB). The training pipeline is:
+
+1. **Download + extract** — `cat robotwin2.0.tar.gz.part-* | tar -xzf -` →
+   `robotwin2.0/{data,meta,videos}`. Verify the extraction is complete
+   (`find videos -name '*.mp4' | wc -l` should be `3 × total_episodes`).
+2. **Re-pack** — the dataset stores three separate cameras (`cam_high`,
+   `cam_left_wrist`, `cam_right_wrist`). `scripts/convert_robotwin_to_lerobot.py`
+   reads the raw v2.1 files directly (per-episode parquet + camera mp4s) and
+   writes a new LeRobot v3.0 dataset whose single `observation.images.image`
+   `[3,384,320]` frame is the exact `build_robotwin_image` layout used at eval
+   time. Reading v2.1 directly (rather than running the full v2.1→v3.0 migration)
+   lets you re-pack an arbitrary episode subset and skip any episodes whose
+   source videos are missing/corrupt:
+
+   ```bash
+   python scripts/convert_robotwin_to_lerobot.py \
+       --src_root /path/to/robotwin2.0 \
+       --episodes 5000-5059 \
+       --dst_repo_id local/robotwin2.0_concat \
+       --dst_root /path/to/robotwin2.0_concat
+   ```
+
+Then train with `scripts/run_robotwin_train.sh`. The released RoboTwin model is
+~6B params (5B video DiT + 1B action DiT); to fit a single l40s the recipe
+**freezes the video DiT** and enables gradient checkpointing, so only the action
+DiT + proprio encoder train. Full-scale training (unfreezing the video DiT) needs
+a multi-GPU allocation.
+
+## How the integration works
+
+- **Observations**: `RoboTwinEnv` emits the head + two wrist cameras under `pixels` plus a flat 14-D joint-position `agent_pos`. For FastWAM, `RoboTwinProcessorStep` (registered in the env preprocessor) concatenates the cameras into a single `[3,384,320]` frame — head on top, left + right wrists side-by-side below — matching the layout FastWAM's RoboTwin checkpoint was trained on.
+- **Actions**: 14-D bimanual joint-position (`qpos`) targets, passed straight to RoboTwin's `take_action(action, action_type="qpos")`.
+- **Determinism**: `reset(seed)` maps to RoboTwin's `setup_demo(seed=…)`; an unstable randomized scene is retried with the next seed.
+- **Autograd**: RoboTwin's curobo motion planner runs an autograd-based optimizer, so `RoboTwinEnv` re-enables grad around every RoboTwin call even though `lerobot-eval` wraps the rollout in `torch.no_grad()`.
+
+Verified: the released `robotwin_uncond_3cam_384` checkpoint scores **~80% success**
+on `beat_block_hammer` (`demo_randomized`) through `lerobot-eval`.

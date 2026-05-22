@@ -20,7 +20,16 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, MimicGenEnv, PushtEnv
+from lerobot.envs.configs import (
+    AlohaEnv,
+    EnvConfig,
+    HubEnvConfig,
+    IsaaclabArenaEnv,
+    LiberoEnv,
+    MimicGenEnv,
+    PushtEnv,
+    RoboTwinEnv,
+)
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
@@ -29,6 +38,7 @@ from lerobot.processor.env_processor import (
     FastWAMGripperRemapStep,
     IsaaclabArenaProcessorStep,
     LiberoProcessorStep,
+    RoboTwinProcessorStep,
 )
 from lerobot.processor.pipeline import PolicyProcessorPipeline
 
@@ -42,6 +52,8 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return LiberoEnv(**kwargs)
     elif env_type == "mimicgen":
         return MimicGenEnv(**kwargs)
+    elif env_type == "robotwin":
+        return RoboTwinEnv(**kwargs)
     else:
         raise ValueError(f"Policy type '{env_type}' is not available.")
 
@@ -83,6 +95,10 @@ def make_env_pre_post_processors(
         # FastWAM postprocessor: remap gripper from training [0,1] (close/open) → LIBERO ±1
         if isinstance(policy_cfg, FastWAMConfig):
             postprocessor_steps.append(FastWAMGripperRemapStep())
+
+    # For RoboTwin: concat the 3 raw cameras into FastWAM's single [3,384,320] frame.
+    if isinstance(env_cfg, RoboTwinEnv) or "robotwin" in env_cfg.type:
+        preprocessor_steps.append(RoboTwinProcessorStep())
 
     # For Isaaclab Arena environments, add the IsaaclabArenaProcessorStep
     if isinstance(env_cfg, IsaaclabArenaEnv) or "isaaclab_arena" in env_cfg.type:
@@ -203,6 +219,28 @@ def make_env(
             n_envs=n_envs,
             camera_name=cfg.camera_name,
             init_states_path=cfg.init_states_path,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
+            episode_length=cfg.episode_length,
+        )
+    elif "robotwin" in cfg.type:
+        import os
+
+        from lerobot.envs.robotwin import create_robotwin_envs
+
+        if cfg.task is None:
+            raise ValueError("RoboTwinEnv requires a task to be specified")
+        robotwin_root = getattr(cfg, "robotwin_root", None) or os.environ.get("ROBOTWIN_ROOT")
+        if not robotwin_root:
+            raise ValueError(
+                "RoboTwinEnv requires `robotwin_root` — set --env.robotwin_root=<path> "
+                "or the ROBOTWIN_ROOT environment variable."
+            )
+
+        return create_robotwin_envs(
+            task=cfg.task,
+            n_envs=n_envs,
+            robotwin_root=robotwin_root,
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
             episode_length=cfg.episode_length,
