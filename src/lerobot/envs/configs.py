@@ -404,6 +404,62 @@ class MimicGenEnv(EnvConfig):
         }
 
 
+@EnvConfig.register_subclass("robotwin")
+@dataclass
+class RoboTwinEnv(EnvConfig):
+    """RoboTwin 2.0 SAPIEN bimanual-manipulation benchmark.
+
+    The env emits the three raw RoboTwin cameras (head + two wrists) at runtime;
+    ``RoboTwinProcessorStep`` (added to the env preprocessor) concatenates them
+    into the single ``[3, 384, 320]`` frame FastWAM expects. ``features`` /
+    ``features_map`` therefore declare that single post-processor image so the
+    static policy-feature check in ``make_policy`` matches the policy config.
+    ``robotwin_root`` points at a cloned RoboTwin repository (set it via
+    ``--env.robotwin_root`` or the ``ROBOTWIN_ROOT`` environment variable).
+    """
+
+    task: str = "beat_block_hammer"
+    fps: int = 25
+    episode_length: int | None = None  # resolved per-task from _eval_step_limit.yml
+    robotwin_root: str | None = None
+    task_config: str = "demo_randomized"  # demo_randomized | demo_clean
+    instruction_type: str = "unseen"
+    instruction: str | None = None
+    render_mode: str = "rgb_array"
+    # Concatenated FastWAM input-frame resolution (height, width).
+    image_height: int = 384
+    image_width: int = 320
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(14,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            "pixels/image": f"{OBS_IMAGES}.image",
+        }
+    )
+
+    def __post_init__(self):
+        # Single concatenated camera frame (head on top, left+right wrists below).
+        self.features["pixels/image"] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(self.image_height, self.image_width, 3)
+        )
+        # Flat 14-D bimanual joint-position state.
+        self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(14,))
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "task_config": self.task_config,
+            "instruction_type": self.instruction_type,
+            "instruction": self.instruction,
+            "render_mode": self.render_mode,
+        }
+
+
 @EnvConfig.register_subclass("metaworld")
 @dataclass
 class MetaworldEnv(EnvConfig):

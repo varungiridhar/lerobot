@@ -153,8 +153,10 @@ class FastWAMPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         self._queue: deque[Tensor] = deque()
 
-    def get_optim_params(self) -> dict[str, Any]:
-        return {n: p for n, p in self.named_parameters() if p.requires_grad}
+    def get_optim_params(self) -> list[Tensor]:
+        # Must return an iterable of parameter tensors (or param-group dicts) —
+        # a name->param dict is not a valid `params` arg for torch optimizers.
+        return [p for p in self.parameters() if p.requires_grad]
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the full action chunk (B, chunk_size, action_dim) for the current observation.

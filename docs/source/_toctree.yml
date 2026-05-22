@@ -71,6 +71,8 @@
     title: Using MetaWorld
   - local: mimicgen
     title: Using MimicGen
+  - local: robotwin
+    title: Using RoboTwin
   title: "Simulation"
 - sections:
   - local: introduction_processors
