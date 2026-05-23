@@ -187,6 +187,30 @@ def plan_chunk_fastwam(
     if "task" in batch:
         img_feats["task"] = batch["task"]
 
+    # Build per-dim noise std (scalar or (A,) tensor).
+    if cfg.noise_std_per_dim is not None:
+        if len(cfg.noise_std_per_dim) != A:
+            raise ValueError(
+                f"noise_std_per_dim length {len(cfg.noise_std_per_dim)} != action dim {A}"
+            )
+        noise_std: "float | Tensor" = torch.tensor(cfg.noise_std_per_dim, dtype=bc_mean.dtype)
+    else:
+        noise_std = cfg.noise_std
+
+    gripper_dim = cfg.gripper_dim if cfg.gripper_dim >= 0 else A + cfg.gripper_dim
+
+    def _apply_gripper_flip(candidates: Tensor, bc_mean: Tensor) -> Tensor:
+        """Randomly flip gripper to opposite sign for p_flip_gripper fraction of candidates."""
+        if cfg.p_flip_gripper <= 0.0:
+            return candidates
+        flip_mask = torch.rand(N, h, device=device, dtype=bc_mean.dtype) < cfg.p_flip_gripper
+        bc_grip = bc_mean[0, :, gripper_dim]  # (h,)
+        flipped = -bc_grip.sign().expand(N, h)  # opposite of BC gripper sign
+        current = candidates[:, :, gripper_dim]
+        candidates = candidates.clone()
+        candidates[:, :, gripper_dim] = torch.where(flip_mask, flipped, current)
+        return candidates
+
     def _spread(q: Tensor) -> tuple[float, float, float, float]:
         return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
 
@@ -202,20 +226,20 @@ def plan_chunk_fastwam(
         q_values = None
         for _ in range(max(1, cfg.n_iters)):
             noise = _sample_noise(
-                (N, h, A), cfg.noise_std, cfg.clip_to, device, mean.dtype,
+                (N, h, A), noise_std, cfg.clip_to, device, mean.dtype,
                 generator, smooth_sigma_t=cfg.noise_smooth_sigma_t,
             )
-            candidates = mean.expand(N, h, A) + noise
+            candidates = _apply_gripper_flip(mean.expand(N, h, A) + noise, mean)
             q_values = _score_candidates_fast(candidates, obs_context, ctx, img_feats).to(device=device, dtype=mean.dtype)
             weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
             mean = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
         return mean, _spread(q_values), q_values
 
     noise = _sample_noise(
-        (N, h, A), cfg.noise_std, cfg.clip_to, device, bc_mean.dtype,
+        (N, h, A), noise_std, cfg.clip_to, device, bc_mean.dtype,
         generator, smooth_sigma_t=cfg.noise_smooth_sigma_t,
     )
-    candidates = bc_mean.expand(N, h, A) + noise
+    candidates = _apply_gripper_flip(bc_mean.expand(N, h, A) + noise, bc_mean)
 
     if cfg.planner_type == "argmax":
         q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
