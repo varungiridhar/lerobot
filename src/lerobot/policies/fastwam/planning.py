@@ -172,7 +172,47 @@ def plan_chunk_fastwam(
     ``q_values``: raw ``(N,)`` Q scores for all candidates (for vis / logging).
     """
     device = next(bc_policy.parameters()).device
-    # Run FastWAM diffusion once → MIN_MAX-normalized actions, returned on CPU.
+    N = cfg.n_samples
+
+    # Raw camera images + task text — Q uses DINOv2 + T5 text conditioning.
+    img_feats = {cam_key: batch[cam_key] for cam_key in ctx.q_camera_keys}
+    if "task" in batch:
+        img_feats["task"] = batch["task"]
+
+    def _spread(q: Tensor) -> tuple[float, float, float, float]:
+        return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
+
+    if cfg.planner_type in ("bc_diffusion_argmax", "bc_diffusion_mppi"):
+        # Sample N diverse chunks via N independent diffusion runs.
+        # Image/text encoding happens ONCE inside predict_n_action_chunks; only the
+        # denoising loop is repeated per sample — far cheaper than N full infer_action calls.
+        candidates = bc_policy.predict_n_action_chunks(batch, N).to(device=device)
+        # (N, h, A) in FastWAM-norm space — same normalization as bc_mean
+
+        # Score all N candidates with Q; encode obs context once and reuse across all N.
+        single_batch = {ACTION: candidates[:1], **img_feats}
+        single_preprocessed = ctx.q_pre(single_batch)
+        obs_context = ctx.q_policy.encode_obs_context(single_preprocessed)  # (S, 1, D)
+        q_values = _score_candidates_fast(candidates, obs_context, ctx, img_feats).to(
+            device=device, dtype=candidates.dtype
+        )
+
+        if cfg.planner_type == "bc_diffusion_argmax":
+            best = int(torch.argmax(q_values))
+            return candidates[best : best + 1], _spread(q_values), q_values
+
+        # bc_diffusion_mppi: softmax-weighted mean of top-K candidates (single-iter MPPI).
+        # n_elites=0 means use all N candidates.
+        K = min(cfg.n_elites, N) if cfg.n_elites > 0 else N
+        topk_idx = torch.topk(q_values, K).indices
+        topk_q = q_values[topk_idx]
+        topk_cands = candidates[topk_idx]
+        weights = torch.softmax((topk_q - topk_q.max()) / cfg.temperature, dim=0)
+        result = (weights.view(K, 1, 1) * topk_cands).sum(dim=0, keepdim=True)
+        return result, _spread(q_values), q_values
+
+    # Noise-based planners (mppi, argmax, cem): run diffusion once to get BC prior mean,
+    # then perturb with Gaussian noise and score candidates with Q.
     bc_mean = bc_policy.predict_action_chunk(batch).to(device=device)
     if bc_mean.shape[0] != 1:
         raise NotImplementedError(
@@ -180,12 +220,6 @@ def plan_chunk_fastwam(
             "Run lerobot-eval with --eval.batch_size=1 when use_planning=true."
         )
     _, h, A = bc_mean.shape
-    N = cfg.n_samples
-
-    # Raw camera images + task text — Q uses DINOv2 + T5 text conditioning.
-    img_feats = {cam_key: batch[cam_key] for cam_key in ctx.q_camera_keys}
-    if "task" in batch:
-        img_feats["task"] = batch["task"]
 
     # Build per-dim noise std (scalar or (A,) tensor).
     if cfg.noise_std_per_dim is not None:
@@ -210,9 +244,6 @@ def plan_chunk_fastwam(
         candidates = candidates.clone()
         candidates[:, :, gripper_dim] = torch.where(flip_mask, flipped, current)
         return candidates
-
-    def _spread(q: Tensor) -> tuple[float, float, float, float]:
-        return (float(q.min()), float(q.max()), float(q.mean()), float(q.std()))
 
     if cfg.planner_type == "mppi":
         # Encode obs once — reused across all N candidates and all n_iters.

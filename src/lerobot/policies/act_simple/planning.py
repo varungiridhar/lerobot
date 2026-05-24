@@ -69,9 +69,11 @@ class PlanningConfig:
     gripper_dim: int = -1
 
     def __post_init__(self):
-        if self.planner_type not in ("mppi", "cem", "argmax"):
+        if self.planner_type not in ("mppi", "cem", "argmax", "bc_diffusion_argmax", "bc_diffusion_mppi"):
             raise ValueError(
-                f"planner_type must be one of {{mppi, cem, argmax}}, got {self.planner_type!r}"
+                f"planner_type must be one of "
+                f"{{mppi, cem, argmax, bc_diffusion_argmax, bc_diffusion_mppi}}, "
+                f"got {self.planner_type!r}"
             )
         if self.n_samples <= 0:
             raise ValueError(f"n_samples must be > 0, got {self.n_samples}")

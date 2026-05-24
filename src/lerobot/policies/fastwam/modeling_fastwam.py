@@ -184,6 +184,40 @@ class FastWAMPolicy(PreTrainedPolicy):
 
         return torch.stack(chunks, dim=0)  # (B, chunk_size, action_dim)
 
+    @torch.no_grad()
+    def predict_n_action_chunks(self, batch: dict[str, Tensor], n_samples: int) -> Tensor:
+        """Return (n_samples, chunk_size, action_dim) from n_samples independent diffusion runs.
+
+        Image and text are encoded ONCE; the denoising loop is repeated n_samples times
+        with independent initial noise. All returned chunks are on-manifold BC samples.
+        Requires batch_size=1.
+        """
+        self.eval()
+        B = next(v for v in batch.values() if isinstance(v, Tensor)).shape[0]
+        if B != 1:
+            raise NotImplementedError("predict_n_action_chunks only supports batch_size=1")
+
+        batch_i = {k: v[0:1] for k, v in batch.items() if isinstance(v, Tensor)}
+        task_list = batch.get("task", None)
+        if task_list is not None:
+            batch_i["task"] = [task_list[0]]
+
+        image = self._prepare_image(batch_i)
+        proprio = self._get_proprio(batch_i)
+        task = (batch_i["task"][0] if batch_i.get("task") else "")
+        prompt = PROMPT_TEMPLATE.format(task=task)
+
+        result = self.model.infer_action(
+            prompt=prompt,
+            input_image=image,
+            action_horizon=self.config.chunk_size,
+            proprio=proprio,
+            num_inference_steps=self.config.num_inference_steps,
+            num_samples=n_samples,
+        )
+        # result["action"] shape: (n_samples, chunk_size, action_dim) float32 on CPU
+        return result["action"]
+
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the next action (B, action_dim) from the action queue.
 
