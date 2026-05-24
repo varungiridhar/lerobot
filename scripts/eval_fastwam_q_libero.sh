@@ -25,6 +25,9 @@ NOISE_STD_PER_DIM=${NOISE_STD_PER_DIM:-}
 # Gripper flip probability (0=disabled). Only used when NOISE_STD_PER_DIM is set.
 P_FLIP_GRIPPER=${P_FLIP_GRIPPER:-0.0}
 NUM_INFER_STEPS=${NUM_INFER_STEPS:-10}
+# Number of diffusion steps for bc_diffusion_* planners (overrides NUM_INFER_STEPS for sampling).
+# Fewer steps → more diverse candidates. Leave empty to use NUM_INFER_STEPS.
+DIFFUSION_STEPS=${DIFFUSION_STEPS:-}
 SEED=${SEED:-42}
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/eval/${TIMESTAMP}_fastwam_q_${LIBERO_TASK}_${PLANNER}_std${NOISE_STD}_n${N_SAMPLES}_l40s}
@@ -42,7 +45,7 @@ echo "  FASTWAM_CKPT:  $FASTWAM_CKPT"
 echo "  Q_CKPT:        $Q_CKPT"
 echo "  LIBERO_TASK:   $LIBERO_TASK"
 echo "  N_EPISODES:    $N_EPISODES"
-echo "  PLANNER:       $PLANNER  noise_std=$NOISE_STD  per_dim=${NOISE_STD_PER_DIM:-none}  p_flip_gripper=$P_FLIP_GRIPPER  n_samples=$N_SAMPLES  n_iters=$N_ITERS  temperature=$TEMPERATURE"
+echo "  PLANNER:       $PLANNER  noise_std=$NOISE_STD  per_dim=${NOISE_STD_PER_DIM:-none}  p_flip_gripper=$P_FLIP_GRIPPER  n_samples=$N_SAMPLES  n_iters=$N_ITERS  temperature=$TEMPERATURE  diffusion_steps=${DIFFUSION_STEPS:-default}"
 echo "  OUTPUT_DIR:    $OUTPUT_DIR"
 echo "================================="
 
@@ -67,5 +70,6 @@ echo N | lerobot-eval \
     ${NOISE_STD_PER_DIM:+--policy.planning.noise_std_per_dim="[$NOISE_STD_PER_DIM]"} \
     --policy.planning.p_flip_gripper="$P_FLIP_GRIPPER" \
     --policy.planning.temperature="$TEMPERATURE" \
+    ${DIFFUSION_STEPS:+--policy.planning.num_diffusion_steps="$DIFFUSION_STEPS"} \
     --output_dir="$OUTPUT_DIR" \
     --seed="$SEED" 2>&1 | tee "$OUTPUT_DIR/log.txt"

@@ -126,7 +126,7 @@ class FastWAMPlanner:
     @torch.no_grad()
     def plan(self, bc_policy: "FastWAMPolicy", batch: dict[str, Tensor]) -> Tensor:
         """Return planned chunk ``(1, h, A)`` in FastWAM-normalized space."""
-        result, spread, q_vals_raw = plan_chunk_fastwam(
+        result, spread, q_vals_raw, action_candidates = plan_chunk_fastwam(
             bc_policy, batch, self.ctx, self.cfg, self.generator
         )
         self.last_q_spread = spread
@@ -143,16 +143,25 @@ class FastWAMPlanner:
             cam_key = f"{OBS_IMAGES}.image"
             frame = _obs_frame_to_uint8(batch[cam_key]) if cam_key in batch else None
             q_np = q_vals_raw.cpu().float().numpy()
-            N = len(q_np)
             # MPPI weighted mean of Q values ≈ Q of the selected action
             if self.cfg.planner_type == "mppi" and spread is not None:
                 weights = torch.softmax(
                     (q_vals_raw - q_vals_raw.max()) / self.cfg.temperature, dim=0
                 )
                 q_sel = float((weights * q_vals_raw).sum())
+            elif self.cfg.planner_type in ("bc_diffusion_mppi",) and spread is not None:
+                K = min(self.cfg.n_elites, len(q_np)) if self.cfg.n_elites > 0 else len(q_np)
+                topk_q = torch.topk(q_vals_raw, K).values
+                weights = torch.softmax((topk_q - topk_q.max()) / self.cfg.temperature, dim=0)
+                q_sel = float((weights * topk_q).sum())
             else:
-                q_sel = float(q_np.max())  # argmax / CEM: use best candidate Q
-            self._vis_chunks.append({"frame": frame, "q_candidates": q_np, "q_selected": q_sel})
+                q_sel = float(q_np.max())
+            chunk_data = {"frame": frame, "q_candidates": q_np, "q_selected": q_sel}
+            # Store action trajectories for bc_diffusion planners (used by trajectory vis)
+            if action_candidates is not None:
+                chunk_data["action_candidates"] = action_candidates.cpu().float().numpy()
+                chunk_data["action_selected"] = result[0].cpu().float().numpy()
+            self._vis_chunks.append(chunk_data)
 
         return result
 
@@ -164,12 +173,13 @@ def plan_chunk_fastwam(
     ctx: PlannerContext,
     cfg: PlanningConfig,
     generator: torch.Generator | None = None,
-) -> tuple[Tensor, tuple[float, float, float, float] | None, Tensor | None]:
-    """Return ``(planned_chunk, q_spread, q_values)`` for one chunk in FastWAM-norm space.
+) -> tuple[Tensor, tuple[float, float, float, float] | None, Tensor | None, Tensor | None]:
+    """Return ``(planned_chunk, q_spread, q_values, candidates)`` for one chunk.
 
     ``planned_chunk`` shape: ``(1, h, A)`` — ready to drop into FastWAM's action queue.
     ``q_spread``: ``(q_min, q_max, q_mean, q_std)`` across candidate scores.
     ``q_values``: raw ``(N,)`` Q scores for all candidates (for vis / logging).
+    ``candidates``: ``(N, h, A)`` all scored candidates; None for noise-based planners.
     """
     device = next(bc_policy.parameters()).device
     N = cfg.n_samples
@@ -184,9 +194,11 @@ def plan_chunk_fastwam(
 
     if cfg.planner_type in ("bc_diffusion_argmax", "bc_diffusion_mppi"):
         # Sample N diverse chunks via N independent diffusion runs.
-        # Image/text encoding happens ONCE inside predict_n_action_chunks; only the
-        # denoising loop is repeated per sample — far cheaper than N full infer_action calls.
-        candidates = bc_policy.predict_n_action_chunks(batch, N).to(device=device)
+        # Image/text encoding happens ONCE; only the denoising loop is repeated per sample.
+        # cfg.num_diffusion_steps overrides policy.num_inference_steps — fewer steps = more diversity.
+        candidates = bc_policy.predict_n_action_chunks(
+            batch, N, num_inference_steps=cfg.num_diffusion_steps
+        ).to(device=device)
         # (N, h, A) in FastWAM-norm space — same normalization as bc_mean
 
         # Score all N candidates with Q; encode obs context once and reuse across all N.
@@ -199,7 +211,7 @@ def plan_chunk_fastwam(
 
         if cfg.planner_type == "bc_diffusion_argmax":
             best = int(torch.argmax(q_values))
-            return candidates[best : best + 1], _spread(q_values), q_values
+            return candidates[best : best + 1], _spread(q_values), q_values, candidates
 
         # bc_diffusion_mppi: softmax-weighted mean of top-K candidates (single-iter MPPI).
         # n_elites=0 means use all N candidates.
@@ -209,7 +221,7 @@ def plan_chunk_fastwam(
         topk_cands = candidates[topk_idx]
         weights = torch.softmax((topk_q - topk_q.max()) / cfg.temperature, dim=0)
         result = (weights.view(K, 1, 1) * topk_cands).sum(dim=0, keepdim=True)
-        return result, _spread(q_values), q_values
+        return result, _spread(q_values), q_values, candidates
 
     # Noise-based planners (mppi, argmax, cem): run diffusion once to get BC prior mean,
     # then perturb with Gaussian noise and score candidates with Q.
@@ -264,7 +276,7 @@ def plan_chunk_fastwam(
             q_values = _score_candidates_fast(candidates, obs_context, ctx, img_feats).to(device=device, dtype=mean.dtype)
             weights = torch.softmax((q_values - q_values.max()) / cfg.temperature, dim=0)
             mean = (weights.view(N, 1, 1) * candidates).sum(dim=0, keepdim=True)
-        return mean, _spread(q_values), q_values
+        return mean, _spread(q_values), q_values, None
 
     noise = _sample_noise(
         (N, h, A), noise_std, cfg.clip_to, device, bc_mean.dtype,
@@ -275,7 +287,7 @@ def plan_chunk_fastwam(
     if cfg.planner_type == "argmax":
         q_values = _score_candidates(candidates, img_feats, ctx).to(device=device, dtype=bc_mean.dtype)
         best = int(torch.argmax(q_values))
-        return candidates[best : best + 1], _spread(q_values), q_values
+        return candidates[best : best + 1], _spread(q_values), q_values, None
 
     # CEM — return q_values from last iteration
     mean = bc_mean.clone()
@@ -294,4 +306,4 @@ def plan_chunk_fastwam(
         elites = cands.index_select(0, elite_idx)
         mean = elites.mean(dim=0, keepdim=True)
         std = elites.std(dim=0, keepdim=True).clamp_min(1e-3)
-    return mean, spread, q_values
+    return mean, spread, q_values, None

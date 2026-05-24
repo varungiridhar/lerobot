@@ -160,7 +160,7 @@ class TestBCDiffusionArgmax(unittest.TestCase):
             "lerobot.policies.fastwam.planning._score_candidates_fast",
             return_value=q_scores,
         ):
-            result, spread, q_vals = plan_chunk_fastwam(bc_policy, {}, ctx, cfg, generator=None)
+            result, spread, q_vals, _ = plan_chunk_fastwam(bc_policy, {}, ctx, cfg, generator=None)
 
         return result, spread, q_vals
 
@@ -218,7 +218,7 @@ class TestBCDiffusionMPPI(unittest.TestCase):
             "lerobot.policies.fastwam.planning._score_candidates_fast",
             return_value=q_scores,
         ):
-            result, spread, q_vals = plan_chunk_fastwam(bc_policy, {}, ctx, cfg, generator=None)
+            result, spread, q_vals, _ = plan_chunk_fastwam(bc_policy, {}, ctx, cfg, generator=None)
 
         return result, spread, q_vals
 

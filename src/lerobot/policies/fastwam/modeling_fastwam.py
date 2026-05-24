@@ -185,7 +185,9 @@ class FastWAMPolicy(PreTrainedPolicy):
         return torch.stack(chunks, dim=0)  # (B, chunk_size, action_dim)
 
     @torch.no_grad()
-    def predict_n_action_chunks(self, batch: dict[str, Tensor], n_samples: int) -> Tensor:
+    def predict_n_action_chunks(
+        self, batch: dict[str, Tensor], n_samples: int, num_inference_steps: int | None = None
+    ) -> Tensor:
         """Return (n_samples, chunk_size, action_dim) from n_samples independent diffusion runs.
 
         Image and text are encoded ONCE; the denoising loop is repeated n_samples times
@@ -207,12 +209,13 @@ class FastWAMPolicy(PreTrainedPolicy):
         task = (batch_i["task"][0] if batch_i.get("task") else "")
         prompt = PROMPT_TEMPLATE.format(task=task)
 
+        steps = num_inference_steps if num_inference_steps is not None else self.config.num_inference_steps
         result = self.model.infer_action(
             prompt=prompt,
             input_image=image,
             action_horizon=self.config.chunk_size,
             proprio=proprio,
-            num_inference_steps=self.config.num_inference_steps,
+            num_inference_steps=steps,
             num_samples=n_samples,
         )
         # result["action"] shape: (n_samples, chunk_size, action_dim) float32 on CPU
