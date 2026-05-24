@@ -457,6 +457,21 @@ def eval_policy(
                         t_vis.start()
                         threads.append(t_vis)
 
+                        # Save XY trajectory plots for bc_diffusion planners.
+                        if any("action_candidates" in c for c in vis_chunks):
+                            from lerobot.policies.fastwam.planning_vis_trajectories import (
+                                plot_episode_trajectories,
+                            )
+                            traj_path = videos_dir / f"eval_episode_{n_episodes_rendered}_traj_vis.png"
+                            diff_steps = getattr(getattr(_planner, "cfg", None), "num_diffusion_steps", None)
+                            t_traj = threading.Thread(
+                                target=plot_episode_trajectories,
+                                args=(vis_chunks, traj_path),
+                                kwargs={"episode_idx": n_episodes_rendered, "diffusion_steps": diff_steps},
+                            )
+                            t_traj.start()
+                            threads.append(t_traj)
+
                 n_episodes_rendered += 1
 
         progbar.set_postfix(
