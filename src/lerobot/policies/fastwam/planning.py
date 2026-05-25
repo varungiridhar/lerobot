@@ -88,15 +88,13 @@ class FastWAMPlanner:
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
-        # FastWAM action normalization mismatch fix:
-        # FastWAM bc_post (MIN_MAX) maps gripper from norm [-1,1] → raw [0,1], but Q was
-        # trained with gripper in [-1,1].  FastWAM normalized space and Q's raw space are both
-        # in [-1,1] for ALL dims, so the correct bc_post for scoring is identity — pass
-        # FastWAM-normalized candidates directly to q_pre without unnormalizing first.
+        # Action round-trip: FastWAM-norm → bc_post (unnorm to raw) → q_pre (Q-norm).
+        # FastWAM (RoboTwin) uses MEAN_STD; Q also uses MEAN_STD but with different dataset
+        # stats — passing bc_post=identity would double-normalize, so we use the real bc_post.
         ctx = PlannerContext(
             q_policy=q_policy,
             q_pre=q_pre,
-            bc_post=lambda x: x,  # identity: FastWAM-norm ≈ Q-raw (both in [-1,1])
+            bc_post=bc_post,
             q_camera_keys=tuple(q_policy.config.camera_keys),
             horizon=bc_chunk_size,
         )
