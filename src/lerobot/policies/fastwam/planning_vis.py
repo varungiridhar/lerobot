@@ -26,13 +26,14 @@ _VIS_FPS = 5   # planning-rate video — slower than env rate, easier to read
 
 
 def _obs_frame_to_uint8(img_tensor) -> np.ndarray:
-    """Convert a (1, C, H, W) or (C, H, W) tensor in [-1, 1] to (H, W, 3) uint8."""
-    import torch
+    """Convert a (1, C, H, W) or (C, H, W) float tensor to (H, W, 3) uint8.
+
+    FastWAM uses IDENTITY visual normalization so images arrive in [0, 1].
+    """
     t = img_tensor
     if t.dim() == 4:
         t = t[0]                        # (C, H, W)
-    t = t.detach().float().cpu()
-    t = (t * 0.5 + 0.5).clamp(0, 1)   # [-1,1] → [0,1]
+    t = t.detach().float().cpu().clamp(0, 1)
     return (t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
