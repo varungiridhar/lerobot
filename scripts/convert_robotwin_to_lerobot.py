@@ -13,25 +13,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Re-pack RoboTwin episodes into FastWAM's single-concatenated-image format.
+"""Re-pack RoboTwin episodes into a LeRobot v3.0 dataset.
 
 Reads the ``robotwin2.0-fastwam`` dataset's raw v2.1 files directly — per-episode
 parquet (14-D state + 14-D action) and the three per-episode camera mp4s
-(``cam_high``, ``cam_left_wrist``, ``cam_right_wrist``) — concatenates the
-cameras with the shared ``build_robotwin_image`` helper (the exact eval-time
-layout), and writes a new LeRobot v3.0 dataset with a single
-``observation.images.image`` ``[3, 384, 320]`` feature.
+(``cam_high``, ``cam_left_wrist``, ``cam_right_wrist``). Reading the v2.1 files
+directly (rather than running the full v2.1->v3.0 migration) lets us re-pack an
+arbitrary episode subset and skip episodes whose source videos are missing/corrupt.
 
-Reading the v2.1 files directly (rather than running the full v2.1->v3.0
-migration) lets us re-pack an arbitrary episode subset and skip episodes whose
-source videos are missing/corrupt.
+Two output layouts (``--mode``):
+  - ``concat``   (default): a single ``observation.images.image`` [3,384,320]
+                 frame — the FastWAM layout produced by ``build_robotwin_image``.
+  - ``multicam``: the three cameras as separate ``observation.images.cam_*``
+                 features (each resized to 256x256) — the per-camera-view input
+                 the Q-function expects.
 
 Usage:
-    python scripts/convert_robotwin_to_lerobot.py \
+    python scripts/convert_robotwin_to_lerobot.py --mode multicam \
         --src_root /path/to/robotwin2.0 \
-        --episodes 5000-5059 \
-        --dst_repo_id local/robotwin2.0_concat \
-        --dst_root /path/to/robotwin2.0_concat
+        --episodes 5000-5299 \
+        --dst_repo_id local/robotwin2.0_multicam \
+        --dst_root /path/to/robotwin2.0_multicam
 """
 import argparse
 import json
@@ -49,6 +51,7 @@ from lerobot.envs.robotwin import build_robotwin_image
 
 CAMERAS = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 CHUNK_SIZE = 1000
+MULTICAM_SIZE = 256  # per-camera frame size for multicam mode (Q-function resizes to 224)
 
 
 def decode_video_frames(path: Path) -> list[torch.Tensor]:
@@ -86,10 +89,21 @@ def _ep_paths(src: Path, ep: int) -> tuple[Path, dict[str, Path]]:
     return parquet, videos
 
 
+def _chw_to_pil(chw_uint8: torch.Tensor, size: int | None = None) -> Image.Image:
+    """(3, H, W) uint8 tensor -> PIL RGB image, optionally resized to (size, size)."""
+    hwc = chw_uint8.permute(1, 2, 0).contiguous().numpy()
+    img = Image.fromarray(hwc)
+    if size is not None:
+        img = img.resize((size, size), Image.BILINEAR)
+    return img
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src_root", required=True, help="Path to the extracted robotwin2.0 v2.1 dataset")
-    ap.add_argument("--episodes", required=True, help="Episode spec, e.g. '5000-5059'")
+    ap.add_argument("--episodes", required=True, help="Episode spec, e.g. '5000-5299'")
+    ap.add_argument("--mode", choices=["concat", "multicam"], default="concat",
+                    help="concat: single FastWAM [384,320] frame; multicam: 3 separate cameras")
     ap.add_argument("--dst_repo_id", default="local/robotwin2.0_concat")
     ap.add_argument("--dst_root", required=True)
     ap.add_argument("--fps", type=int, default=50)
@@ -98,7 +112,7 @@ def main():
 
     src = Path(a.src_root)
     episodes = parse_episodes(a.episodes)
-    print(f"Re-packing {len(episodes)} episodes: {episodes[0]}..{episodes[-1]}")
+    print(f"Re-packing {len(episodes)} episodes ({episodes[0]}..{episodes[-1]}) | mode={a.mode}")
 
     # task_index -> task string
     tasks: dict[int, str] = {}
@@ -119,10 +133,18 @@ def main():
     features = {
         "action": {"dtype": "float32", "shape": (14,), "names": None},
         "observation.state": {"dtype": "float32", "shape": (14,), "names": None},
-        "observation.images.image": {
-            "dtype": img_dtype, "shape": (384, 320, 3), "names": ["height", "width", "channels"]
-        },
     }
+    if a.mode == "concat":
+        features["observation.images.image"] = {
+            "dtype": img_dtype, "shape": (384, 320, 3), "names": ["height", "width", "channels"]
+        }
+    else:  # multicam
+        for cam in CAMERAS:
+            features[f"observation.images.{cam}"] = {
+                "dtype": img_dtype, "shape": (MULTICAM_SIZE, MULTICAM_SIZE, 3),
+                "names": ["height", "width", "channels"],
+            }
+
     dst = LeRobotDataset.create(
         repo_id=a.dst_repo_id, fps=a.fps, features=features, root=dst_root,
         robot_type="aloha", use_videos=not a.no_videos,
@@ -143,21 +165,25 @@ def main():
                   f"{[len(v) for v in cam_frames.values()]} — using {n_frames}")
 
         for t in range(n_frames):
-            image = build_robotwin_image(
-                cam_frames["cam_high"][t],
-                cam_frames["cam_left_wrist"][t],
-                cam_frames["cam_right_wrist"][t],
-            )  # (3, 384, 320) uint8
-            dst.add_frame({
+            frame = {
                 "action": torch.tensor(np.asarray(df["action"].iloc[t]), dtype=torch.float32),
                 "observation.state": torch.tensor(
                     np.asarray(df["observation.state"].iloc[t]), dtype=torch.float32
                 ),
-                "observation.images.image": Image.fromarray(
-                    image.permute(1, 2, 0).contiguous().numpy()
-                ),
                 "task": tasks[int(df["task_index"].iloc[t])],
-            })
+            }
+            if a.mode == "concat":
+                image = build_robotwin_image(
+                    cam_frames["cam_high"][t],
+                    cam_frames["cam_left_wrist"][t],
+                    cam_frames["cam_right_wrist"][t],
+                )  # (3, 384, 320) uint8
+                frame["observation.images.image"] = _chw_to_pil(image)
+            else:  # multicam — 3 separate cameras, each resized to MULTICAM_SIZE
+                for cam in CAMERAS:
+                    frame[f"observation.images.{cam}"] = _chw_to_pil(cam_frames[cam][t], MULTICAM_SIZE)
+            dst.add_frame(frame)
+
         dst.save_episode()
         n_done += 1
         if n_done % 20 == 0:
