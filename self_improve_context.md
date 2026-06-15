@@ -135,7 +135,6 @@ distribution rather than the original BC demos.
 ### Implementation
 - **Script**: `scripts/self_improvement_loop.py`
 - **SLURM job**: `scripts/run_self_improvement.sh`
-- **Documentation**: `scripts/self_improvement_loop.md`
 
 ### Data flow
 ```
@@ -235,8 +234,63 @@ python scripts/self_improvement_loop.py \
 ```
 
 ### SLURM script
-`scripts/run_self_improvement.sh` — L40S, 12h, defaults: 5 iterations, 20 eps/iter, 200 steps.
+`scripts/run_self_improvement.sh` — H200, 8h. Auto-chains next iteration via `sbatch --dependency=afterok`.
 Override params via `--export` flags on sbatch.
+
+### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--fastwam_ckpt` | (required) | Path to FastWAM checkpoint |
+| `--q_ckpt` | (required) | Path to initial Q checkpoint |
+| `--original_dataset_repo_id` | `HuggingFaceVLA/libero` | HF repo ID of the original training dataset |
+| `--original_dataset_root` | `/storage/project/r-agarg35-0/shared/lerobot-data-2` | Local root for the dataset |
+| `--task` | `libero_10` | LIBERO task split |
+| `--n_iterations` | 5 | Number of self-improvement iterations |
+| `--n_episodes` | 20 | Episodes to collect per iteration |
+| `--finetune_steps` | 200 | Q fine-tuning gradient steps per iteration |
+| `--finetune_lr` | 1e-5 | AdamW learning rate |
+| `--batch_size` | 32 | Training batch size |
+| `--online_fraction` | 0.5 | Fraction of each batch from online data |
+| `--planner_type` | `bc_diffusion_mppi` | Planner for collection |
+| `--n_samples` | 16 | Number of planning candidates |
+| `--n_elites` | 16 | Number of elite candidates (MPPI) |
+| `--diffusion_steps` | 3 | Diffusion steps for `bc_diffusion_*` planner |
+| `--output_dir` | (required) | Where to save checkpoints and logs |
+| `--seed` | 42 | Random seed |
+
+### Output structure
+
+```
+output_dir/
+  loop_summary.jsonl          # one JSON line per iteration
+  iter_000/
+    episodes/
+      ep_0000.pt              # successful episode tensors
+      ep_0001.pt
+      ...
+    q_checkpoint/
+      config.json
+      model.safetensors       # fine-tuned Q weights
+    metrics.json              # per-iteration metrics
+  iter_001/
+    ...
+```
+
+Episode `.pt` file keys: `observation.images.image` (T,3,224,224), `observation.state` (T,state_dim), `action` (T,action_dim), `next.success` (T,), `task` (str).
+
+`loop_summary.jsonl` fields per line: `iteration`, `n_collected`, `n_online_frames`, `pc_success`, `finetune_loss`, `elapsed_s`.
+
+### Memory budget (one L40S, 46 GB)
+
+| Component | VRAM |
+|-----------|------|
+| FastWAM (BF16, N=16 samples) | ~25 GB |
+| Q-function (FP32 + AdamW) | ~4 GB |
+| Batch (bsz=32, 256×256 images) | ~2 GB |
+| **Total** | ~31 GB |
+
+Use `--n_samples 16 --batch_size 32` on L40S. For H200 (80 GB) increase to `--n_samples 64 --batch_size 64`.
 
 ---
 
