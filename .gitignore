@@ -194,3 +194,4 @@ results_self_improvement_deterministic.tsv
 # experiments things
 experiment/
 experiments/
+traj_vis/
