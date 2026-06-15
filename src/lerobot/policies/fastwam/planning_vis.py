@@ -38,19 +38,20 @@ def _obs_frame_to_uint8(img_tensor) -> np.ndarray:
 
 
 def make_planning_vis_video(
-    chunk_frames: list[np.ndarray],    # one (H, W, 3) uint8 frame per planning chunk
+    chunk_frames: list[np.ndarray],    # one (H, W, 3) uint8 frame per planning chunk (fallback)
     q_candidates: list[np.ndarray],    # one (N,) float array per chunk
     q_selected: list[float],           # one float per chunk (MPPI-weighted mean of Q)
     out_path: str | Path,
     v_min: float = 0.0,
     v_max: float = 1.0,
     fps: int = _VIS_FPS,
+    vis_chunks: list[dict] | None = None,  # full chunk dicts with optional "step_frames"
 ) -> str:
     """Render side-by-side MP4: left=camera, right=animated Q-value spotlight.
 
-    The spotlight: at frame t (= chunk t), candidate Q dots for chunk t are drawn
-    solid (alpha=1, larger), then revert to faint (alpha=0.12) at t+1.
-    The solid navy line accumulates q_selected[0..t].
+    If vis_chunks contains "step_frames" lists, the camera panel advances every env step
+    (stride 1) while the Q panel updates only at chunk boundaries. Otherwise falls back
+    to one video frame per planning chunk.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -62,7 +63,22 @@ def make_planning_vis_video(
         logger.warning("make_planning_vis_video: no chunks to render, skipping.")
         return str(out_path)
 
-    cam_h, cam_w = chunk_frames[0].shape[:2]
+    # Build per-video-frame sequence: (camera_frame, chunk_index)
+    # Use step_frames if available for full temporal resolution.
+    if vis_chunks is not None and any("step_frames" in c and len(c["step_frames"]) > 1 for c in vis_chunks):
+        frame_seq: list[tuple[np.ndarray, int]] = []
+        for t, chunk in enumerate(vis_chunks):
+            frames = chunk.get("step_frames") or ([chunk["frame"]] if chunk.get("frame") is not None else [])
+            for f in frames:
+                frame_seq.append((f, t))
+    else:
+        frame_seq = [(chunk_frames[t], t) for t in range(n_chunks)]
+
+    if not frame_seq:
+        logger.warning("make_planning_vis_video: no frames to render, skipping.")
+        return str(out_path)
+
+    cam_h, cam_w = frame_seq[0][0].shape[:2]
     dpi = 80
     fig, ax = plt.subplots(1, 1, figsize=(cam_w / dpi, cam_h / dpi), dpi=dpi)
     fig.subplots_adjust(left=0.18, right=0.97, top=0.97, bottom=0.18)
@@ -87,27 +103,22 @@ def make_planning_vis_video(
     plot_w_px, plot_h_px = fig.canvas.get_width_height()
 
     video_frames: list[np.ndarray] = []
-    spotlight = None  # current solid scatter artist
+    spotlight = None
+    prev_chunk_idx = -1
 
-    for t in range(n_chunks):
-        # Reveal selected-Q line up to chunk t
-        line_obj.set_data(range(t + 1), q_selected[: t + 1])
+    for cam_frame, t in frame_seq:
+        # Update Q panel only when advancing to a new chunk
+        if t != prev_chunk_idx:
+            line_obj.set_data(range(t + 1), q_selected[: t + 1])
+            if spotlight is not None:
+                spotlight.remove()
+            cq = q_candidates[t]
+            spotlight = ax.scatter(
+                [t] * len(cq), cq, s=6, alpha=1.0, c="steelblue", linewidths=0, zorder=5,
+            )
+            fig.canvas.draw()
+            prev_chunk_idx = t
 
-        # Spotlight: remove previous, draw current chunk solid
-        if spotlight is not None:
-            spotlight.remove()
-        cq = q_candidates[t]
-        spotlight = ax.scatter(
-            [t] * len(cq),
-            cq,
-            s=6,
-            alpha=1.0,
-            c="steelblue",
-            linewidths=0,
-            zorder=5,
-        )
-
-        fig.canvas.draw()
         plot_buf = (
             np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
             .reshape(plot_h_px, plot_w_px, 4)[:, :, :3]
@@ -124,12 +135,12 @@ def make_planning_vis_video(
                     plot_buf, ((0, cam_h - ph), (0, 0), (0, 0)), constant_values=255
                 )
 
-        video_frames.append(np.concatenate([chunk_frames[t], plot_buf], axis=1))
+        video_frames.append(np.concatenate([cam_frame, plot_buf], axis=1))
 
     plt.close(fig)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(str(out_path), video_frames, fps=fps)
-    logger.info("Planning vis video saved: %s", out_path)
+    logger.info("Planning vis video saved: %s  (%d frames)", out_path, len(video_frames))
     return str(out_path)

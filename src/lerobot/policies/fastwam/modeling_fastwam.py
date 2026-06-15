@@ -221,6 +221,129 @@ class FastWAMPolicy(PreTrainedPolicy):
         # result["action"] shape: (n_samples, chunk_size, action_dim) float32 on CPU
         return result["action"]
 
+    @torch.no_grad()
+    def predict_n_action_chunks_partial(
+        self,
+        batch: dict[str, Tensor],
+        n_samples: int,
+        num_inference_steps: int = 10,
+        sigma_start: float = 1.0,
+        bc_mean: Tensor | None = None,  # (1, h, A); required when sigma_start < 1.0
+        context_noise_std: float = 0.0,
+    ) -> Tensor:                        # (n_samples, h, A) float32
+        """Partial denoising with optional per-sample context noise for diversity.
+
+        sigma_start (0-1): initial noise level.
+          1.0 = start from pure noise (standard diffusion);
+          0.5 = add half noise to bc_mean; runs T/2 steps.
+        bc_mean: anchor for partial denoising; ignored when sigma_start=1.0.
+
+        context_noise_std: std of per-sample Gaussian noise added to text/proprio
+          context features and video KV-cache values after expanding to N samples.
+          Each sample attends to a slightly different imagined context throughout the
+          entire denoising loop, forcing genuine trajectory divergence.
+        """
+        self.eval()
+        model = self.model
+        device = next(self.parameters()).device
+
+        batch_i = {k: v[0:1] for k, v in batch.items() if isinstance(v, Tensor)}
+        task_list = batch.get("task", None)
+        if task_list is not None:
+            batch_i["task"] = [task_list[0]]
+
+        image = self._prepare_image(batch_i)
+        proprio = self._get_proprio(batch_i)
+        task = batch_i.get("task", [""])[0] if batch_i.get("task") else ""
+        context, context_mask = model.encode_prompt(PROMPT_TEMPLATE.format(task=task))
+        if proprio is not None:
+            context, context_mask = model._append_proprio_to_context(context, context_mask, proprio)
+
+        first_frame_latents = model._encode_input_image_latents_tensor(image)
+        fuse_flag = bool(getattr(model.video_expert, "fuse_vae_embedding_in_latents", False))
+        timestep_video_zero = torch.zeros((1,), dtype=first_frame_latents.dtype, device=device)
+        video_pre = model.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video_zero,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+
+        # Derive action shape: use bc_mean if provided, else infer from model config.
+        if bc_mean is not None:
+            action_horizon, A = bc_mean.shape[1], bc_mean.shape[2]
+        else:
+            action_horizon = self.config.chunk_size
+            A = self.config.action_dim
+
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = model._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_horizon,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=device,
+        )
+        video_kv_cache = model.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={"context": video_pre["context"], "mask": video_pre["context_mask"]},
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        # Build full schedule and slice to sub-schedule starting at sigma_start.
+        all_timesteps, all_deltas = model.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps, device=device, dtype=model.torch_dtype,
+        )
+        T = float(model.infer_action_scheduler.num_train_timesteps)
+        t_threshold = sigma_start * T
+        mask = all_timesteps <= t_threshold
+        start_idx = int(mask.nonzero(as_tuple=True)[0][0]) if mask.any() else 0
+        sub_timesteps = all_timesteps[start_idx:]
+        sub_deltas = all_deltas[start_idx:]
+        actual_sigma = float(all_timesteps[start_idx]) / T if start_idx < len(all_timesteps) else 0.0
+
+        eps = torch.randn(n_samples, action_horizon, A, device=device, dtype=model.torch_dtype)
+        if bc_mean is not None and actual_sigma < 1.0:
+            x0 = bc_mean.to(dtype=model.torch_dtype, device=device)  # (1, h, A)
+            latents = (1.0 - actual_sigma) * x0 + actual_sigma * eps
+        else:
+            latents = eps  # pure noise when sigma_start=1.0 or no bc_mean
+
+        ctx_n = context.expand(n_samples, -1, -1).clone()
+        ctx_mask_n = context_mask.expand(n_samples, -1)
+        kv_cache_n = [
+            {"k": l["k"].expand(n_samples, -1, -1), "v": l["v"].expand(n_samples, -1, -1).clone()}
+            for l in video_kv_cache
+        ]
+
+        # Per-sample context noise: each of the N samples attends to a slightly
+        # different imagined context throughout every denoising step, breaking the
+        # deterministic ODE's tendency to collapse all trajectories to the same mean.
+        if context_noise_std > 0:
+            ctx_n = ctx_n + torch.randn_like(ctx_n) * context_noise_std
+            kv_cache_n = [
+                {"k": l["k"], "v": l["v"] + torch.randn_like(l["v"]) * context_noise_std}
+                for l in kv_cache_n
+            ]
+
+        for step_t, step_delta in zip(sub_timesteps, sub_deltas):
+            timestep_action = step_t.unsqueeze(0).to(dtype=latents.dtype, device=device)
+            pred_v = model._predict_action_noise_with_cache(
+                latents_action=latents,
+                timestep_action=timestep_action,
+                context=ctx_n,
+                context_mask=ctx_mask_n,
+                video_kv_cache=kv_cache_n,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            latents = model.infer_action_scheduler.step(pred_v, step_delta, latents)
+
+        return latents.detach().float()  # (n_samples, h, A)
+
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the next action (B, action_dim) from the action queue.
 
@@ -233,6 +356,13 @@ class FastWAMPolicy(PreTrainedPolicy):
             else:
                 chunk = self.predict_action_chunk(batch)  # (B, chunk_size, action_dim) on CPU
             self._queue.extend(chunk[:, : self.config.n_action_steps].transpose(0, 1))
+        elif self._planner is not None and hasattr(self._planner, "record_step"):
+            # Intermediate step — record frame so the vis video has full temporal resolution.
+            from lerobot.policies.fastwam.planning_vis import _obs_frame_to_uint8
+            from lerobot.utils.constants import OBS_IMAGES
+            cam_key = f"{OBS_IMAGES}.image"
+            if cam_key in batch:
+                self._planner.record_step(_obs_frame_to_uint8(batch[cam_key]))
         return self._queue.popleft()  # (B, action_dim)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:

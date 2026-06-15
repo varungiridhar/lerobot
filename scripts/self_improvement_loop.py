@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Redirect HuggingFace cache away from the 20 GB home-dir quota.
+os.environ.setdefault("HF_HOME", "/storage/project/r-agarg35-0/shared/huggingface_cache")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,17 +52,17 @@ def _run_episode(
     preprocessor,
     postprocessor,
     seed: int | None = None,
-) -> dict | None:
-    """Run one episode and return a data dict if successful, else None.
+) -> dict:
+    """Run one episode and return a data dict regardless of success.
 
-    Returns dict with keys: action (T,A), observation.images.image (T,3,H,W),
-    observation.images.image2 (T,3,H,W), next.success (T,), task (str).
+    Returns dict with keys: action (T,A), observation.images.* (T,3,H,W),
+    next.success (T,), success (bool), task (str).
     """
     from copy import deepcopy
 
     import numpy as np
     from lerobot.envs.utils import add_envs_task, preprocess_observation
-    from lerobot.utils.constants import ACTION, DONE
+    from lerobot.utils.constants import ACTION
 
     policy.reset()
     observation, info = env.reset(seed=[seed] if seed is not None else None)
@@ -104,14 +106,10 @@ def _run_episode(
         step += 1
 
     ep_success = any(all_successes)
-
-    if not ep_success:
-        return None
-
     T = len(all_actions)
     action_tensor = torch.cat(all_actions, dim=0)  # (T, A)
 
-    ep_dict: dict = {"action": action_tensor, "task": ""}
+    ep_dict: dict = {"action": action_tensor, "task": "", "success": ep_success}
 
     # Stack images for each camera key.
     cam_keys = set()
@@ -142,48 +140,50 @@ def collect_episodes(
     n_episodes: int,
     episodes_dir: Path,
     start_seed: int = 0,
-) -> tuple[list[Path], float]:
-    """Run episodes across all task envs and save successful ones.
+) -> float:
+    """Run episodes across all task envs and save them as a LeRobotDataset.
 
-    Distributes n_episodes evenly across tasks. Returns (saved .pt files, success rate).
+    Distributes n_episodes evenly across tasks. Saves to episodes_dir in LeRobot
+    format (parquet + PNG images) for lazy per-frame loading. Returns success rate.
     """
+    from lerobot.policies.q_function.online_dataset import save_episodes_lerobot
+
     task_envs = [(tg, tid, env) for tg, group in envs.items() for tid, env in group.items()]
     n_tasks = len(task_envs)
     eps_per_task = max(1, n_episodes // n_tasks)
 
     log.info(f"Collecting {n_episodes} episodes across {n_tasks} task envs ({eps_per_task} per task) ...")
-    episodes_dir.mkdir(parents=True, exist_ok=True)
 
-    all_files: list[Path] = []
+    all_episode_dicts: list[dict] = []
     all_successes: list[bool] = []
     total_eps = 0
-    file_idx = 0
 
     for tg, tid, env in task_envs:
         if total_eps >= n_episodes:
             break
         task_success = 0
-        for ep_i in range(eps_per_task):
+        for _ep_i in range(eps_per_task):
             seed = start_seed + total_eps
             ep_dict = _run_episode(
                 env=env, policy=policy,
                 env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
                 preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
             )
-            success = ep_dict is not None
+            success = ep_dict["success"]
             all_successes.append(success)
+            all_episode_dicts.append(ep_dict)
             total_eps += 1
             if success:
-                path = episodes_dir / f"ep_{file_idx:04d}.pt"
-                torch.save(ep_dict, str(path))
-                all_files.append(path)
-                file_idx += 1
                 task_success += 1
         log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
 
-    pc_success = 100.0 * sum(all_successes) / max(len(all_successes), 1)
-    log.info(f"  Total: {len(all_files)} successful eps, overall success={pc_success:.1f}%")
-    return all_files, pc_success
+    action_dim = int(all_episode_dicts[0]["action"].shape[1]) if all_episode_dicts else 7
+    save_episodes_lerobot(all_episode_dicts, episodes_dir, action_dim=action_dim)
+
+    n_success = sum(all_successes)
+    pc_success = 100.0 * n_success / max(len(all_successes), 1)
+    log.info(f"  Total: {len(all_episode_dicts)} episodes ({n_success} success, {len(all_successes)-n_success} failure), success={pc_success:.1f}%")
+    return pc_success
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,10 +252,17 @@ def finetune_q(
     online_fraction: float,
     device: torch.device,
     ckpt_dir: Path,
-) -> Path:
+    original_q_ckpt_path: str = "",
+    grad_clip_norm: float = 10.0,
+    global_step: int = 0,
+    use_wandb: bool = False,
+) -> tuple[Path, float, int]:
     """Fine-tune Q on 50/50 mix of original + online data.
 
-    Returns the path to the saved checkpoint directory.
+    Backbone LR is scaled by the same ratio used during original training
+    (optimizer_lr_backbone / optimizer_lr), applied to the fine-tune LR.
+
+    Returns (checkpoint_dir, mean_loss, updated_global_step).
     """
     from torch.optim import AdamW
 
@@ -263,7 +270,7 @@ def finetune_q(
 
     n_orig = len(original_q_dataset)
     n_online = len(online_dataset)
-    log.info(f"Fine-tuning Q: {n_orig} orig + {n_online} online frames, {steps} steps")
+    log.info(f"Fine-tuning Q: {n_orig} orig + {n_online} online frames, {steps} steps, lr={lr:.2e}")
 
     combined = ConcatDataset([original_q_dataset, online_dataset])
 
@@ -281,9 +288,20 @@ def finetune_q(
         filtered = [{k: v for k, v in item.items() if k in online_keys} for item in batch]
         return default_collate(filtered)
 
-    loader = DataLoader(combined, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=2, pin_memory=True, collate_fn=collate_shared_keys)
+    loader = DataLoader(combined, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=4, pin_memory=True, collate_fn=collate_shared_keys)
 
-    optimizer = AdamW(q_policy.get_optim_params(), lr=lr, weight_decay=1e-4)
+    # Build param groups preserving the backbone:head LR ratio from original training.
+    # During training: head=optimizer_lr, backbone=optimizer_lr_backbone.
+    # get_optim_params() returns [{head_params}, {backbone_params, lr=cfg.optimizer_lr_backbone}].
+    # Without explicit override, AdamW uses the top-level lr for the head but the hardcoded
+    # cfg.optimizer_lr_backbone (e.g. 9e-5) for the backbone — making backbone 9x faster than
+    # the head at lr=1e-5. Fix: scale both groups by the same factor relative to training LRs.
+    q_cfg = q_policy.config
+    backbone_ratio = q_cfg.optimizer_lr_backbone / q_cfg.optimizer_lr
+    param_groups = q_policy.get_optim_params()
+    param_groups[0]["lr"] = lr                       # head
+    param_groups[1]["lr"] = lr * backbone_ratio       # backbone at same ratio as training (0.3x)
+    optimizer = AdamW(param_groups, weight_decay=1e-4)
 
     losses = []
     data_iter = iter(loader)
@@ -300,23 +318,40 @@ def finetune_q(
         optimizer.zero_grad()
         loss, loss_dict = q_policy.forward(batch)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(q_policy.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(q_policy.parameters(), grad_clip_norm)
         optimizer.step()
         q_policy.update()  # Polyak update target network
 
-        losses.append(loss_dict["td_ce_loss"])
+        step_loss = loss_dict["td_ce_loss"]
+        losses.append(step_loss)
+        global_step += 1
+
         if (step + 1) % 10 == 0:
             recent = sum(losses[-10:]) / 10
-            log.info(f"  step {step+1}/{steps}  loss={recent:.4f}")
+            log.info(f"  step {step+1}/{steps}  loss={recent:.4f}  grad_norm={grad_norm:.3f}")
+            if use_wandb:
+                import wandb
+                wandb.log(
+                    {"finetune/loss": recent, "finetune/grad_norm": float(grad_norm), "finetune/lr": lr},
+                    step=global_step,
+                )
 
     q_policy.eval()
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     q_policy.save_pretrained(str(ckpt_dir))
+
+    # Copy preprocessor/postprocessor files from the source Q checkpoint so the
+    # saved checkpoint is self-contained and can be loaded by from_checkpoints().
+    import shutil
+    for fname in Path(original_q_ckpt_path).glob("policy_pre*"):
+        shutil.copy2(fname, ckpt_dir / fname.name)
+    for fname in Path(original_q_ckpt_path).glob("policy_post*"):
+        shutil.copy2(fname, ckpt_dir / fname.name)
     log.info(f"  Saved Q checkpoint to {ckpt_dir}")
 
     mean_loss = sum(losses) / len(losses) if losses else float("nan")
-    return ckpt_dir, mean_loss
+    return ckpt_dir, mean_loss, global_step
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +404,8 @@ def _setup_policy_and_env(args, device: torch.device):
     )
     if args.diffusion_steps:
         planning_cfg.num_diffusion_steps = args.diffusion_steps
+    if args.noise_smooth_sigma_t is not None:
+        planning_cfg.noise_smooth_sigma_t = args.noise_smooth_sigma_t
 
     planner = FastWAMPlanner.from_checkpoints(
         cfg=planning_cfg,
@@ -394,7 +431,21 @@ def self_improvement_loop(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "loop_summary.jsonl"
 
-    # Set up FastWAM + env + preprocessors
+    # ── Wandb ────────────────────────────────────────────────────────────────
+    use_wandb = bool(args.wandb_project)
+    if use_wandb:
+        import wandb as _wandb
+        run_name = args.wandb_run_name or f"{output_dir.name}"
+        _wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=run_name,
+            config=vars(args),
+            dir=str(output_dir),
+        )
+        log.info(f"wandb run: {_wandb.run.get_url()}")
+
+    # ── Set up FastWAM + env + preprocessors ─────────────────────────────────
     policy, planner, envs, preprocessor, postprocessor, env_preprocessor, env_postprocessor = (
         _setup_policy_and_env(args, device)
     )
@@ -412,17 +463,19 @@ def self_improvement_loop(args):
         q_policy=q_policy,
     )
 
-    start_seed = args.seed
+    start_seed = args.seed + args.start_iteration * args.n_episodes
+    global_step = args.start_iteration * args.finetune_steps
 
-    for iteration in range(args.n_iterations):
+    for i in range(args.n_iterations):
+        iteration = args.start_iteration + i
         log.info(f"\n{'='*60}\nIteration {iteration}\n{'='*60}")
         iter_dir = output_dir / f"iter_{iteration:03d}"
         iter_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
 
         # ── 1. Collect episodes ──────────────────────────────────────────────
-        episodes_dir = iter_dir / "episodes"
-        episode_files, pc_success = collect_episodes(
+        episodes_dir = iter_dir / "online_episodes"
+        pc_success = collect_episodes(
             policy=policy,
             envs=envs,
             env_preprocessor=env_preprocessor,
@@ -435,40 +488,21 @@ def self_improvement_loop(args):
         )
         start_seed += args.n_episodes
 
-        if not episode_files:
-            log.warning("No successful episodes collected — skipping fine-tuning this iteration.")
-            metrics = {
-                "iteration": iteration,
-                "n_collected": 0,
-                "pc_success": pc_success,
-                "finetune_loss": None,
-                "elapsed_s": time.time() - t0,
-            }
-            with open(summary_path, "a") as f:
-                f.write(json.dumps(metrics) + "\n")
-            continue
-
-        # ── 2. Build online dataset ──────────────────────────────────────────
+        # ── 2. Build online dataset (growing buffer across all iterations) ──────
         from lerobot.policies.q_function.online_dataset import OnlineQDataset
 
-        # Q was trained on images at the dataset's native resolution (e.g. 256×256).
-        # Rollout images are at the env resolution (e.g. 224×224). Upsample to match
-        # the original training dataset so the Q preprocessor normalizes consistently.
         q_cfg = q_policy.config
-        orig_ds_sample = original_q_ds[0]
-        orig_img_size = orig_ds_sample[list(q_cfg.camera_keys)[0]].shape[-1]  # e.g. 256
         online_ds = OnlineQDataset(
-            episode_files=episode_files,
+            output_dir=output_dir,
             h=int(q_cfg.h),
             terminal_bonus=1.0,
             camera_keys=tuple(q_cfg.camera_keys),
-            target_image_size=orig_img_size,
         )
-        log.info(f"Online dataset: {len(online_ds)} frames from {len(episode_files)} episodes.")
+        log.info(f"Online dataset: {len(online_ds)} frames across {iteration + 1} iterations.")
 
         # ── 3. Fine-tune Q ───────────────────────────────────────────────────
         ckpt_dir = iter_dir / "q_checkpoint"
-        _, mean_loss = finetune_q(
+        _, mean_loss, global_step = finetune_q(
             q_policy=q_policy,
             q_pre_train=q_pre_train,
             original_q_dataset=original_q_ds,
@@ -479,16 +513,68 @@ def self_improvement_loop(args):
             online_fraction=args.online_fraction,
             device=device,
             ckpt_dir=ckpt_dir,
+            original_q_ckpt_path=args.q_ckpt,
+            grad_clip_norm=args.grad_clip_norm,
+            global_step=global_step,
+            use_wandb=use_wandb,
         )
 
         # ── 4. Q weights updated in-place — planner.ctx.q_policy is already updated ──
         log.info("Q weights updated in-place (planner will use new weights on next call).")
 
+        # ── 5. Eval with video clips ─────────────────────────────────────────
+        eval_pc_success = None
+        if args.eval_n_episodes > 0:
+            from lerobot.scripts.lerobot_eval import eval_policy_all
+
+            log.info(f"Running eval ({args.eval_n_episodes} episodes) for clips ...")
+            videos_dir = iter_dir / "eval_videos"
+            with torch.no_grad():
+                eval_info = eval_policy_all(
+                    envs=envs,
+                    policy=policy,
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    n_episodes=args.eval_n_episodes,
+                    max_episodes_rendered=min(args.eval_n_episodes, 4),
+                    videos_dir=videos_dir,
+                    start_seed=args.seed + 100_000 + iteration * 1000,
+                )
+            overall = eval_info["overall"]
+            eval_pc_success = overall.get("pc_success", None)
+            log.info(f"  Eval: pc_success={eval_pc_success:.1f}%")
+
+            if use_wandb:
+                import wandb as _wandb
+                log_dict = {
+                    "collect/pc_success": pc_success,
+                    "collect/n_collected": args.n_episodes,
+                    "finetune/mean_loss": mean_loss,
+                    "eval/pc_success": eval_pc_success,
+                }
+                if "avg_sum_reward" in overall:
+                    log_dict["eval/avg_sum_reward"] = overall["avg_sum_reward"]
+                _wandb.log(log_dict, step=global_step)
+                for vp in overall.get("video_paths", [])[:2]:
+                    try:
+                        _wandb.log({"eval/video": _wandb.Video(vp, fps=10, format="mp4")}, step=global_step)
+                    except Exception as e:
+                        log.warning(f"Failed to log video {vp}: {e}")
+        elif use_wandb:
+            import wandb as _wandb
+            _wandb.log(
+                {"collect/pc_success": pc_success, "collect/n_collected": args.n_episodes, "finetune/mean_loss": mean_loss},
+                step=global_step,
+            )
+
         metrics = {
             "iteration": iteration,
-            "n_collected": len(episode_files),
+            "n_collected": args.n_episodes,
             "n_online_frames": len(online_ds),
             "pc_success": pc_success,
+            "eval_pc_success": eval_pc_success,
             "finetune_loss": mean_loss,
             "elapsed_s": time.time() - t0,
         }
@@ -496,7 +582,14 @@ def self_improvement_loop(args):
             f.write(json.dumps(metrics) + "\n")
 
         (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-        log.info(f"Iteration {iteration} done: loss={mean_loss:.4f}, elapsed={metrics['elapsed_s']:.1f}s")
+        log.info(
+            f"Iteration {iteration} done: collect={pc_success:.1f}% eval={eval_pc_success} "
+            f"loss={mean_loss:.4f} elapsed={metrics['elapsed_s']:.1f}s"
+        )
+
+    if use_wandb:
+        import wandb as _wandb
+        _wandb.finish()
 
     log.info(f"\nSelf-improvement loop complete. Summary: {summary_path}")
 
@@ -516,14 +609,28 @@ def parse_args():
     p.add_argument("--n_episodes", type=int, default=20)
     p.add_argument("--finetune_steps", type=int, default=200)
     p.add_argument("--finetune_lr", type=float, default=1e-5)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=48)
     p.add_argument("--online_fraction", type=float, default=0.5)
+    p.add_argument("--grad_clip_norm", type=float, default=10.0)
     p.add_argument("--planner_type", default="bc_diffusion_mppi")
     p.add_argument("--n_samples", type=int, default=16)
     p.add_argument("--n_elites", type=int, default=16)
+    p.add_argument("--noise_smooth_sigma_t", type=float, default=None)
     p.add_argument("--diffusion_steps", type=int, default=3)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--start_iteration", type=int, default=0,
+                   help="Iteration index to start from (for chained jobs). iter dirs are named iter_{start_iteration + i}.")
+    # eval
+    p.add_argument("--eval_n_episodes", type=int, default=5,
+                   help="Episodes to run for eval clips after each finetune (0 to skip).")
+    # wandb
+    p.add_argument("--wandb_project", default="",
+                   help="W&B project name. Leave empty to disable wandb.")
+    p.add_argument("--wandb_entity", default="",
+                   help="W&B entity (team/user). Defaults to your default entity.")
+    p.add_argument("--wandb_run_name", default="",
+                   help="W&B run name. Defaults to si_<task>_n<n_episodes>_s<finetune_steps>.")
     return p.parse_args()
 
 

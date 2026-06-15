@@ -1,22 +1,17 @@
-"""OnlineQDataset: wraps per-episode .pt files collected during eval rollouts.
+"""OnlineQDataset: growing-buffer online dataset for Q-function self-improvement.
 
-Produces the same __getitem__ format as QValueLabelDataset for use in
-self-improvement Q fine-tuning. Reward mode is always 'all_success': terminal
-frame gets q_reward=1.0, all others get 0.0.
+Episodes are saved in LeRobot format (parquet + PNG images) — one LeRobotDataset per
+iteration under iter_NNN/online_episodes/.  OnlineQDataset loads ALL past iteration
+datasets lazily: only metadata (episode boundaries, success flag) is read at
+construction time; images and actions are loaded per-frame on demand via
+LeRobotDataset.__getitem__, which reads individual PNG files.
 
-Episode .pt files must contain:
-    "observation.images.image":  (T, 3, H, W) float32 [0,1], NOT flipped
-    "observation.images.image2": (T, 3, H, W) float32 [0,1], NOT flipped (optional)
-    "action":                    (T, A) float32
-    "task":                      str
-    (other keys from _compile_episode_data are ignored)
+This avoids loading full episode tensors into RAM — the old .pt approach required
+~430 MB per episode × N episodes in the growing buffer, easily exceeding the
+64 GB/GPU SLURM limit.
 
-Images are flipped along H and W dims to match the LiberoProcessorStep convention
-used during original Q training (raw rollout obs are saved pre-flip).
-
-Images are also resized to (target_image_size, target_image_size) to match the
-original training dataset resolution (256×256 for LIBERO Q-function). The Q
-preprocessor will then resize them to the model's input resolution (224×224).
+Episode .pt files (legacy) are no longer read here; save_episodes_lerobot() in
+self_improvement_loop.py handles writing.
 """
 
 from __future__ import annotations
@@ -24,99 +19,201 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
-from torch import Tensor
 from torch.utils.data import Dataset
 
 
 _CAMERA_KEYS = ("observation.images.image", "observation.images.image2")
 
+# Image feature shape saved during collection: (H, W, C) uint8, env native resolution.
+ONLINE_IMAGE_SHAPE = (256, 256, 3)
+
+# Feature spec for LeRobotDataset.create() — must match save_episodes_lerobot().
+ONLINE_DATASET_FEATURES = {
+    "observation.images.image": {
+        "dtype": "image",
+        "shape": ONLINE_IMAGE_SHAPE,
+        "names": ["height", "width", "channel"],
+    },
+    "observation.images.image2": {
+        "dtype": "image",
+        "shape": ONLINE_IMAGE_SHAPE,
+        "names": ["height", "width", "channel"],
+    },
+    "action": {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": None,
+    },
+    "episode_success": {
+        "dtype": "bool",
+        "shape": (1,),
+        "names": None,
+    },
+}
+
+ONLINE_DATASET_FPS = 10.0
+ONLINE_DATASET_REPO_ID = "online_episodes"
+
+
+def save_episodes_lerobot(
+    episode_dicts: list[dict],
+    episodes_dir: Path,
+    action_dim: int = 7,
+    fps: float = ONLINE_DATASET_FPS,
+    camera_keys: tuple[str, ...] = _CAMERA_KEYS,
+) -> None:
+    """Save a list of episode dicts to a LeRobotDataset at episodes_dir.
+
+    episode_dicts must have keys produced by _run_episode():
+        "action":                    (T, A) float32 tensor
+        "observation.images.image":  (T, 3, H, W) float32 [0,1] tensor (unflipped)
+        "observation.images.image2": (T, 3, H, W) float32 [0,1] tensor (unflipped)
+        "task":                      str
+        "success":                   bool
+
+    Images are flipped along H and W before saving to match the LiberoProcessorStep
+    convention used by the Q-function preprocessor (same as offline training data).
+    """
+    import numpy as np
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    features = dict(ONLINE_DATASET_FEATURES)
+    features["action"]["shape"] = (action_dim,)
+
+    episodes_dir.parent.mkdir(parents=True, exist_ok=True)
+    ds = LeRobotDataset.create(
+        repo_id=ONLINE_DATASET_REPO_ID,
+        fps=fps,
+        features=features,
+        root=str(episodes_dir),
+        use_videos=False,
+    )
+
+    for ep in episode_dicts:
+        T = int(ep["action"].shape[0])
+        ep_success = bool(ep.get("success", False))
+        task_str = ep.get("task", "")
+
+        for t in range(T):
+            frame: dict = {
+                "task": task_str,
+                "action": ep["action"][t].numpy().astype(np.float32),
+                "episode_success": np.array([ep_success], dtype=bool),
+            }
+            for key in camera_keys:
+                if key in ep:
+                    img = ep[key][t]  # (3, H, W) float32 [0,1]
+                    img = torch.flip(img, dims=[1, 2])  # flip H, W to match offline convention
+                    target_h, target_w = ONLINE_IMAGE_SHAPE[:2]
+                    if img.shape[-2] != target_h or img.shape[-1] != target_w:
+                        import torch.nn.functional as F
+                        img = F.interpolate(img.unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(0)
+                    frame[key] = (img * 255).byte().permute(1, 2, 0).numpy()  # (H, W, C) uint8
+            ds.add_frame(frame)
+
+        ds.save_episode()
+
+    ds.finalize()
+
 
 class OnlineQDataset(Dataset):
-    """Wrap successful episode .pt files as a Q-function training dataset.
+    """Growing-buffer online Q-function dataset backed by per-iteration LeRobotDatasets.
+
+    At construction, globs output_dir for all iter_*/online_episodes/ directories and
+    loads them as LeRobotDataset instances (metadata only — no images in RAM).
+    __getitem__ loads individual frames on demand via LeRobotDataset.
 
     Args:
-        episode_files: Paths to .pt episode files produced by collect_episodes().
+        output_dir: Self-improvement run directory; globs iter_*/online_episodes/.
         h: Q-function horizon (same as QFunctionConfig.h).
-        terminal_bonus: Reward assigned at the last frame of each episode.
-        camera_keys: Image keys to include. Defaults to both LIBERO cameras.
-        target_image_size: Resize images to this square size to match the
-            original training dataset resolution before Q-preprocessor scaling.
-            None means no resize (use when env and dataset resolutions match).
+        fps: Dataset FPS — must match ONLINE_DATASET_FPS used at save time.
+        terminal_bonus: Reward at the terminal frame of successful episodes.
+        camera_keys: Image keys to include.
     """
 
     def __init__(
         self,
-        episode_files: list[Path],
+        output_dir: Path,
         h: int,
+        fps: float = ONLINE_DATASET_FPS,
         terminal_bonus: float = 1.0,
         camera_keys: tuple[str, ...] = _CAMERA_KEYS,
-        target_image_size: int | None = 256,
     ):
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
         self.h = h
+        self.fps = fps
         self.terminal_bonus = terminal_bonus
         self.camera_keys = camera_keys
-        self.target_image_size = target_image_size
 
-        self._episodes: list[dict] = []
-        self._index: list[tuple[int, int]] = []  # (episode_idx, frame_t)
+        delta_timestamps: dict[str, list[float]] = {k: [0.0, h / fps] for k in camera_keys}
+        delta_timestamps["action"] = [i / fps for i in range(2 * h)]
 
-        for path in episode_files:
-            ep = torch.load(str(path), map_location="cpu", weights_only=False)
-            ep_idx = len(self._episodes)
-            T = int(ep["action"].shape[0])
-            self._episodes.append(ep)
-            for t in range(T):
-                self._index.append((ep_idx, t))
+        ds_dirs = sorted(output_dir.glob("iter_*/online_episodes"))
+        if not ds_dirs:
+            raise ValueError(f"No iter_*/online_episodes dirs found under {output_dir}")
+
+        self._sub_datasets: list[LeRobotDataset] = []
+        # (ds_idx, local_frame_idx, frame_in_ep, ep_len)
+        self._index: list[tuple[int, int, int, int]] = []
+
+        for ds_dir in ds_dirs:
+            ds = LeRobotDataset(
+                repo_id=ONLINE_DATASET_REPO_ID,
+                root=str(ds_dir),          # dataset root = online_episodes/ dir itself
+                delta_timestamps=delta_timestamps,
+                force_cache_sync=False,    # never fetch from HF Hub
+            )
+            ds_idx = len(self._sub_datasets)
+            self._sub_datasets.append(ds)
+
+            eps_meta = ds.meta.episodes
+            for ep_i in range(len(eps_meta)):
+                ep = eps_meta[ep_i]
+                ep_from = int(ep["dataset_from_index"])
+                ep_len  = int(ep["length"])
+                for local_idx in range(ep_from, ep_from + ep_len):
+                    frame_in_ep = local_idx - ep_from
+                    self._index.append((ds_idx, local_idx, frame_in_ep, ep_len))
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict:
-        ep_idx, t = self._index[idx]
-        ep = self._episodes[ep_idx]
-        T = int(ep["action"].shape[0])
-        terminal_t = T - 1
-        h = self.h
+        ds_idx, local_idx, frame_in_ep, ep_len = self._index[idx]
+        item = self._sub_datasets[ds_idx][local_idx]
 
-        # Bootstrap obs at t+h, clamped to last in-episode frame.
-        t_boot = min(t + h, terminal_t)
+        h = self.h
+        terminal_t = ep_len - 1
+
+        # episode_success is (1,) bool tensor; constant for all frames in the episode.
+        ep_success = bool(item["episode_success"])
+        ep_terminal_bonus = self.terminal_bonus if ep_success else 0.0
+
         out: dict = {}
 
-        # ── Images: (2, 3, H, W) stacks at [t, t+h], flipped to match Q format ──
+        # Images: (2, 3, H, W) stacked by LeRobotDataset for delta_timestamps [0, h/fps]
         for key in self.camera_keys:
-            if key not in ep:
-                continue
-            imgs: Tensor = ep[key]  # (T, 3, H, W) unflipped
-            frame_t = torch.flip(imgs[t], dims=[1, 2])      # flip H, W
-            frame_boot = torch.flip(imgs[t_boot], dims=[1, 2])
-            if self.target_image_size is not None:
-                s = self.target_image_size
-                frame_t = F.interpolate(frame_t.unsqueeze(0), size=(s, s), mode="bilinear", align_corners=False).squeeze(0)
-                frame_boot = F.interpolate(frame_boot.unsqueeze(0), size=(s, s), mode="bilinear", align_corners=False).squeeze(0)
-            out[key] = torch.stack([frame_t, frame_boot], dim=0)  # (2, 3, H, W)
+            if key in item:
+                out[key] = item[key]
 
-        # ── Action window [t : t+2h] with end-of-episode padding ────────────
-        chunks = []
-        for i in range(2 * h):
-            ti = min(t + i, terminal_t)
-            chunks.append(ep["action"][ti])
-        out["action"] = torch.stack(chunks, dim=0)  # (2h, A)
+        # Actions: (2h, A) stacked by LeRobotDataset for delta_timestamps [0, ..., (2h-1)/fps]
+        out["action"] = item["action"]
 
-        # ── Task string ──────────────────────────────────────────────────────
-        out["task"] = ep.get("task", "")
+        # Task string
+        out["task"] = item.get("task", "")
 
-        # ── Reward labels (all_success mode) ────────────────────────────────
+        # Reward labels
         reward_chunk = torch.zeros(h, dtype=torch.float32)
         reward_pad = torch.zeros(h, dtype=torch.bool)
         for i in range(h):
-            f = t + i
-            if f < T:
-                reward_chunk[i] = self.terminal_bonus if f == terminal_t else 0.0
+            f = frame_in_ep + i
+            if f < ep_len:
+                reward_chunk[i] = ep_terminal_bonus if f == terminal_t else 0.0
             else:
                 reward_pad[i] = True
 
-        bootstrap_valid = (t + h) < (T - 1)
+        bootstrap_valid = (frame_in_ep + h) < (ep_len - 1)
 
         out["q_reward_chunk_first"] = reward_chunk
         out["q_reward_pad_first"] = reward_pad

@@ -121,6 +121,11 @@ class FastWAMPlanner:
         """Return and remove the oldest completed episode's vis data."""
         return self._completed_episodes.pop(0) if self._completed_episodes else None
 
+    def record_step(self, frame: "np.ndarray") -> None:
+        """Append an intermediate env-step frame to the current chunk's step_frames list."""
+        if self._vis_chunks:
+            self._vis_chunks[-1]["step_frames"].append(frame)
+
     @torch.no_grad()
     def plan(self, bc_policy: "FastWAMPolicy", batch: dict[str, Tensor]) -> Tensor:
         """Return planned chunk ``(1, h, A)`` in FastWAM-normalized space."""
@@ -154,7 +159,8 @@ class FastWAMPlanner:
                 q_sel = float((weights * topk_q).sum())
             else:
                 q_sel = float(q_np.max())
-            chunk_data = {"frame": frame, "q_candidates": q_np, "q_selected": q_sel}
+            step_frames = [frame] if frame is not None else []
+            chunk_data = {"frame": frame, "step_frames": step_frames, "q_candidates": q_np, "q_selected": q_sel}
             # Store action trajectories for bc_diffusion planners (used by trajectory vis)
             if action_candidates is not None:
                 chunk_data["action_candidates"] = action_candidates.cpu().float().numpy()
@@ -194,10 +200,20 @@ def plan_chunk_fastwam(
         # Sample N diverse chunks via N independent diffusion runs.
         # Image/text encoding happens ONCE; only the denoising loop is repeated per sample.
         # cfg.num_diffusion_steps overrides policy.num_inference_steps — fewer steps = more diversity.
-        candidates = bc_policy.predict_n_action_chunks(
-            batch, N, num_inference_steps=cfg.num_diffusion_steps
-        ).to(device=device)
+        context_noise_std = getattr(cfg, "context_noise_std", 0.0)
+        if context_noise_std > 0:
+            steps = cfg.num_diffusion_steps if cfg.num_diffusion_steps is not None else 10
+            candidates = bc_policy.predict_n_action_chunks_partial(
+                batch, N, num_inference_steps=steps, sigma_start=1.0,
+                context_noise_std=context_noise_std,
+            ).to(device=device)
+        else:
+            candidates = bc_policy.predict_n_action_chunks(
+                batch, N, num_inference_steps=cfg.num_diffusion_steps
+            ).to(device=device)
         # (N, h, A) in FastWAM-norm space — same normalization as bc_mean
+        if candidates.dim() == 2:  # model squeezes sample dim when N=1
+            candidates = candidates.unsqueeze(0)
 
         # Score all N candidates with Q; encode obs context once and reuse across all N.
         single_batch = {ACTION: candidates[:1], **img_feats}
