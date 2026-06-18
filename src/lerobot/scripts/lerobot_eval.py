@@ -452,10 +452,29 @@ def eval_policy(
                         t_vis = threading.Thread(
                             target=make_planning_vis_video,
                             args=(chunk_frames, q_candidates, q_selected, vis_path),
-                            kwargs={"v_min": v_min, "v_max": v_max},
+                            kwargs={"v_min": v_min, "v_max": v_max, "vis_chunks": vis_chunks, "fps": env.unwrapped.metadata.get("render_fps", 10)},
                         )
                         t_vis.start()
                         threads.append(t_vis)
+
+                        # Save raw planning data (Q values + action candidates) as NPZ.
+                        npz_path = videos_dir / f"eval_episode_{n_episodes_rendered}_planning_data.npz"
+                        _save_planning_data_npz(vis_chunks, npz_path)
+
+                        # Save XY trajectory plots for bc_diffusion planners.
+                        if any("action_candidates" in c for c in vis_chunks):
+                            from lerobot.policies.fastwam.planning_vis_trajectories import (
+                                plot_episode_trajectories,
+                            )
+                            traj_path = videos_dir / f"eval_episode_{n_episodes_rendered}_traj_vis.png"
+                            diff_steps = getattr(getattr(_planner, "cfg", None), "num_diffusion_steps", None)
+                            t_traj = threading.Thread(
+                                target=plot_episode_trajectories,
+                                args=(vis_chunks, traj_path),
+                                kwargs={"episode_idx": n_episodes_rendered, "diffusion_steps": diff_steps},
+                            )
+                            t_traj.start()
+                            threads.append(t_traj)
 
                 n_episodes_rendered += 1
 
@@ -505,6 +524,38 @@ def eval_policy(
         info["video_paths"] = video_paths
 
     return info
+
+
+def _save_planning_data_npz(vis_chunks: list[dict], out_path) -> None:
+    """Save Q values and action candidates from vis_chunks to NPZ for offline analysis.
+
+    Keys in the saved file:
+    - ``q_candidates``: object array of shape (n_chunks,), each element is (N,) float32
+    - ``q_selected``: (n_chunks,) float32 — Q of the selected action per chunk
+    - ``action_candidates``: object array (n_chunks,), each (N, h, A) if available else None
+    - ``action_selected``: object array (n_chunks,), each (h, A) if available else None
+    """
+    import numpy as np
+    n = len(vis_chunks)
+    q_cands = np.empty(n, dtype=object)
+    q_sel = np.zeros(n, dtype=np.float32)
+    act_cands = np.empty(n, dtype=object)
+    act_sel = np.empty(n, dtype=object)
+    has_actions = False
+    for i, c in enumerate(vis_chunks):
+        q_cands[i] = c["q_candidates"].astype(np.float32)
+        q_sel[i] = float(c["q_selected"])
+        if "action_candidates" in c:
+            act_cands[i] = c["action_candidates"].astype(np.float32)
+            act_sel[i] = c["action_selected"].astype(np.float32)
+            has_actions = True
+    save_dict = {"q_candidates": q_cands, "q_selected": q_sel}
+    if has_actions:
+        save_dict["action_candidates"] = act_cands
+        save_dict["action_selected"] = act_sel
+    from pathlib import Path
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(out_path), **save_dict)
 
 
 def _compile_episode_data(

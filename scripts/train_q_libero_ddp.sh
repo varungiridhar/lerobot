@@ -3,32 +3,68 @@
 #SBATCH -N1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem-per-gpu=64G
-#SBATCH -q embers
+#SBATCH -q inferno
 #SBATCH -t 8:00:00
-#SBATCH --gres=gpu:h200:4
+#SBATCH --gres=gpu:h200:2
 #SBATCH -p gpu-h200
 #SBATCH -o logs/%j.out
 #SBATCH -e logs/%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=vgiridhar6@gatech.edu
 
-# Activate conda environment
-source /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/miniconda3/etc/profile.d/conda.sh
-conda activate lerobot
+# Q-function DDP training on H200 (2 GPUs, bsz=48).
+#
+# Two dataset modes controlled by USE_PLAY (default: false):
+#   false — BC only: HuggingFaceVLA/libero (q5 bucket, terminal bonus 1.0)
+#   true  — BC + play: adds 4 LIBERO play splits (play bucket, terminal bonus 0.0)
+#
+# Submit from repo root with ./logs/ present (mkdir -p logs):
+#   sbatch scripts/train_q_libero_ddp.sh                        # BC only
+#   sbatch --export=ALL,USE_PLAY=true scripts/train_q_libero_ddp.sh  # BC + play
+#
+# Resume from a checkpoint:
+#   sbatch --export=ALL,RESUME_CKPT=/path/to/checkpoint scripts/train_q_libero_ddp.sh
+
+USE_PLAY=${USE_PLAY:-false}
+RESUME_CKPT=${RESUME_CKPT:-}
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-lerobot-q}"
 
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
-# Redirect ALL HuggingFace caches (hub/models, datasets, tokenizers) away from the 20GB-capped home dir
-export HF_HOME=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/.cache/huggingface
 
-cd /storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/lerobot
+export WANDB_DIR="$HOME/scratch/wandb"
+export WANDB_CACHE_DIR="$HOME/scratch/wandb/cache"
+export WANDB_ARTIFACT_DIR="$HOME/scratch/wandb/artifacts"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR"
 
-DATA_ROOT="/storage/home/hcoda1/7/igeorgiev3/shared/lerobot-data-2"
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}" || exit 1
 
-accelerate launch \
-    --num_processes=4 \
+MASTER_PORT=$(( 20000 + ${SLURM_JOB_ID:-$RANDOM} % 10000 ))
+echo "master port: ${MASTER_PORT}"
+
+source scripts/hang_watchdog.sh
+
+if [ "$USE_PLAY" = "true" ]; then
+    JOB_NAME=qf_libero_ddp2_bsz48_bc_plus_play_h200
+    REPO_IDS='[HuggingFaceVLA/libero,VarunGiridhar3/libero40_libero_object_play,VarunGiridhar3/libero40_libero_10_play,VarunGiridhar3/libero40_libero_goal_play,VarunGiridhar3/libero40_libero_spatial_play]'
+    TERMINAL_BONUSES='{q5: 1.0, play: 0.0}'
+    BUCKET_OVERRIDES='{HuggingFaceVLA/libero: q5, VarunGiridhar3/libero40_libero_object_play: play, VarunGiridhar3/libero40_libero_10_play: play, VarunGiridhar3/libero40_libero_goal_play: play, VarunGiridhar3/libero40_libero_spatial_play: play}'
+else
+    JOB_NAME=qf_libero_ddp2_bsz48_bc_h200
+    REPO_IDS='[HuggingFaceVLA/libero]'
+    TERMINAL_BONUSES='{q5: 1.0}'
+    BUCKET_OVERRIDES='{HuggingFaceVLA/libero: q5}'
+fi
+
+run_with_hang_watchdog accelerate launch \
+    --num_processes=2 \
     --mixed_precision=bf16 \
     --multi_gpu \
+    --main_process_port=${MASTER_PORT} \
     $(which lerobot-train) \
-    --job_name=qf_libero_ddp4_bsz16 \
+    --job_name=${JOB_NAME} \
     --policy.type=q_function \
     --policy.push_to_hub=false \
     --policy.dino_model_name=facebook/dinov2-large \
@@ -38,9 +74,10 @@ accelerate launch \
     --policy.n_decoder_layers=18 \
     --policy.image_resize_h=224 \
     --policy.image_resize_w=224 \
-    --policy.reward_mode=all_success \
-    --policy.terminal_bonus_uniform=1.0 \
+    --policy.reward_mode=sparse \
     --policy.step_reward=0.0 \
+    --policy.terminal_bonuses="${TERMINAL_BONUSES}" \
+    --policy.bucket_overrides="${BUCKET_OVERRIDES}" \
     --policy.v_min=-0.01 \
     --policy.v_max=1.01 \
     --policy.hl_gauss_sigma=0.0075 \
@@ -50,21 +87,27 @@ accelerate launch \
     --policy.h=32 \
     --policy.gamma=0.99 \
     --policy.target_tau=0.005 \
-    --policy.optimizer_lr=1.4e-4 \
-    --policy.optimizer_lr_backbone=4.2e-5 \
+    --policy.optimizer_lr=3e-4 \
+    --policy.optimizer_lr_backbone=9e-5 \
     --policy.optimizer_weight_decay=1e-4 \
     --policy.lr_scheduler=cosine_decay_with_warmup \
-    --policy.lr_warmup_steps=5000 \
-    --policy.lr_decay_steps=100000 \
+    --policy.lr_warmup_steps=2000 \
+    --policy.lr_decay_steps=40000 \
     --policy.lr_decay_min=1e-6 \
-    --dataset.repo_id=HuggingFaceVLA/libero \
-    --dataset.root="${DATA_ROOT}/HuggingFaceVLA/libero" \
-    --batch_size=16 \
-    --steps=100000 \
+    --dataset.repo_ids="${REPO_IDS}" \
+    --dataset.root="$HOME/scratch/hf_cache/lerobot" \
+    --batch_size=48 \
+    --steps=40000 \
     --log_freq=50 \
-    --save_freq=10000 \
-    --eval_freq=0 \
+    --save_freq=1000 \
+    --eval_freq=2000 \
+    --test_split_ratio=0.1 \
+    --test_freq=50 \
+    --test_n_batches=1 \
     --num_workers=6 \
     --cudnn_deterministic=false \
+    ${RESUME_CKPT:+--resume_ckpt="${RESUME_CKPT}"} \
     --wandb.enable=true \
-    --wandb.project=awm
+    --wandb.project=awm \
+    --wandb.disable_artifact=true
+exit $?

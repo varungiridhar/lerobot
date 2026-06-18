@@ -918,6 +918,7 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        num_samples: int = 1,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -950,12 +951,6 @@ class FastWAM(torch.nn.Module):
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -1006,7 +1001,7 @@ class FastWAM(torch.nn.Module):
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
-            action_seq_len=latents_action.shape[1],
+            action_seq_len=action_horizon,
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
         )
@@ -1021,30 +1016,57 @@ class FastWAM(torch.nn.Module):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
+        # Build the denoising schedule once; reuse across all num_samples runs.
+        # Use float32 dtype placeholder for schedule build (dtype doesn't affect schedule values).
+        _sched_dtype = self.torch_dtype
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
-            dtype=latents_action.dtype,
+            dtype=_sched_dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = self._predict_action_noise_with_cache(
+        # Batched denoising: all num_samples run in a single forward pass per step.
+        # KV cache (built once from video/text) is expanded from B=1 to B=num_samples via
+        # .expand() — no memory copy, just a strided view. Action tokens are tiny (~20×7)
+        # so the batch dimension is essentially free on VRAM.
+        _gen = generator if num_samples == 1 else None
+        latents_action = torch.randn(
+            (num_samples, action_horizon, self.action_expert.action_dim),
+            generator=_gen,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        # Expand context and KV cache to batch=num_samples (strided views, no copy).
+        ctx_n = context.expand(num_samples, -1, -1)
+        ctx_mask_n = context_mask.expand(num_samples, -1)
+        # KV cache tensors are (1, Sv, H*Dh) — expand to (N, Sv, H*Dh) via strided view.
+        kv_cache_n = [
+            {
+                "k": layer["k"].expand(num_samples, -1, -1),
+                "v": layer["v"].expand(num_samples, -1, -1),
+            }
+            for layer in video_kv_cache
+        ]
+
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            # timestep_action shape (1,) — pre_dit auto-expands to (num_samples,) when B>1.
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            pred_action = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
-                video_kv_cache=video_kv_cache,
+                context=ctx_n,
+                context_mask=ctx_mask_n,
+                video_kv_cache=kv_cache_n,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
             )
-            pred_action = pred_action_posi
-
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+        stacked = latents_action.detach().to(dtype=torch.float32)  # (num_samples, h, A)
         return {
-            "action": latents_action[0].detach().to(dtype=torch.float32),
+            "action": stacked[0] if num_samples == 1 else stacked,
         }
 
     @torch.no_grad()

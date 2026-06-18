@@ -178,6 +178,8 @@ robotwin = [
     "numpy>=1.26.4,<2.0",  # RoboTwin's SAPIEN sim stack predates numpy 2
     "h5py>=3.10",
     "scipy>=1.10",
+    "warp-lang==1.12.1",  # RoboTwin: curobo motion planner GPU backend; 1.13+ dropped warp.torch API
+    "yourdfpy",  # RoboTwin: curobo dependency for URDF parsing
 ]
 
 # All
