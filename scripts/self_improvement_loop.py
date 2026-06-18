@@ -328,13 +328,26 @@ def finetune_q(
 
         if (step + 1) % 10 == 0:
             recent = sum(losses[-10:]) / 10
-            log.info(f"  step {step+1}/{steps}  loss={recent:.4f}  grad_norm={grad_norm:.3f}")
+            # Surface the negatives signal so L0/L1/L2 are attributable: margin_loss
+            # (0 when negatives off) + per-negative rank accuracy from the forward.
+            margin = loss_dict.get("margin_loss", 0.0)
+            rank_bits = " ".join(
+                f"{k.split('/')[0].replace('neg_','')}={v:.2f}"
+                for k, v in loss_dict.items() if k.startswith("neg_") and k.endswith("/rank_acc")
+            )
+            log.info(
+                f"  step {step+1}/{steps}  td_ce={recent:.4f}  margin={margin:.4f}  "
+                f"grad_norm={grad_norm:.3f}  {rank_bits}"
+            )
             if use_wandb:
                 import wandb
-                wandb.log(
-                    {"finetune/loss": recent, "finetune/grad_norm": float(grad_norm), "finetune/lr": lr},
-                    step=global_step,
-                )
+                wlog = {"finetune/loss": recent, "finetune/grad_norm": float(grad_norm), "finetune/lr": lr}
+                # Pass through all scalar diagnostics from the forward (margin_loss,
+                # neg_*/q_mean, neg_*/rank_acc, bucket_*/...) under finetune/.
+                for k, v in loss_dict.items():
+                    if isinstance(v, (int, float)):
+                        wlog[f"finetune/{k}"] = float(v)
+                wandb.log(wlog, step=global_step)
 
     q_policy.eval()
 
