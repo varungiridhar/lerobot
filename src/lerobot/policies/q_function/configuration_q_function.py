@@ -154,6 +154,40 @@ class QFunctionConfig(PreTrainedConfig):
     bucket_overrides: dict[str, str] = field(default_factory=dict)
     max_ep_length_hint: int = 250
 
+    # ── Synthetic negatives / ranking-margin auxiliary loss ───────────────
+    # When neg_margin_weight > 0, the training forward builds batch-internal
+    # negative chunks for demo-bucket samples and adds
+    #   λ · mean(relu(δ + Q(s, a_neg) − Q(s, a_true)))
+    # to the TD loss. Negatives reuse the already-encoded obs context, so the
+    # extra cost is decoder-only. Motivated by the Stage-0 probe finding that
+    # the Q ranks a wrong-episode expert chunk at chance (AUROC ≈ 0.5): the
+    # margin supervises exactly the ordering MPPI consumes, without asserting
+    # fabricated absolute values for mildly-perturbed (recoverable) chunks.
+    neg_margin_weight: float = 0.0
+    neg_margin_delta: float = 0.1
+    # "Tube" negatives: smoothed Gaussian siblings of the true chunk at these
+    # σ-scales. Noise is drawn in the NORMALIZED action space, so a scale of
+    # 1.0 ≙ one per-dim std of the training data — per-dim calibrated for free.
+    # The gripper dim is held at its true value (binary; noise is meaningless).
+    neg_tube_sigmas: tuple[float, ...] = (1.0, 2.0)
+    neg_tube_smooth_sigma_t: float = 2.0   # temporal smoothing ≙ the MPPI planner's
+    neg_use_swap: bool = True       # wrong-chunk negatives: roll true chunks across the batch
+    neg_use_temporal: bool = True   # time-reversed true chunk as a negative
+    # Margin loss applies only to samples from these buckets (demos). Play
+    # samples already carry ≈0 targets; ranking below them is meaningless.
+    neg_buckets: tuple[str, ...] = ("q5",)
+
+    # ── Multi-dataset mixture knobs ────────────────────────────────────────
+    # Per-bucket sampling weight (1.0 = natural frequency), applied as a static
+    # resampled index list over the train split (DDP-safe: plain Subset+shuffle,
+    # no custom sampler). e.g. {"q5": 2.0} doubles BC frames per epoch.
+    bucket_sample_weights: dict[str, float] = field(default_factory=dict)
+    # Multi-dataset only: overwrite the aggregated ACTION normalization stats
+    # with this sub-dataset's stats, so Q's normalized action space matches the
+    # BC convention instead of a play-inflated blend (Stage-0: blended rot std
+    # is ~8× the BC std, compressing BC chunks in normalized units).
+    action_stats_repo_id: str | None = None
+
     # ── Target network (Polyak) ────────────────────────────────────────────
     target_tau: float = 0.005
 

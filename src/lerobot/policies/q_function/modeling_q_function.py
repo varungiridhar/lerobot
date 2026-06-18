@@ -580,7 +580,10 @@ class QFunctionPolicy(PreTrainedPolicy):
 
         text_tokens = self._encode_language(batch)
 
-        logits_online = self.q_online(imgs_t, a_first, text_tokens=text_tokens)
+        # Encode the obs context once; reused below for synthetic negatives
+        # (identical to q_online(imgs, a) — forward() is exactly this two-step).
+        context = self.q_online.encode_context(imgs_t, text_tokens)
+        logits_online = self.q_online.forward_with_context(context, a_first)
 
         with torch.no_grad():
             target_logits = self.q_target(imgs_tph, a_second, text_tokens=text_tokens)
@@ -612,7 +615,8 @@ class QFunctionPolicy(PreTrainedPolicy):
 
         target_probs = _two_hot_target(y, self.bin_centers, self.config.hl_gauss_sigma)
         log_probs = F.log_softmax(logits_online, dim=-1)
-        loss = -(target_probs * log_probs).sum(dim=-1).mean()
+        td_ce_per_sample = -(target_probs * log_probs).sum(dim=-1)
+        loss = td_ce_per_sample.mean()
 
         with torch.no_grad():
             q_pred = _expected_value(logits_online, self.bin_centers)
@@ -632,8 +636,105 @@ class QFunctionPolicy(PreTrainedPolicy):
                 "reward_sum_mean": discounted_rewards.mean().item(),
                 "tau": float(self.config.target_tau),
             }
+            # Per-bucket diagnostics: without these, a shortcut (e.g. play-style
+            # detection) is invisible in the aggregate metrics.
+            bucket_idx = batch.get(BUCKET_INDEX)
+            if bucket_idx is not None and self.config.reward_mode != "all_success":
+                from lerobot.policies.q_function.q_value_labels import DEFAULT_BUCKET_ORDER
+
+                for ordinal, name in enumerate(DEFAULT_BUCKET_ORDER):
+                    m = bucket_idx.view(-1) == ordinal
+                    if m.any():
+                        loss_dict[f"bucket_{name}/td_ce_loss"] = td_ce_per_sample[m].mean().item()
+                        loss_dict[f"bucket_{name}/q_pred_mean"] = q_pred[m].mean().item()
+                        loss_dict[f"bucket_{name}/q_target_mean"] = y[m].mean().item()
+                        loss_dict[f"bucket_{name}/frac"] = m.float().mean().item()
+
+        # ── Ranking-margin loss on batch-internal synthetic negatives ────────
+        if self.config.neg_margin_weight > 0:
+            margin_loss, neg_metrics = self._negatives_margin_loss(
+                context, a_first, logits_online, batch.get(BUCKET_INDEX)
+            )
+            if margin_loss is not None:
+                loss = loss + self.config.neg_margin_weight * margin_loss
+                loss_dict["margin_loss"] = float(margin_loss.detach().item())
+                loss_dict.update(neg_metrics)
 
         return loss, loss_dict
+
+    def _negatives_margin_loss(
+        self,
+        context: Tensor,
+        a_first: Tensor,
+        logits_online: Tensor,
+        bucket_idx: Tensor | None,
+    ) -> tuple[Tensor | None, dict[str, float]]:
+        """Ranking margin: relu(δ + Q(s, a_neg) − Q(s, a_true)), demo buckets only.
+
+        Negative chunks are built batch-internally in the (normalized) action
+        space and scored by reusing ``context`` — one extra decoder pass, no
+        extra image encoding. Returns (None, {}) when no eligible samples.
+        """
+        cfg = self.config
+        B = a_first.shape[0]
+
+        if bucket_idx is not None and cfg.reward_mode != "all_success":
+            from lerobot.policies.q_function.q_value_labels import DEFAULT_BUCKET_ORDER
+
+            allowed = {
+                ordinal for ordinal, name in enumerate(DEFAULT_BUCKET_ORDER) if name in cfg.neg_buckets
+            }
+            mask = torch.tensor(
+                [int(b) in allowed for b in bucket_idx.view(-1).tolist()], device=a_first.device
+            )
+        else:
+            mask = torch.ones(B, dtype=torch.bool, device=a_first.device)
+        if not mask.any():
+            return None, {}
+
+        a_pos = a_first[mask]                                # (M, h, A)
+        M = a_pos.shape[0]
+        negs: list[Tensor] = []
+        names: list[str] = []
+
+        if cfg.neg_use_swap and M > 1:
+            # Wrong-chunk negative: another sample's true chunk (≠ episode/task/
+            # state w.h.p. under a shuffled loader) at THIS state.
+            negs.append(torch.roll(a_pos, shifts=1, dims=0))
+            names.append("swap")
+
+        if cfg.neg_tube_sigmas:
+            from lerobot.policies.act_simple.planning import _smooth_time
+
+            for s in cfg.neg_tube_sigmas:
+                noise = torch.randn_like(a_pos) * float(s)
+                if cfg.neg_tube_smooth_sigma_t > 0:
+                    noise = _smooth_time(noise, cfg.neg_tube_smooth_sigma_t)
+                noise[..., -1] = 0.0  # hold the gripper dim
+                negs.append(a_pos + noise)
+                names.append(f"tube{s:g}s")
+
+        if cfg.neg_use_temporal:
+            negs.append(torch.flip(a_pos, dims=[1]))
+            names.append("trev")
+
+        if not negs:
+            return None, {}
+
+        K = len(negs)
+        ctx_pos = context[:, mask]                           # (S, M, D)
+        ctx_rep = torch.cat([ctx_pos] * K, dim=1)            # (S, K·M, D)
+        logits_neg = self.q_online.forward_with_context(ctx_rep, torch.cat(negs, dim=0))
+        q_neg = _expected_value(logits_neg, self.bin_centers).view(K, M)
+        q_pos = _expected_value(logits_online, self.bin_centers)[mask]   # differentiable
+
+        margin = F.relu(cfg.neg_margin_delta + q_neg - q_pos.unsqueeze(0))
+        metrics: dict[str, float] = {}
+        with torch.no_grad():
+            for k, name in enumerate(names):
+                metrics[f"neg_{name}/q_mean"] = q_neg[k].mean().item()
+                metrics[f"neg_{name}/rank_acc"] = (q_pos > q_neg[k]).float().mean().item()
+        return margin.mean(), metrics
 
     @torch.no_grad()
     def encode_obs_context(self, preprocessed_batch: dict[str, Tensor]) -> Tensor:

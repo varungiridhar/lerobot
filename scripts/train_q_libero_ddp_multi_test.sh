@@ -3,15 +3,12 @@
 #SBATCH -N1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem-per-gpu=64G
-#SBATCH -q inferno
+#SBATCH -q embers
 #SBATCH -t 8:00:00
-#SBATCH --gres=gpu:h200:2
-#SBATCH -p gpu-h200
-#SBATCH -o logs/%j.out
-#SBATCH -e logs/%j.err
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=vgiridhar6@gatech.edu
-
+#SBATCH --gres=gpu:rtx_6000:1
+#SBATCH -p gpu-rtx6000
+#SBATCH -o /storage/home/hcoda1/6/vgiridhar6/forks/qplanning/logs/%j.out
+#SBATCH -e /storage/home/hcoda1/6/vgiridhar6/forks/qplanning/logs/%j.err
 
 # Multi-dataset Q-function DDP training: BC (HuggingFaceVLA/libero)
 # + 4 LIBERO play splits. Mirrors scripts/train_q_libero_ddp.sh for
@@ -51,44 +48,13 @@ conda activate "${CONDA_ENV:-lerobot-q}"
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 
-# Keep wandb's run dir + artifact cache on scratch. Home and the project
-# filesystem are quota-capped; wandb otherwise writes run files next to the
-# repo (home) and caches artifacts under ~/.cache (a symlink onto project),
-# which leads to "Disk quota exceeded" failures.
-export WANDB_DIR="$HOME/scratch/wandb"
-export WANDB_CACHE_DIR="$HOME/scratch/wandb/cache"
-export WANDB_ARTIFACT_DIR="$HOME/scratch/wandb/artifacts"
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR"
+cd /storage/home/hcoda1/6/vgiridhar6/forks/qplanning || exit 1
 
-# Under sbatch, SLURM stages the script to /var/spool/slurmd/jobN/slurm_script,
-# so ${BASH_SOURCE[0]} points THERE rather than the original file path — a plain
-# `dirname "${BASH_SOURCE[0]}"/..` would cd to /var/spool/slurmd and any relative
-# output paths (outputs/, logs/) would land in that dir and vanish at job end.
-# $SLURM_SUBMIT_DIR is set by SLURM to the directory from which sbatch was invoked
-# (the repo root if you submitted from there). The BASH_SOURCE fallback covers
-# the case where the script is run interactively via `bash scripts/...`.
-cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}" || exit 1
-
-# Unique torch-distributed rendezvous port, derived from the SLURM job id, so
-# two accelerate jobs packed onto the same DGX node don't collide on the
-# default port 29500 (EADDRINUSE).
-MASTER_PORT=$(( 20000 + ${SLURM_JOB_ID:-$RANDOM} % 10000 ))
-echo "master port: ${MASTER_PORT}"
-
-# Hang detector: wraps the training command, py-spy-dumps every rank +
-# dataloader worker if no training step is logged for HANG_TIMEOUT seconds
-# (default 900), then tears the job down so a DDP/dataloader stall fails fast
-# (~20 min) instead of idling ~4 h until the NCCL watchdog. Dumps land in
-# logs/hang_dumps_<jobid>/.
-source scripts/hang_watchdog.sh
-
-run_with_hang_watchdog accelerate launch \
-    --num_processes=2 \
+accelerate launch \
+    --num_processes=1 \
     --mixed_precision=bf16 \
-    --multi_gpu \
-    --main_process_port=${MASTER_PORT} \
     $(which lerobot-train) \
-    --job_name=qf_libero_ddp2_bsz48_bc_plus_play_h200 \
+    --job_name=qf_libero_ddp4_bsz16_bc_plus_play \
     --policy.type=q_function \
     --policy.push_to_hub=false \
     --policy.dino_model_name=facebook/dinov2-large \
@@ -115,22 +81,17 @@ run_with_hang_watchdog accelerate launch \
     --policy.optimizer_lr_backbone=9e-5 \
     --policy.optimizer_weight_decay=1e-4 \
     --policy.lr_scheduler=cosine_decay_with_warmup \
-    --policy.lr_warmup_steps=2000 \
-    --policy.lr_decay_steps=40000 \
+    --policy.lr_warmup_steps=10 \
+    --policy.lr_decay_steps=100 \
     --policy.lr_decay_min=1e-6 \
     --dataset.repo_ids='[HuggingFaceVLA/libero,VarunGiridhar3/libero40_libero_object_play,VarunGiridhar3/libero40_libero_10_play,VarunGiridhar3/libero40_libero_goal_play,VarunGiridhar3/libero40_libero_spatial_play]' \
-    --dataset.root="$HOME/scratch/hf_cache/lerobot" \
-    --batch_size=48 \
-    --steps=40000 \
+    --dataset.root="/storage/home/hcoda1/6/vgiridhar6/scratch/hf_cache/lerobot" \
+    --batch_size=1 \
+    --steps=100 \
     --log_freq=50 \
-    --save_freq=1000 \
-    --eval_freq=2000 \
-    --test_split_ratio=0.1 \
-    --test_freq=50 \
-    --test_n_batches=1 \
-    --num_workers=6 \
+    --save_freq=50 \
+    --eval_freq=10 \
+    --num_workers=8 \
     --cudnn_deterministic=false \
-    --wandb.enable=true \
-    --wandb.project=awm \
-    --wandb.disable_artifact=true
-exit $?
+    --wandb.enable=false \
+    --wandb.project=awm

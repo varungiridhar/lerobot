@@ -57,11 +57,27 @@ class PlanningConfig:
     # candidate chunks temporally smooth — closer to the BC training distribution
     # than IID per-step jitter.
     noise_smooth_sigma_t: float | None = None
+    # Per-action-dimension noise std in normalized space. When set, overrides
+    # noise_std with a per-dim vector. Length must equal the action dimension.
+    # Calibrate as: noise_std_per_dim[i] = target_sigma * q_std[i] / fw_half_range[i]
+    noise_std_per_dim: list[float] | None = None
+    # Probability of flipping the gripper action to its opposite value for each
+    # candidate. Applied after Gaussian noise; gripper dim is excluded from
+    # noise_std_per_dim (set to 0.0 there). Only used when noise_std_per_dim is set.
+    p_flip_gripper: float = 0.0
+    # Index of the gripper dimension in the action vector (default: last dim).
+    gripper_dim: int = -1
+    # Number of diffusion denoising steps for bc_diffusion_* planners. When None,
+    # falls back to policy.num_inference_steps. Fewer steps → more diverse (noisier)
+    # samples; use with bc_diffusion_mppi + n_elites to smooth via weighted mean.
+    num_diffusion_steps: int | None = None
 
     def __post_init__(self):
-        if self.planner_type not in ("mppi", "cem", "argmax"):
+        if self.planner_type not in ("mppi", "cem", "argmax", "bc_diffusion_argmax", "bc_diffusion_mppi"):
             raise ValueError(
-                f"planner_type must be one of {{mppi, cem, argmax}}, got {self.planner_type!r}"
+                f"planner_type must be one of "
+                f"{{mppi, cem, argmax, bc_diffusion_argmax, bc_diffusion_mppi}}, "
+                f"got {self.planner_type!r}"
             )
         if self.n_samples <= 0:
             raise ValueError(f"n_samples must be > 0, got {self.n_samples}")
@@ -269,16 +285,22 @@ def _smooth_time(noise: Tensor, sigma: float) -> Tensor:
     return y * scale
 
 
-def _sample_noise(shape: tuple[int, int, int], std: float, clip_to: float | None,
+def _sample_noise(shape: tuple[int, int, int], std: "float | Tensor", clip_to: float | None,
                   device: torch.device, dtype: torch.dtype,
                   generator: torch.Generator | None,
                   smooth_sigma_t: float | None = None) -> Tensor:
-    if std == 0.0:
+    """Sample noise of ``shape`` scaled by ``std`` (scalar or per-dim ``(A,)`` tensor)."""
+    scalar_std = std if isinstance(std, float) else None
+    if scalar_std == 0.0:
         return torch.zeros(shape, device=device, dtype=dtype)
     if generator is not None:
-        noise = torch.randn(shape, device=device, dtype=dtype, generator=generator) * std
+        noise = torch.randn(shape, device=device, dtype=dtype, generator=generator)
     else:
-        noise = torch.randn(shape, device=device, dtype=dtype) * std
+        noise = torch.randn(shape, device=device, dtype=dtype)
+    if isinstance(std, Tensor):
+        noise = noise * std.to(device=device, dtype=dtype)  # (A,) broadcasts over (N, h, A)
+    else:
+        noise = noise * std
     if smooth_sigma_t is not None and smooth_sigma_t > 0:
         noise = _smooth_time(noise, smooth_sigma_t)
     if clip_to is not None:

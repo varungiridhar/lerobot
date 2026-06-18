@@ -316,6 +316,32 @@ class QValueLabelDataset(Dataset):
         """True if a non-empty episode-level holdout was carved at construction."""
         return self.holdout_fraction > 0.0 and len(self._frame_indices_test) > 0
 
+    def balanced_train_frame_indices(
+        self, weights: dict[str, float], seed: int | None = None
+    ) -> list[int]:
+        """Static per-bucket resampling of the train split (weight 1.0 = natural).
+
+        Integer part of the weight duplicates an index; the fractional part is a
+        Bernoulli draw (seeded — deterministic across resumes/ranks). Weights < 1
+        subsample. Returns a shuffled index list for a plain ``Subset`` +
+        ``shuffle=True`` DataLoader — keeping accelerate's even-batches DDP path
+        (a custom sampler would desync ranks; see lerobot_train.py).
+        """
+        if self._all_success:
+            raise ValueError("bucket_sample_weights requires per-repo bucket assignments.")
+        import random as _random
+
+        rng = _random.Random(seed if seed is not None else self.holdout_seed)
+        base = self._frame_indices_train if self._frame_indices_train else list(range(len(self)))
+        out: list[int] = []
+        for idx in base:
+            bucket = self._dataset_index_to_bucket[int(self._dataset_idx_by_frame[idx].item())]
+            w = float(weights.get(bucket, 1.0))
+            n = int(w) + (1 if rng.random() < (w - int(w)) else 0)
+            out.extend([idx] * n)
+        rng.shuffle(out)
+        return out
+
     # ── Pre-encoded feature cache ──────────────────────────────────────────
 
     def _maybe_load_preencoded(self, dataset) -> list[dict[str, np.memmap]] | None:

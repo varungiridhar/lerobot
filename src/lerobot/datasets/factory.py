@@ -171,6 +171,26 @@ def _maybe_wrap_for_policy(dataset, cfg: TrainPipelineConfig):
     if cfg.policy is None or getattr(cfg.policy, "type", None) != "q_function":
         return dataset
     from lerobot.policies.q_function.q_value_labels import QValueLabelDataset
+
+    # Optional frozen ACTION normalization stats: on a BC+play mixture the
+    # aggregated stats are play-inflated (rot std ~8× BC), which both shifts
+    # Q's normalized action space between runs and breaks the planner-side
+    # assumption that Q-normalized ≈ BC-normalized. Pin them to one sub-dataset.
+    stats_repo = getattr(cfg.policy, "action_stats_repo_id", None)
+    if stats_repo:
+        if not isinstance(dataset, MultiLeRobotDataset):
+            logging.info("action_stats_repo_id set but dataset is single-repo; no override needed.")
+        else:
+            from copy import deepcopy
+            subs = {sub.repo_id: sub for sub in dataset._datasets}
+            if stats_repo not in subs:
+                raise ValueError(
+                    f"action_stats_repo_id={stats_repo!r} is not among repo_ids {sorted(subs)}"
+                )
+            # In-place mutation: dataset.stats is the same dict object the meta
+            # proxy and processor construction read from.
+            dataset.stats[ACTION] = deepcopy(subs[stats_repo].meta.stats[ACTION])
+            logging.info(f"ACTION normalization stats pinned to {stats_repo}")
     wrapped = QValueLabelDataset(
         dataset,
         h=cfg.policy.h,

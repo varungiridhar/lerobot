@@ -493,7 +493,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # against the other rank's gradient all-reduce (NCCL collective desync).
         # A plain Subset + shuffle uses the standard, even-batches sharding path.
         # The complementary test frames feed a separate, rank-0-only loader below.
-        train_dataset = torch.utils.data.Subset(dataset, dataset.train_frame_indices)
+        bucket_weights = dict(getattr(cfg.policy, "bucket_sample_weights", None) or {})
+        if bucket_weights:
+            train_indices = dataset.balanced_train_frame_indices(bucket_weights, seed=cfg.seed)
+            logging.info(
+                f"Bucket-balanced sampling: {len(train_indices)} frames/epoch "
+                f"(natural {len(dataset.train_frame_indices)}; weights={bucket_weights})"
+            )
+        else:
+            train_indices = dataset.train_frame_indices
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
         shuffle = True
         sampler = None
     else:

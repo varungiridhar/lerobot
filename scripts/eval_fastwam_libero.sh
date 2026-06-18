@@ -20,6 +20,10 @@ TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/eval/${TIMESTAMP}_fastwam_${LIBERO_TASK}_l40s}
 
 # ---- Environment ----
+# Direct PATH prepend (not `conda activate`): `conda` isn't reliably on PATH in
+# non-interactive batch shells on some nodes (DGX/H100). Works on every node.
+export PATH="$HOME/.conda/envs/${CONDA_ENV:-lerobot}/bin:$PATH"
+
 export HF_HOME=/storage/project/r-agarg35-0/shared/huggingface_cache
 export MUJOCO_GL=egl
 export TOKENIZERS_PARALLELISM=false
