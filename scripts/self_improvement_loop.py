@@ -453,6 +453,34 @@ def self_improvement_loop(args):
     # Q policy reference (lives inside planner.ctx)
     q_policy = planner.ctx.q_policy
 
+    # ── Negative-Q paradigm override (controlled toggle) ─────────────────────
+    # The in-loop finetune calls q_policy.forward(batch), which adds the
+    # ranking-margin loss on batch-internal synthetic negatives whenever
+    # config.neg_margin_weight > 0 (tube/swap/trev; see modeling_q_function
+    # ._negatives_margin_loss). Overriding the loaded Q's config here lets every
+    # arm start from the SAME Q checkpoint and differ only in the negatives
+    # applied during self-improvement finetuning. Online frames are bucket
+    # "q5" (q_bucket_index=0) so they are eligible negatives anchors.
+    q_policy.config.neg_margin_weight = float(args.neg_margin_weight)
+    if args.neg_margin_weight > 0:
+        q_policy.config.neg_margin_delta = float(args.neg_margin_delta)
+        q_policy.config.neg_use_swap = bool(args.neg_use_swap)
+        q_policy.config.neg_use_temporal = bool(args.neg_use_temporal)
+        q_policy.config.neg_tube_smooth_sigma_t = float(args.neg_tube_smooth_sigma_t)
+        if args.neg_tube_sigmas is not None:
+            sigmas = tuple(float(s) for s in str(args.neg_tube_sigmas).split(",") if s.strip())
+            q_policy.config.neg_tube_sigmas = sigmas
+        log.info(
+            "Negatives ON: margin_weight=%.3f delta=%.3f tube_sigmas=%s smooth_t=%.1f "
+            "swap=%s temporal=%s buckets=%s",
+            q_policy.config.neg_margin_weight, q_policy.config.neg_margin_delta,
+            q_policy.config.neg_tube_sigmas, q_policy.config.neg_tube_smooth_sigma_t,
+            q_policy.config.neg_use_swap, q_policy.config.neg_use_temporal,
+            q_policy.config.neg_buckets,
+        )
+    else:
+        log.info("Negatives OFF (baseline loop): neg_margin_weight=0")
+
     # Q training preprocessor (with Q-key passthrough)
     q_pre_train = _make_q_train_preprocessor(args.q_ckpt)
 
@@ -612,6 +640,19 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=48)
     p.add_argument("--online_fraction", type=float, default=0.5)
     p.add_argument("--grad_clip_norm", type=float, default=10.0)
+    # ── Negative-Q paradigms (applied during the in-loop Q finetune) ──────────
+    # neg_margin_weight=0 → baseline loop (on-policy success/failure terminal
+    # rewards only). >0 → add ranking-margin negatives on top.
+    p.add_argument("--neg_margin_weight", type=float, default=0.0,
+                   help="Weight on the ranking-margin negatives loss in finetune (0 = off).")
+    p.add_argument("--neg_margin_delta", type=float, default=0.1)
+    p.add_argument("--neg_tube_sigmas", type=str, default="1.0,2.0",
+                   help="Comma-separated tube perturbation sigmas (smoothed per-dim noise).")
+    p.add_argument("--neg_tube_smooth_sigma_t", type=float, default=2.0)
+    p.add_argument("--neg_use_swap", action=argparse.BooleanOptionalAction, default=True,
+                   help="Cross-batch wrong-chunk (roll) negatives.")
+    p.add_argument("--neg_use_temporal", action=argparse.BooleanOptionalAction, default=True,
+                   help="Time-reversed-chunk negatives.")
     p.add_argument("--planner_type", default="bc_diffusion_mppi")
     p.add_argument("--n_samples", type=int, default=16)
     p.add_argument("--n_elites", type=int, default=16)
