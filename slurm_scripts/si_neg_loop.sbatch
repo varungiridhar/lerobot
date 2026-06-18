@@ -33,6 +33,7 @@ export HF_HUB_CACHE=/storage/project/r-agarg35-0/vgiridhar6/hf_cache
 export MUJOCO_GL=egl
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_DIR="$HOME/scratch/wandb"
 export WANDB_CACHE_DIR="$HOME/scratch/wandb/cache"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" slurm_out

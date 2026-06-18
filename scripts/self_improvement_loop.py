@@ -529,6 +529,17 @@ def self_improvement_loop(args):
         log.info(f"Online dataset: {len(online_ds)} frames across {iteration + 1} iterations.")
 
         # ── 3. Fine-tune Q ───────────────────────────────────────────────────
+        # FastWAM (~25 GB) is idle during finetune; offload it to CPU so the
+        # ~1B-param Q + AdamW + DINOv2 activations fit on a 44 GB L40s. FastWAM
+        # is reloaded to GPU before the next iteration's collection. q_policy is
+        # reached via a plain attribute (planner._planner.ctx.q_policy), NOT a
+        # registered submodule of `policy`, so policy.to("cpu") never moves it.
+        offloaded = device.type == "cuda"
+        if offloaded:
+            policy.to("cpu")
+            torch.cuda.empty_cache()
+            log.info("Offloaded FastWAM to CPU for finetune (frees VRAM for Q training).")
+
         ckpt_dir = iter_dir / "q_checkpoint"
         _, mean_loss, global_step = finetune_q(
             q_policy=q_policy,
@@ -548,6 +559,10 @@ def self_improvement_loop(args):
         )
 
         # ── 4. Q weights updated in-place — planner.ctx.q_policy is already updated ──
+        if offloaded:
+            torch.cuda.empty_cache()
+            policy.to(device)  # reload FastWAM for the next iteration's collection / eval
+            log.info("Reloaded FastWAM to GPU.")
         log.info("Q weights updated in-place (planner will use new weights on next call).")
 
         # ── 5. Eval with video clips ─────────────────────────────────────────
