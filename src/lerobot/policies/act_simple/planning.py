@@ -71,6 +71,10 @@ class PlanningConfig:
     # falls back to policy.num_inference_steps. Fewer steps → more diverse (noisier)
     # samples; use with bc_diffusion_mppi + n_elites to smooth via weighted mean.
     num_diffusion_steps: int | None = None
+    # Per-sample std of Gaussian noise injected into the diffusion context for
+    # bc_diffusion_* planners (0 = disabled). Read in fastwam.planning via getattr;
+    # declared here so it is settable from the CLI (--policy.planning.context_noise_std).
+    context_noise_std: float = 0.0
 
     def __post_init__(self):
         if self.planner_type not in ("mppi", "cem", "argmax", "bc_diffusion_argmax", "bc_diffusion_mppi"):
