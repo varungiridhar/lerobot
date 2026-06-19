@@ -1,14 +1,15 @@
 #!/bin/bash
 #SBATCH -J fastwam_q_eval
-#SBATCH -A gts-agarg35
+#SBATCH -A gts-agarg35-ideas_l40s
 #SBATCH -N1
 #SBATCH --cpus-per-gpu=4
 #SBATCH --mem-per-gpu=64G
 #SBATCH -q embers
 #SBATCH -t 6:00:00
-#SBATCH --gres=gpu:L40s:1
-#SBATCH -o logs/%j.out
-#SBATCH -e logs/%j.err
+#SBATCH -p gpu-l40s
+#SBATCH --gres=gpu:l40s:1
+#SBATCH -o slurm_out/%x-%j.out
+#SBATCH -e slurm_out/%x-%j.err
 
 # ---- Configurable args (override via --export on sbatch) ----
 FASTWAM_CKPT=${FASTWAM_CKPT:-/storage/project/r-agarg35-0/shared/awm/fastwam_checkpoint}
@@ -40,12 +41,17 @@ TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/eval/${TIMESTAMP}_fastwam_q_${LIBERO_TASK}_${PLANNER}_std${NOISE_STD}_n${N_SAMPLES}_l40s}
 
 # ---- Environment ----
-export HF_HOME=/storage/project/r-agarg35-0/shared/huggingface_cache
+# PATH-prepend (conda activate is unreliable in non-interactive sbatch shells).
+export PATH="$HOME/.conda/envs/${CONDA_ENV:-lerobot}/bin:$PATH"
+export HF_HOME=/storage/scratch1/6/vgiridhar6/hf
+export HF_HUB_CACHE=/storage/project/r-agarg35-0/vgiridhar6/hf_cache
 export MUJOCO_GL=egl
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-cd $SLURM_SUBMIT_DIR
+cd "$SLURM_SUBMIT_DIR"
+mkdir -p slurm_out
 
 echo "=== FastWAM + Q-planning eval ==="
 echo "  FASTWAM_CKPT:  $FASTWAM_CKPT"
