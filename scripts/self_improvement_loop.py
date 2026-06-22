@@ -52,11 +52,19 @@ def _run_episode(
     preprocessor,
     postprocessor,
     seed: int | None = None,
+    obs_capture: str = "pre",
 ) -> dict:
     """Run one episode and return a data dict regardless of success.
 
     Returns dict with keys: action (T,A), observation.images.* (T,3,H,W),
     next.success (T,), success (bool), task (str).
+
+    obs_capture: which stage to snapshot the camera tensors from.
+      "pre"  (LIBERO): raw obs before env_preprocessor — image/image2 are the Q
+             cams; saved flipped downstream to match the offline convention.
+      "post" (RoboTwin): obs AFTER env_preprocessor, so RoboTwinProcessorStep has
+             renamed the 3 raw cameras to cam_high/cam_left_wrist/cam_right_wrist
+             (the Q's camera_keys) and they are already in training orientation.
     """
     from copy import deepcopy
 
@@ -76,19 +84,21 @@ def _run_episode(
 
     while not np.all(done) and step < max_steps:
         obs_tensor = preprocess_observation(observation)  # NCHW float32, unflipped
-        # Save only tensor-valued image keys (skip robot_state dict).
+        obs_tensor = add_envs_task(env, obs_tensor)
+        obs_proc = env_preprocessor(obs_tensor)  # robotwin_processor renames+concats here
+        # Snapshot camera tensors from the requested stage (pre = raw obs for LIBERO;
+        # post = env_preprocessor output for RoboTwin, which has cam_high/etc).
+        _src = obs_proc if obs_capture == "post" else obs_tensor
         obs_saved = {
-            k: deepcopy(v) for k, v in obs_tensor.items()
+            k: deepcopy(v) for k, v in _src.items()
             if k.startswith("observation.images.") and isinstance(v, torch.Tensor)
         }
         all_obs_tensors.append(obs_saved)
 
-        obs_tensor = add_envs_task(env, obs_tensor)
-        obs_tensor = env_preprocessor(obs_tensor)
-        obs_tensor = preprocessor(obs_tensor)
+        obs_proc = preprocessor(obs_proc)
 
         with torch.no_grad():
-            action = policy.select_action(obs_tensor)
+            action = policy.select_action(obs_proc)
         action = postprocessor(action)
         action_trans = env_postprocessor({ACTION: action})
         action_np = action_trans[ACTION].cpu().numpy()
@@ -140,13 +150,23 @@ def collect_episodes(
     n_episodes: int,
     episodes_dir: Path,
     start_seed: int = 0,
+    camera_keys: tuple[str, ...] | None = None,
+    obs_capture: str = "pre",
+    flip: bool = True,
+    image_shape: tuple[int, int, int] = (256, 256, 3),
 ) -> float:
     """Run episodes across all task envs and save them as a LeRobotDataset.
 
     Distributes n_episodes evenly across tasks. Saves to episodes_dir in LeRobot
     format (parquet + PNG images) for lazy per-frame loading. Returns success rate.
+
+    camera_keys/obs_capture/flip/image_shape: env-specific (LIBERO defaults; RoboTwin
+    passes its 3 Q-cameras, obs_capture="post", flip=False).
     """
-    from lerobot.policies.q_function.online_dataset import save_episodes_lerobot
+    from lerobot.policies.q_function.online_dataset import _CAMERA_KEYS, save_episodes_lerobot
+
+    if camera_keys is None:
+        camera_keys = _CAMERA_KEYS
 
     task_envs = [(tg, tid, env) for tg, group in envs.items() for tid, env in group.items()]
     n_tasks = len(task_envs)
@@ -168,6 +188,7 @@ def collect_episodes(
                 env=env, policy=policy,
                 env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
                 preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
+                obs_capture=obs_capture,
             )
             success = ep_dict["success"]
             all_successes.append(success)
@@ -178,7 +199,10 @@ def collect_episodes(
         log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
 
     action_dim = int(all_episode_dicts[0]["action"].shape[1]) if all_episode_dicts else 7
-    save_episodes_lerobot(all_episode_dicts, episodes_dir, action_dim=action_dim)
+    save_episodes_lerobot(
+        all_episode_dicts, episodes_dir, action_dim=action_dim,
+        camera_keys=camera_keys, image_shape=image_shape, flip=flip,
+    )
 
     n_success = sum(all_successes)
     pc_success = 100.0 * n_success / max(len(all_successes), 1)
@@ -374,7 +398,7 @@ def finetune_q(
 def _setup_policy_and_env(args, device: torch.device):
     """Build FastWAM policy, Q planner, env, and all processors."""
     from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.envs.configs import LiberoEnv
+    from lerobot.envs.configs import LiberoEnv, RoboTwinEnv
     from lerobot.envs.factory import make_env, make_env_pre_post_processors
     from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
     from lerobot.policies.fastwam.planning import FastWAMPlanner
@@ -383,8 +407,12 @@ def _setup_policy_and_env(args, device: torch.device):
 
     set_seed(args.seed)
 
-    env_cfg = LiberoEnv(task=args.task, observation_height=224, observation_width=224)
-    log.info(f"Creating LIBERO env: {args.task}")
+    if args.env_type == "robotwin":
+        env_cfg = RoboTwinEnv(task=args.task, robotwin_root=args.robotwin_root)
+        log.info(f"Creating RoboTwin env: {args.task} (root={args.robotwin_root})")
+    else:
+        env_cfg = LiberoEnv(task=args.task, observation_height=224, observation_width=224)
+        log.info(f"Creating LIBERO env: {args.task}")
     envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
 
     # PreTrainedConfig.from_pretrained dispatches on the 'type' field and returns FastWAMConfig.
@@ -515,6 +543,9 @@ def self_improvement_loop(args):
         t0 = time.time()
 
         # ── 1. Collect episodes ──────────────────────────────────────────────
+        # RoboTwin: capture the 3 Q-cameras AFTER env_preprocessor (cam_high/etc),
+        # no flip. LIBERO: raw obs (image/image2) pre-processor, flipped on save.
+        _is_rt = args.env_type == "robotwin"
         episodes_dir = iter_dir / "online_episodes"
         pc_success = collect_episodes(
             policy=policy,
@@ -526,6 +557,9 @@ def self_improvement_loop(args):
             n_episodes=args.n_episodes,
             episodes_dir=episodes_dir,
             start_seed=start_seed,
+            camera_keys=tuple(q_policy.config.camera_keys) if _is_rt else None,
+            obs_capture="post" if _is_rt else "pre",
+            flip=not _is_rt,
         )
         start_seed += args.n_episodes
 
@@ -656,6 +690,10 @@ def self_improvement_loop(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="FastWAM + Q self-improvement loop")
+    p.add_argument("--env_type", default="libero", choices=["libero", "robotwin"],
+                   help="Simulator: libero (single/dual cam) or robotwin (3 cams, bimanual).")
+    p.add_argument("--robotwin_root", default=None,
+                   help="Path to the RoboTwin repo (required for --env_type robotwin).")
     p.add_argument("--fastwam_ckpt", required=True)
     p.add_argument("--q_ckpt", required=True)
     p.add_argument("--original_dataset_repo_id", default="HuggingFaceVLA/libero")
