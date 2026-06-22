@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
-from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim.optimizers import AdamConfig, AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig, DiffuserSchedulerConfig
 from lerobot.policies.act_simple_with_awm_head.planning import PlanningConfig
 
 
@@ -27,10 +27,10 @@ from lerobot.policies.act_simple_with_awm_head.planning import PlanningConfig
 class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
     """Configuration for ACT Simple + World Model Head policy.
 
-    Combines the act_simple encoder-decoder (non-autoregressive, continuous actions, L1 loss)
-    with the world model decoder from AWM. The action decoder is identical to act_simple;
-    the world model decoder takes continuous action embeddings (no tokenization) and predicts
-    future encoder representations via cosine similarity loss.
+    By default this matches the main-branch ACT Simple + AWM head implementation:
+    an ACT Simple action decoder with an AWM-style world model head. When
+    ``use_diffusion_action_head`` is enabled, the action generator switches to the
+    diffusion-policy U-Net path while keeping the existing world model decoder.
 
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy.
@@ -72,7 +72,39 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
         }
     )
 
-    # Architecture — Vision backbone.
+    # Action branch selector.
+    use_diffusion_action_head: bool = False
+
+    # The diffusion-policy loader drops the final frames to avoid excessive action padding.
+    drop_n_last_frames: int = 0
+
+    # Action diffusion branch: shared full-frame vision backbone + spatial-softmax preprocessing.
+    action_vision_backbone: str = "resnet18"
+    action_crop_shape: tuple[int, int] | None = None
+    action_crop_is_random: bool = False
+    action_pretrained_backbone_weights: str | None = None
+    action_use_group_norm: bool = True
+    action_spatial_softmax_num_keypoints: int = 32
+    action_use_separate_rgb_encoder_per_camera: bool = False
+
+    # Action diffusion branch: U-Net + scheduler.
+    action_down_dims: tuple[int, ...] = (512, 1024, 2048)
+    action_kernel_size: int = 5
+    action_n_groups: int = 8
+    action_diffusion_step_embed_dim: int = 128
+    action_use_film_scale_modulation: bool = True
+    action_noise_scheduler_type: str = "DDPM"
+    action_num_train_timesteps: int = 100
+    action_beta_schedule: str = "squaredcos_cap_v2"
+    action_beta_start: float = 0.0001
+    action_beta_end: float = 0.02
+    action_prediction_type: str = "epsilon"
+    action_clip_sample: bool = True
+    action_clip_sample_range: float = 1.0
+    action_num_inference_steps: int | None = None
+    action_do_mask_loss_for_padding: bool = False
+
+    # World-model architecture.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
@@ -104,12 +136,13 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
 
     # Training preset.
     optimizer_lr: float = 1e-5
-    optimizer_weight_decay: float = 0.0
     optimizer_lr_backbone: float = 1e-5
     optimizer_grad_clip_norm: float = 10.0
-
-    # LR schedule.
+    optimizer_betas: tuple[float, float] = (0.95, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 0.0
     use_lr_schedule: bool = False
+    scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 5000
     scheduler_decay_steps: int = 100_000
     scheduler_decay_lr: float = 0.0
@@ -136,19 +169,64 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.n_obs_steps != 1:
+        if self.use_diffusion_action_head:
+            if self.drop_n_last_frames == 0:
+                self.drop_n_last_frames = self.chunk_size - self.n_action_steps - self.n_obs_steps + 1
+            if not self.action_vision_backbone.startswith("resnet"):
+                raise ValueError(
+                    f"`action_vision_backbone` must be one of the ResNet variants. Got {self.action_vision_backbone}."
+                )
+            if self.vision_backbone != self.action_vision_backbone:
+                raise ValueError(
+                    "The WM and action branches now share a single visual backbone, so "
+                    f"`vision_backbone` and `action_vision_backbone` must match. Got "
+                    f"{self.vision_backbone=} and {self.action_vision_backbone=}."
+                )
+            if self.n_obs_steps <= 0:
+                raise ValueError(f"`n_obs_steps` must be positive. Got {self.n_obs_steps}.")
+            supported_prediction_types = ["epsilon", "sample"]
+            if self.action_prediction_type not in supported_prediction_types:
+                raise ValueError(
+                    f"`action_prediction_type` must be one of {supported_prediction_types}. "
+                    f"Got {self.action_prediction_type}."
+                )
+            supported_noise_schedulers = ["DDPM", "DDIM"]
+            if self.action_noise_scheduler_type not in supported_noise_schedulers:
+                raise ValueError(
+                    f"`action_noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+                    f"Got {self.action_noise_scheduler_type}."
+                )
+            downsampling_factor = 2 ** len(self.action_down_dims)
+            if self.chunk_size % downsampling_factor != 0:
+                raise ValueError(
+                    "The chunk size should be an integer multiple of the diffusion downsampling factor. "
+                    f"Got {self.chunk_size=} and {self.action_down_dims=}."
+                )
+        elif self.n_obs_steps != 1:
             raise ValueError(
-                f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+                f"Multiple observation steps not handled yet without diffusion. Got `nobs_steps={self.n_obs_steps}`"
             )
 
-    def get_optimizer_preset(self) -> AdamWConfig:
+    def get_optimizer_preset(self) -> AdamConfig | AdamWConfig:
+        if self.use_diffusion_action_head:
+            return AdamConfig(
+                lr=self.optimizer_lr,
+                betas=self.optimizer_betas,
+                eps=self.optimizer_eps,
+                weight_decay=self.optimizer_weight_decay,
+            )
         return AdamWConfig(
             lr=self.optimizer_lr,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
-    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig | None:
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig | CosineDecayWithWarmupSchedulerConfig | None:
+        if self.use_diffusion_action_head:
+            return DiffuserSchedulerConfig(
+                name=self.scheduler_name,
+                num_warmup_steps=self.scheduler_warmup_steps,
+            )
         if not self.use_lr_schedule:
             return None
         return CosineDecayWithWarmupSchedulerConfig(
@@ -159,11 +237,17 @@ class ACTSimpleWithAWMHeadConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
+        if self.use_diffusion_action_head and self.robot_state_feature is None:
+            raise ValueError("You must provide `observation.state` for the diffusion action branch.")
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        # Deprecated crop fields are accepted for checkpoint compatibility, but the action and WM
+        # branches now both consume full-frame shared ResNet feature maps.
 
     @property
     def observation_delta_indices(self) -> list[int]:
+        if self.use_diffusion_action_head:
+            return list(range(1 - self.n_obs_steps, 1)) + [self.chunk_size]
         return [0, self.chunk_size]
 
     @property
