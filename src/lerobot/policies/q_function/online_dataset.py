@@ -55,30 +55,59 @@ ONLINE_DATASET_FPS = 10.0
 ONLINE_DATASET_REPO_ID = "online_episodes"
 
 
+def _build_online_features(
+    camera_keys: tuple[str, ...],
+    action_dim: int,
+    image_shape: tuple[int, int, int] = ONLINE_IMAGE_SHAPE,
+) -> dict:
+    """Feature spec for LeRobotDataset.create() for an arbitrary set of cameras.
+
+    Generalizes the hardcoded 2-camera LIBERO spec to N cameras (e.g. RoboTwin's
+    3 Q-cameras), all at ``image_shape`` so frames stack cleanly with the original
+    training dataset during the finetune mix.
+    """
+    features: dict = {
+        "action": {"dtype": "float32", "shape": (action_dim,), "names": None},
+        "episode_success": {"dtype": "bool", "shape": (1,), "names": None},
+    }
+    for key in camera_keys:
+        features[key] = {
+            "dtype": "image",
+            "shape": image_shape,
+            "names": ["height", "width", "channel"],
+        }
+    return features
+
+
 def save_episodes_lerobot(
     episode_dicts: list[dict],
     episodes_dir: Path,
     action_dim: int = 7,
     fps: float = ONLINE_DATASET_FPS,
     camera_keys: tuple[str, ...] = _CAMERA_KEYS,
+    image_shape: tuple[int, int, int] = ONLINE_IMAGE_SHAPE,
+    flip: bool = True,
 ) -> None:
     """Save a list of episode dicts to a LeRobotDataset at episodes_dir.
 
     episode_dicts must have keys produced by _run_episode():
-        "action":                    (T, A) float32 tensor
-        "observation.images.image":  (T, 3, H, W) float32 [0,1] tensor (unflipped)
-        "observation.images.image2": (T, 3, H, W) float32 [0,1] tensor (unflipped)
-        "task":                      str
-        "success":                   bool
+        "action":            (T, A) float32 tensor
+        <each camera_key>:   (T, 3, H, W) float32 [0,1] tensor
+        "task":              str
+        "success":           bool
 
-    Images are flipped along H and W before saving to match the LiberoProcessorStep
-    convention used by the Q-function preprocessor (same as offline training data).
+    Each camera is resized to ``image_shape`` (so online frames stack with the
+    original training dataset during finetune). ``flip`` flips H,W — needed for
+    LIBERO (whose offline data is stored in the LiberoProcessorStep-flipped
+    convention and whose obs are captured pre-processor) but NOT for RoboTwin
+    (cams are captured post-processor, already in the training orientation).
     """
     import numpy as np
+    import torch.nn.functional as F
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    features = dict(ONLINE_DATASET_FEATURES)
-    features["action"]["shape"] = (action_dim,)
+    features = _build_online_features(camera_keys, action_dim, image_shape)
+    target_h, target_w = image_shape[:2]
 
     episodes_dir.parent.mkdir(parents=True, exist_ok=True)
     ds = LeRobotDataset.create(
@@ -103,10 +132,9 @@ def save_episodes_lerobot(
             for key in camera_keys:
                 if key in ep:
                     img = ep[key][t]  # (3, H, W) float32 [0,1]
-                    img = torch.flip(img, dims=[1, 2])  # flip H, W to match offline convention
-                    target_h, target_w = ONLINE_IMAGE_SHAPE[:2]
+                    if flip:
+                        img = torch.flip(img, dims=[1, 2])  # flip H, W to match offline convention
                     if img.shape[-2] != target_h or img.shape[-1] != target_w:
-                        import torch.nn.functional as F
                         img = F.interpolate(img.unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(0)
                     frame[key] = (img * 255).byte().permute(1, 2, 0).numpy()  # (H, W, C) uint8
             ds.add_frame(frame)
