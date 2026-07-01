@@ -28,6 +28,7 @@ flat ``agent_pos``) so the same preprocessing pipeline is reused. The three
 raw cameras are exposed separately; the FastWAM-specific concat into a single
 [3, 384, 320] frame is done by ``RoboTwinProcessorStep`` (see env_processor.py).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -45,7 +46,7 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 import yaml
 from gymnasium import spaces
 
@@ -60,6 +61,12 @@ STATE_DIM = 14
 DEFAULT_MAX_EPISODE_STEPS = 1000
 # Number of consecutive seeds to try if setup_demo raises (unstable scene).
 RESET_RETRIES = 12
+# FastWAM expert-check seed gating (RoboTwin/script/eval_policy.py::eval_policy).
+# The seed cursor starts at 100000*(1+seed); a seed is scored only if the scripted
+# oracle solves it. Cap the per-episode seed search so a task with no solvable
+# seed fails loudly instead of hanging.
+SEED_BASE_MULTIPLIER = 100000
+MAX_GATE_CANDIDATES = 200
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +231,7 @@ class RoboTwinEnv(gym.Env):
         instruction: str | None = None,
         max_episode_steps: int | None = None,
         render_mode: str = "rgb_array",
+        expert_check: bool = True,
     ):
         super().__init__()
         self.task_name = task_name
@@ -231,7 +239,10 @@ class RoboTwinEnv(gym.Env):
         self.task_config = task_config
         self.instruction_type = instruction_type
         self.render_mode = render_mode
+        self.expert_check = expert_check
         self._max_episode_steps_override = max_episode_steps
+        # Persistent seed cursor for FastWAM's expert-check gating (set on 1st reset).
+        self._now_seed: int | None = None
 
         if not self.robotwin_root.is_dir():
             raise FileNotFoundError(f"robotwin_root does not exist: {self.robotwin_root}")
@@ -296,9 +307,8 @@ class RoboTwinEnv(gym.Env):
 
     def _close_task(self) -> None:
         if self._is_setup:
-            with _robotwin_ctx(self.robotwin_root):
-                with contextlib.suppress(Exception):
-                    self._task_env.close_env(clear_cache=True)
+            with _robotwin_ctx(self.robotwin_root), contextlib.suppress(Exception):
+                self._task_env.close_env(clear_cache=True)
             self._is_setup = False
 
     def reset(self, seed: int | None = None, options: dict | None = None):  # noqa: ARG002
@@ -308,17 +318,32 @@ class RoboTwinEnv(gym.Env):
 
         self._close_task()
 
-        # setup_demo can raise on an unstable randomized scene — try next seeds.
+        used_seed = self._gated_setup(seed) if self.expert_check else self._plain_setup(seed)
+
+        self._episode_idx += 1
+        obs = self._get_obs()
+        info = {"is_success": False, "seed": used_seed, "task": self.task}
+        return obs, info
+
+    # -- setup helpers -------------------------------------------------------
+    def _setup_seed(self, seed: int) -> None:
+        """Build the task scene for `seed` (may raise UnStableError / build errors)."""
+        with _robotwin_ctx(self.robotwin_root):
+            self._task_env.setup_demo(now_ep_num=self._episode_idx, seed=seed, is_test=True, **self._args)
+
+    def _safe_close(self) -> None:
+        with _robotwin_ctx(self.robotwin_root), contextlib.suppress(Exception):
+            self._task_env.close_env()
+
+    def _plain_setup(self, seed: int) -> int:
+        """Ungated setup: skip past unstable scenes only (no expert-solvability gate)."""
         first_exc: Exception | None = None
         attempt_errors: list[str] = []
         used_seed = seed
         for attempt in range(RESET_RETRIES):
             used_seed = seed + attempt
             try:
-                with _robotwin_ctx(self.robotwin_root):
-                    self._task_env.setup_demo(
-                        now_ep_num=self._episode_idx, seed=used_seed, is_test=True, **self._args
-                    )
+                self._setup_seed(used_seed)
                 self._is_setup = True
                 break
             except Exception as e:  # noqa: BLE001 — UnStableError or scene-build failure
@@ -327,11 +352,12 @@ class RoboTwinEnv(gym.Env):
                 attempt_errors.append(f"seed {used_seed}: {type(e).__name__}: {e}")
                 logger.warning(
                     "RoboTwin setup_demo failed (attempt %d/%d, seed %d):\n%s",
-                    attempt + 1, RESET_RETRIES, used_seed, traceback.format_exc(),
+                    attempt + 1,
+                    RESET_RETRIES,
+                    used_seed,
+                    traceback.format_exc(),
                 )
-                with _robotwin_ctx(self.robotwin_root):
-                    with contextlib.suppress(Exception):
-                        self._task_env.close_env()
+                self._safe_close()
         else:
             raise RuntimeError(
                 f"RoboTwin setup_demo failed for task '{self.task_name}' after "
@@ -339,15 +365,90 @@ class RoboTwinEnv(gym.Env):
                 f"First error: {type(first_exc).__name__}: {first_exc}\n"
                 f"All attempts: {attempt_errors}"
             ) from first_exc
-
-        self._episode_idx += 1
         self.task = self._fixed_instruction or _resolve_instruction(self.robotwin_root, self.task_name)
         with contextlib.suppress(Exception):
             self._task_env.set_instruction(instruction=self.task)
+        return used_seed
 
-        obs = self._get_obs()
-        info = {"is_success": False, "seed": used_seed, "task": self.task}
-        return obs, info
+    def _gated_setup(self, seed: int) -> int:
+        """FastWAM expert-check seed gating (RoboTwin/script/eval_policy.py::eval_policy).
+
+        Enumerate seeds from a persistent cursor (initialised to ``100000*(1+seed)``
+        on the first reset). For each candidate, run the scripted oracle
+        (``setup_demo`` -> ``play_once``) and accept the seed only if the oracle
+        solves it (``plan_success and check_success()``); otherwise skip it. On
+        acceptance, re-setup the scene for the policy rollout, sample a per-episode
+        instruction from the oracle's descriptions, and resume the cursor past the
+        accepted seed on the next reset (mirrors ``now_seed += 1`` after a rollout).
+        """
+        if self._now_seed is None:
+            self._now_seed = SEED_BASE_MULTIPLIER * (1 + int(seed))
+
+        episode_info: dict | None = None
+        accepted: int | None = None
+        for _ in range(MAX_GATE_CANDIDATES):
+            cand = self._now_seed
+            # --- expert check: does the scripted oracle solve this seed? ---
+            try:
+                self._setup_seed(cand)
+                with _robotwin_ctx(self.robotwin_root):
+                    episode_info = self._task_env.play_once()
+                self._safe_close()
+            except Exception:  # noqa: BLE001 — UnStableError or expert-rollout failure
+                self._safe_close()
+                self._now_seed += 1
+                continue
+            solved = bool(getattr(self._task_env, "plan_success", False)) and bool(
+                self._task_env.check_success()
+            )
+            if not solved:
+                self._now_seed += 1
+                continue
+            # --- accepted: re-build the same seed for the policy rollout ---
+            try:
+                self._setup_seed(cand)
+            except Exception:  # noqa: BLE001 — passed expert check but failed re-init
+                self._safe_close()
+                self._now_seed += 1
+                continue
+            accepted = cand
+            self._is_setup = True
+            break
+
+        if accepted is None:
+            raise RuntimeError(
+                f"No expert-solvable seed found for RoboTwin task '{self.task_name}' "
+                f"within {MAX_GATE_CANDIDATES} candidates (cursor at {self._now_seed})."
+            )
+
+        self._now_seed = accepted + 1  # next reset resumes past this seed (eval_policy L409)
+        self._set_episode_instruction(episode_info)
+        return accepted
+
+    def _set_episode_instruction(self, episode_info: dict | None) -> None:
+        """Sample the per-episode instruction like FastWAM (falls back to static)."""
+        if self._fixed_instruction is not None:
+            self.task = self._fixed_instruction
+        else:
+            self.task = _resolve_instruction(self.robotwin_root, self.task_name)
+            if episode_info is not None:
+                try:
+                    from generate_episode_instructions import generate_episode_descriptions
+
+                    # 3rd arg = FastWAM's test_num (eval episode count); it only bounds
+                    # the generated description-list length. The exact sampled string is
+                    # not bit-reproducible vs FastWAM (global np-RNG state differs), so
+                    # it only matters for language-conditioned policies.
+                    results = generate_episode_descriptions(self.task_name, [episode_info["info"]], 100)
+                    self.task = str(np.random.choice(results[0][self.instruction_type]))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Faithful instruction sampling failed for %s (%s); using static.",
+                        self.task_name,
+                        e,
+                    )
+        with contextlib.suppress(Exception):
+            self._task_env.set_instruction(instruction=self.task)
 
     def step(self, action: np.ndarray):
         if not self._is_setup:
@@ -425,6 +526,16 @@ def create_robotwin_envs(
         raise ValueError(f"n_envs must be positive; got {n_envs}.")
 
     gym_kwargs = dict(gym_kwargs or {})
+    if gym_kwargs.get("expert_check", True) and n_envs != 1:
+        # FastWAM parity uses a single sequential seed cursor per task. With n_envs>1
+        # each sub-env owns an independent cursor (a different seed stream) and
+        # early-finishing sub-envs run the oracle gate for discarded episodes, so the
+        # scored seed set is not FastWAM's. Require batch_size=1 (planning is bs=1
+        # locked anyway); disable gating explicitly to opt out.
+        raise ValueError(
+            f"RoboTwin expert-check gating requires batch_size=1, got n_envs={n_envs}. "
+            "Set --eval.batch_size=1, or pass --env.expert_check=false to disable gating."
+        )
     task_names = [t.strip() for t in str(task).split(",") if t.strip()]
     if not task_names:
         raise ValueError("`task` must contain at least one RoboTwin task name.")

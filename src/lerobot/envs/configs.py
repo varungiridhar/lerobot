@@ -269,8 +269,11 @@ class LiberoEnv(EnvConfig):
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
-    observation_height: int = 360
-    observation_width: int = 360
+    # FastWAM parity: policy input is 224 (video_size); the env renders at
+    # render_resolution=256 (LIBERO_ENV_RESOLUTION) and center-crop-resizes to 224.
+    observation_height: int = 224
+    observation_width: int = 224
+    render_resolution: int = 256
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -291,6 +294,10 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    # FastWAM eval parity (sim_libero.yaml): 30 settle steps before the policy acts,
+    # and iterate a distinct init state per trial (vs pinning one per sub-env).
+    num_steps_wait: int = 30
+    iterate_init_states: bool = True
 
     def __post_init__(self):
         if self.obs_type == "pixels":
@@ -345,6 +352,9 @@ class LiberoEnv(EnvConfig):
             "render_mode": self.render_mode,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "num_steps_wait": self.num_steps_wait,
+            "iterate_init_states": self.iterate_init_states,
+            "render_resolution": self.render_resolution,
         }
 
 
@@ -426,6 +436,11 @@ class RoboTwinEnv(EnvConfig):
     instruction_type: str = "unseen"
     instruction: str | None = None
     render_mode: str = "rgb_array"
+    # FastWAM eval parity (RoboTwin/script/eval_policy.py): gate each seed through
+    # the scripted oracle (seed base 100000*(1+seed); score only seeds the expert
+    # solves) and sample a per-episode instruction from the oracle's descriptions.
+    # Requires batch_size=1 (a single sequential seed cursor, like FastWAM).
+    expert_check: bool = True
     # Concatenated FastWAM input-frame resolution (height, width).
     image_height: int = 384
     image_width: int = 320
@@ -457,6 +472,7 @@ class RoboTwinEnv(EnvConfig):
             "instruction_type": self.instruction_type,
             "instruction": self.instruction,
             "render_mode": self.render_mode,
+            "expert_check": self.expert_check,
         }
 
 

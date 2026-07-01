@@ -28,8 +28,29 @@ import torch
 from gymnasium import spaces
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from PIL import Image
 
 from lerobot.processor import RobotObservation
+
+# FastWAM renders LIBERO at this resolution (the resolution its training data was
+# rendered at) and then center-crop-resizes each camera to the policy input size
+# (`experiments/libero/libero_utils.py::LIBERO_ENV_RESOLUTION`). We mirror both.
+LIBERO_ENV_RESOLUTION = 256
+
+
+def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Scale-to-fit then center-crop, matching FastWAM's LIBERO preprocessing
+    (`experiments/libero/eval_libero_single.py::_center_crop_resize`). Uses PIL
+    bilinear so the resampled pixels are bit-identical to FastWAM's."""
+    pil_image = Image.fromarray(image)
+    src_w, src_h = pil_image.size
+    scale = max(width / src_w, height / src_h)
+    resized = pil_image.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
+    rw, rh = resized.size
+    left = max((rw - width) // 2, 0)
+    top = max((rh - height) // 2, 0)
+    cropped = resized.crop((left, top, left + width, top + height))
+    return np.asarray(cropped, dtype=np.uint8)
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -85,12 +106,17 @@ def get_libero_dummy_action():
 ACTION_DIM = 7
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
+# Max policy-acting steps per rollout, matched to FastWAM's eval protocol
+# (FastWAM `experiments/libero/eval_libero_single.py::_get_max_steps`). These are
+# LONGER than the OpenVLA-style budgets LeRobot shipped (280/280/300/520/400) —
+# the paper evaluates on extended horizons, so we mirror them exactly for
+# apples-to-apples comparison against FastWAM's reported numbers.
 TASK_SUITE_MAX_STEPS: dict[str, int] = {
-    "libero_spatial": 280,  # longest training demo has 193 steps
-    "libero_object": 280,  # longest training demo has 254 steps
-    "libero_goal": 300,  # longest training demo has 270 steps
-    "libero_10": 520,  # longest training demo has 505 steps
-    "libero_90": 400,  # longest training demo has 373 steps
+    "libero_spatial": 400,
+    "libero_object": 400,
+    "libero_goal": 400,
+    "libero_10": 700,
+    "libero_90": 700,
 }
 
 
@@ -113,8 +139,10 @@ class LiberoEnv(gym.Env):
         init_states: bool = True,
         episode_index: int = 0,
         camera_name_mapping: dict[str, str] | None = None,
-        num_steps_wait: int = 10,
+        num_steps_wait: int = 30,
         control_mode: str = "relative",
+        iterate_init_states: bool = True,
+        render_resolution: int = LIBERO_ENV_RESOLUTION,
     ):
         super().__init__()
         self.task_id = task_id
@@ -143,9 +171,20 @@ class LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index
         self.episode_length = episode_length
+        self.iterate_init_states = iterate_init_states
+        # FastWAM renders at LIBERO_ENV_RESOLUTION and center-crop-resizes each
+        # camera down to observation_height/width; render_resolution controls the
+        # raw render size (256 for parity).
+        self.render_resolution = render_resolution
         # Load once and keep
         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
-        self._init_state_id = self.episode_index  # tie each sub-env to a fixed init state
+        self._init_state_id = self.episode_index  # sub-env's starting init state (advanced per trial below)
+        # FastWAM parity: the eval seed encodes the global trial index
+        # (seed = start_seed + batch_ix*n_envs + episode_index). We recover
+        # start_seed on the first seeded reset and index a DISTINCT init state per
+        # trial, seeding the env only once — mirroring get_libero_env + the
+        # `for trial_idx: set_init_state(initial_states[trial_idx])` loop.
+        self._start_seed: int | None = None
 
         self._env = self._make_envs_task(task_suite, self.task_id)
         default_steps = 500
@@ -232,8 +271,10 @@ class LiberoEnv(gym.Env):
 
         env_args = {
             "bddl_file_name": task_bddl_file,
-            "camera_heights": self.observation_height,
-            "camera_widths": self.observation_width,
+            # Render at FastWAM's resolution; _format_raw_obs then center-crop-resizes
+            # each camera down to observation_height/width (matches FastWAM).
+            "camera_heights": self.render_resolution,
+            "camera_widths": self.render_resolution,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -243,6 +284,12 @@ class LiberoEnv(gym.Env):
         images = {}
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
+            # FastWAM parity: images are rendered at render_resolution and
+            # center-crop-resized to the policy input size (get_libero_image ->
+            # _center_crop_resize). The 180° rotation is applied downstream by
+            # LiberoProcessorStep; for a 180° rotation the crop/rotate order commutes.
+            if image.shape[0] != self.observation_height or image.shape[1] != self.observation_width:
+                image = _center_crop_resize(image, self.observation_width, self.observation_height)
             images[self.camera_name_mapping[camera_name]] = image
 
         eef_pos = raw_obs.get("robot0_eef_pos")
@@ -292,7 +339,19 @@ class LiberoEnv(gym.Env):
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
-        self._env.seed(seed)
+        if self.iterate_init_states and self._init_states is not None:
+            # FastWAM parity: iterate DISTINCT init states across rollouts and seed
+            # the env ONCE. A seeded reset is a batch-level reset from lerobot-eval
+            # (seed encodes the trial index); a seed=None reset is the in-env
+            # auto-reset after an episode ends — that one keeps the current state.
+            if seed is not None:
+                if self._start_seed is None:
+                    self._start_seed = int(seed) - self.episode_index
+                    self._env.seed(self._start_seed)  # seed once, like get_libero_env
+                trial_idx = int(seed) - self._start_seed
+                self._init_state_id = trial_idx % len(self._init_states)
+        else:
+            self._env.seed(seed)
         raw_obs = self._env.reset()
         if self.init_states and self._init_states is not None:
             raw_obs = self._env.set_init_state(self._init_states[self._init_state_id])
@@ -341,7 +400,14 @@ class LiberoEnv(gym.Env):
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
+            # FastWAM parity: FastWAM does exactly ONE env.reset() per trial (the
+            # env is seeded once and its placement RNG persists across trials — see
+            # libero_utils.py). lerobot-eval already issues a fresh seeded reset at
+            # the start of each rollout, so this in-step reset is redundant and, by
+            # advancing the placement RNG a second time, would shift object positions
+            # off FastWAM's. Skip it in the parity path.
+            if not self.iterate_init_states:
+                self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
 
