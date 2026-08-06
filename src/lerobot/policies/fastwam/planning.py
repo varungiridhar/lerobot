@@ -27,6 +27,7 @@ from lerobot.policies.act_simple.planning import (
     _sample_noise,
     _score_candidates,
     _score_candidates_fast,
+    q_grad_wrt_actions,
 )
 from lerobot.utils.constants import ACTION
 
@@ -201,11 +202,46 @@ def plan_chunk_fastwam(
         # Image/text encoding happens ONCE; only the denoising loop is repeated per sample.
         # cfg.num_diffusion_steps overrides policy.num_inference_steps — fewer steps = more diversity.
         context_noise_std = getattr(cfg, "context_noise_std", 0.0)
-        if context_noise_std > 0:
+        guidance_scale = getattr(cfg, "q_guidance_scale", 0.0)
+
+        # Encode the obs context up front: guidance needs it during denoising, and the
+        # final scoring pass reuses it. Only the images matter here, so ACTION is a
+        # correctly-shaped placeholder that q_pre can normalize.
+        dummy_action = torch.zeros(
+            1, ctx.horizon, bc_policy.config.action_dim, device=device
+        )
+        single_preprocessed = ctx.q_pre({ACTION: dummy_action, **img_feats})
+        obs_context = ctx.q_policy.encode_obs_context(single_preprocessed)  # (S, 1, D)
+
+        guidance_fn = None
+        if guidance_scale > 0:
+            def guidance_fn(latents: Tensor, pred_v: Tensor, sigma: float) -> Tensor:
+                # Q is trained on clean action chunks, so scoring the noisy latent
+                # directly would query it far off-distribution at high sigma. Flow
+                # matching gives the clean estimate for free: x_t = (1-s)*x0 + s*eps
+                # and v = eps - x0, hence x0 = x_t - s*v. Differentiate Q there, with
+                # pred_v held constant (the standard stop-grad approximation that
+                # avoids backpropagating through the DiT).
+                sigma = max(sigma, 1e-4)
+                x0 = latents - sigma * pred_v
+                grad, _ = q_grad_wrt_actions(
+                    x0, obs_context, ctx, img_feats,
+                    normalize=cfg.q_guidance_normalize,
+                )
+                # Nudge the x0 target by `guidance_scale`, then re-express as a
+                # velocity: v' = (x_t - x0')/sigma = pred_v - scale*grad/sigma.
+                # On the final step sigma == |delta|, so the trajectory lands exactly
+                # on the guided x0 — which makes the scale directly interpretable as
+                # a displacement in normalized action space, independent of step count.
+                return pred_v - (guidance_scale / sigma) * grad.to(dtype=pred_v.dtype)
+
+        # The partial sampler is the only path exposing the per-step guidance hook, so
+        # route through it whenever guidance or context noise is active.
+        if context_noise_std > 0 or guidance_scale > 0:
             steps = cfg.num_diffusion_steps if cfg.num_diffusion_steps is not None else 10
             candidates = bc_policy.predict_n_action_chunks_partial(
                 batch, N, num_inference_steps=steps, sigma_start=1.0,
-                context_noise_std=context_noise_std,
+                context_noise_std=context_noise_std, guidance_fn=guidance_fn,
             ).to(device=device)
         else:
             candidates = bc_policy.predict_n_action_chunks(
@@ -215,10 +251,6 @@ def plan_chunk_fastwam(
         if candidates.dim() == 2:  # model squeezes sample dim when N=1
             candidates = candidates.unsqueeze(0)
 
-        # Score all N candidates with Q; encode obs context once and reuse across all N.
-        single_batch = {ACTION: candidates[:1], **img_feats}
-        single_preprocessed = ctx.q_pre(single_batch)
-        obs_context = ctx.q_policy.encode_obs_context(single_preprocessed)  # (S, 1, D)
         q_values = _score_candidates_fast(candidates, obs_context, ctx, img_feats).to(
             device=device, dtype=candidates.dtype
         )

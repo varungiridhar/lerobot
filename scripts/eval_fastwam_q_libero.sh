@@ -36,6 +36,9 @@ NUM_INFER_STEPS=${NUM_INFER_STEPS:-10}
 DIFFUSION_STEPS=${DIFFUSION_STEPS:-3}
 # Per-sample context noise std for bc_diffusion_* planners (0=disabled).
 CONTEXT_NOISE_STD=${CONTEXT_NOISE_STD:-0.0}
+# Q-gradient guidance strength for bc_diffusion_* planners (0=disabled, plain
+# sample-then-rank). Displacement in normalized action space per denoising step.
+Q_GUIDANCE_SCALE=${Q_GUIDANCE_SCALE:-0.0}
 # Gaussian smoothing sigma along time axis for MPPI noise (0=IID, 2=smooth). Empty=disabled.
 NOISE_SMOOTH_SIGMA_T=${NOISE_SMOOTH_SIGMA_T:-}
 # Set USE_PLANNING=false for baseline BC-only eval (skips Q-function entirely).
@@ -105,6 +108,7 @@ else
         --policy.planning.temperature="$TEMPERATURE" \
         ${DIFFUSION_STEPS:+--policy.planning.num_diffusion_steps="$DIFFUSION_STEPS"} \
         --policy.planning.context_noise_std="$CONTEXT_NOISE_STD" \
+        --policy.planning.q_guidance_scale="$Q_GUIDANCE_SCALE" \
         ${NOISE_SMOOTH_SIGMA_T:+--policy.planning.noise_smooth_sigma_t="$NOISE_SMOOTH_SIGMA_T"} \
         --output_dir="$OUTPUT_DIR" \
         --seed="$SEED" 2>&1 | tee "$OUTPUT_DIR/log.txt"

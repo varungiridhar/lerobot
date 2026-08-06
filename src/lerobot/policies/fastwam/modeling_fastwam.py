@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -230,6 +231,7 @@ class FastWAMPolicy(PreTrainedPolicy):
         sigma_start: float = 1.0,
         bc_mean: Tensor | None = None,  # (1, h, A); required when sigma_start < 1.0
         context_noise_std: float = 0.0,
+        guidance_fn: "Callable[[Tensor], Tensor] | None" = None,
     ) -> Tensor:                        # (n_samples, h, A) float32
         """Partial denoising with optional per-sample context noise for diversity.
 
@@ -242,6 +244,16 @@ class FastWAMPolicy(PreTrainedPolicy):
           context features and video KV-cache values after expanding to N samples.
           Each sample attends to a slightly different imagined context throughout the
           entire denoising loop, forcing genuine trajectory divergence.
+
+        guidance_fn: optional callback that rewrites the predicted velocity each
+          denoising step, used for Q-gradient guidance. Called as
+          ``guidance_fn(latents, pred_v, sigma)`` and returns a velocity of the same
+          shape. ``sigma`` is the current noise level in [0, 1], which lets the
+          callback recover the clean-action estimate ``x0 = latents - sigma * pred_v``
+          — the only point in the loop where a model trained on clean actions sees
+          an in-distribution input. It runs inside this method's no-grad context, so
+          a callback needing autograd must re-enable it itself (see
+          ``q_grad_wrt_actions``).
         """
         self.eval()
         model = self.model
@@ -340,6 +352,8 @@ class FastWAMPolicy(PreTrainedPolicy):
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
             )
+            if guidance_fn is not None:
+                pred_v = guidance_fn(latents, pred_v, float(step_t) / T).to(dtype=latents.dtype)
             latents = model.infer_action_scheduler.step(pred_v, step_delta, latents)
 
         return latents.detach().float()  # (n_samples, h, A)

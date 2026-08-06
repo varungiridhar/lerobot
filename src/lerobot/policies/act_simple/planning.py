@@ -75,6 +75,21 @@ class PlanningConfig:
     # bc_diffusion_* planners (0 = disabled). Read in fastwam.planning via getattr;
     # declared here so it is settable from the CLI (--policy.planning.context_noise_std).
     context_noise_std: float = 0.0
+    # Q-gradient guidance for bc_diffusion_* planners. When > 0, every denoising step
+    # nudges the *clean-action estimate* x0 along dQ/dx0 and re-expresses that as a
+    # velocity, so samples are steered toward high Q during sampling instead of only
+    # being ranked afterwards. Unlike sample-then-rank this does not depend on the
+    # candidates already being diverse — and in practice it also restores diversity,
+    # since each sample follows its own local Q gradient.
+    #
+    # Units: displacement in normalized action space, and step-count invariant
+    # (measured: 0.1 moves the selected chunk ~0.04 RMS at 1, 3, 5 and 10 steps).
+    # Useful range is ~0.05-0.3; beyond that Q gets exploited off-manifold — at 1.0
+    # candidate spread hits 0.8, i.e. the chunks are essentially unconstrained.
+    q_guidance_scale: float = 0.0
+    # Normalize the gradient to unit RMS per sample before scaling. Keeps the step
+    # size independent of the Q head's output scale, which varies by checkpoint.
+    q_guidance_normalize: bool = True
 
     def __post_init__(self):
         if self.planner_type not in ("mppi", "cem", "argmax", "bc_diffusion_argmax", "bc_diffusion_mppi"):
@@ -82,6 +97,12 @@ class PlanningConfig:
                 f"planner_type must be one of "
                 f"{{mppi, cem, argmax, bc_diffusion_argmax, bc_diffusion_mppi}}, "
                 f"got {self.planner_type!r}"
+            )
+        if self.q_guidance_scale < 0:
+            raise ValueError(f"q_guidance_scale must be >= 0, got {self.q_guidance_scale}")
+        if self.q_guidance_scale > 0 and not self.planner_type.startswith("bc_diffusion"):
+            raise ValueError(
+                f"q_guidance_scale > 0 requires a bc_diffusion_* planner, got {self.planner_type!r}"
             )
         if self.n_samples <= 0:
             raise ValueError(f"n_samples must be > 0, got {self.n_samples}")
@@ -240,6 +261,14 @@ def _score_candidates_fast(
     img_feats           : raw images/task dict (needed so q_pre can pixel-normalize; DINOv2 is skipped).
     """
     from lerobot.policies.q_function.modeling_q_function import _expected_value
+
+    # The Q net runs in fp32, but Q-gradient guidance calls this mid-denoising, where
+    # the latents still carry FastWAM's bf16 compute dtype. Cast at the boundary;
+    # `.to()` is differentiable, so gradients flow back in the caller's dtype.
+    q_dtype = next(ctx.q_policy.parameters()).dtype
+    if candidates_norm.dtype != q_dtype:
+        candidates_norm = candidates_norm.to(dtype=q_dtype)
+
     N, h, A = candidates_norm.shape
     flat_norm = candidates_norm.reshape(N * h, A)
     flat_raw = ctx.bc_post(flat_norm)
@@ -262,6 +291,51 @@ def _score_candidates_fast(
     context_N = precomputed_context.expand(-1, N, -1).contiguous()  # (S, N, D)
     logits = ctx.q_policy.q_online.forward_with_context(context_N, actions)
     return _expected_value(logits, ctx.q_policy.bin_centers)
+
+
+def q_grad_wrt_actions(
+    candidates_norm: Tensor,
+    precomputed_context: Tensor,
+    ctx: PlannerContext,
+    img_feats: dict | None = None,
+    normalize: bool = True,
+    grad_chunk: int = 16,
+) -> tuple[Tensor, Tensor]:
+    """dQ/d(candidates_norm) for Q-gradient guidance.
+
+    Differentiates through the same path ``_score_candidates_fast`` scores with, so
+    the gradient is expressed in FastWAM's normalized action space and can be added
+    straight onto the diffusion latents.
+
+    Returns (grad, q_values). ``grad`` matches ``candidates_norm``'s shape; when
+    ``normalize`` is set it is rescaled to unit RMS per sample so the guidance step
+    size does not depend on the Q head's output scale.
+
+    ``grad_chunk`` bounds how many candidates are differentiated at once. Each
+    candidate's Q is independent, so chunking is exact — it only trades a little
+    speed for peak memory. Holding all of them at once OOMs a 44 GB L40s at the 64
+    samples LIBERO uses (RoboTwin's 32 fit, which is why this went unnoticed).
+
+    Runs under ``torch.enable_grad()``, so it works inside the ``@torch.no_grad()``
+    sampling loop.
+    """
+    grads, qs = [], []
+    step = max(1, grad_chunk)
+    for i in range(0, candidates_norm.shape[0], step):
+        with torch.enable_grad():
+            x = candidates_norm[i : i + step].detach().requires_grad_(True)
+            q = _score_candidates_fast(x, precomputed_context, ctx, img_feats)
+            (g,) = torch.autograd.grad(q.sum(), x)
+        grads.append(g.detach())
+        qs.append(q.detach())
+        del x, q, g
+    grad = torch.cat(grads, dim=0)
+    q = torch.cat(qs, dim=0)
+
+    if normalize:
+        rms = grad.flatten(1).pow(2).mean(dim=1).sqrt().clamp_min(1e-8)
+        grad = grad / rms.view(-1, *([1] * (grad.dim() - 1)))
+    return grad.detach(), q.detach()
 
 
 def _gaussian_kernel_1d(sigma: float, device: torch.device, dtype: torch.dtype) -> Tensor:
