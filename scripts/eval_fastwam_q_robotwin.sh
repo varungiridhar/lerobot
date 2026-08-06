@@ -94,7 +94,17 @@ COND_USE_PLANNING["mppi_std01"]=true
 COND_NOISE_STD["mppi_std01"]=0.1
 COND_NOISE_PER_DIM["mppi_std01"]="0.1,0.1,0.1,0.1,0.1,0.1,0.0,0.1,0.1,0.1,0.1,0.1,0.1,0.0"
 
-CONDITIONS=(baseline mppi_std03 mppi_std02 mppi_std01)
+# 3-step bc_diffusion_mppi: samples N chunks from the diffusion prior and takes the
+# Q-weighted mean of the top-K, rather than perturbing one chunk with Gaussian noise.
+# It matched or beat every noise-based variant on both suites, so it is the default.
+COND_USE_PLANNING["bcdiff_s3"]=true
+COND_NOISE_STD["bcdiff_s3"]=0.3
+COND_NOISE_PER_DIM["bcdiff_s3"]=""
+
+# Only baseline + bc_diffusion_mppi by default. The mppi_std* conditions are kept
+# above but left out: noise_std is read only by the noise-based `mppi` planner, so
+# under bc_diffusion_mppi all three would run identical configs.
+CONDITIONS=(baseline bcdiff_s3)
 N_TASKS=${#ALL_TASKS[@]}
 N_BATCHES=$(( (N_TASKS + BATCH_SIZE - 1) / BATCH_SIZE ))
 
@@ -157,15 +167,14 @@ for COND in "${CONDITIONS[@]}"; do
         --policy.num_inference_steps=10 \\
         --policy.use_planning=true \\
         --policy.planning.q_checkpoint_path=\"\$Q_CKPT\" \\
-        --policy.planning.planner_type=mppi \\
+        --policy.planning.planner_type=bc_diffusion_mppi \\
+        --policy.planning.num_diffusion_steps=3 \\
         --policy.planning.n_samples=32 \\
         --policy.planning.n_iters=3 \\
         --policy.planning.n_elites=8 \\
         --policy.planning.noise_std=${NOISE_STD} \\
-        ${PER_DIM_FLAG} \\
-        --policy.planning.p_flip_gripper=0.1 \\
+        --policy.planning.p_flip_gripper=0.0 \\
         --policy.planning.temperature=1.0 \\
-        --policy.planning.noise_smooth_sigma_t=2.0 \\
         --output_dir='${OUTDIR}' \\
         --seed=${SEED} 2>&1 | tee '${OUTDIR}/log.txt'
     echo '>>> Done ${TASK}'"

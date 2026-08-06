@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 _DIM_X, _DIM_Y, _DIM_Z = 0, 1, 2
 _DIM_GRIPPER = -1
 
+# Dark theme: foreground must be set explicitly or matplotlib defaults to black
+# text, which is unreadable on these backgrounds.
+_FG = "white"
+_BG_FIG = "#0d0d1a"
+_BG_AX = "#1a1a2e"
+
 
 def _q_to_colors(q_vals: np.ndarray, cmap_name: str = "plasma") -> np.ndarray:
     """Map (N,) Q values to (N, 4) RGBA colors via a colormap."""
@@ -77,11 +83,12 @@ def plot_episode_trajectories(
         n_rows, n_cols,
         figsize=(n_cols * 3.2, n_rows * 3.0),
         squeeze=False,
+        constrained_layout=True,
     )
     steps_label = f"{diffusion_steps} steps" if diffusion_steps is not None else "full"
     fig.suptitle(
         f"BC Diffusion Trajectories — episode {episode_idx}, {steps_label}",
-        fontsize=13, y=1.01,
+        fontsize=13, color=_FG,
     )
 
     for panel_idx, chunk in enumerate(chunks_with_actions):
@@ -113,17 +120,22 @@ def plot_episode_trajectories(
         )
 
         q_min, q_max = float(q_vals.min()), float(q_vals.max())
-        ax.set_title(f"chunk {panel_idx}\nQ [{q_min:.3f}, {q_max:.3f}]", fontsize=7)
-        ax.set_xlabel("x", fontsize=7)
-        ax.set_ylabel("y", fontsize=7)
-        ax.tick_params(labelsize=6)
-        ax.set_facecolor("#1a1a2e")
+        ax.set_title(f"chunk {panel_idx}\nQ [{q_min:.3f}, {q_max:.3f}]", fontsize=7, color=_FG)
+        ax.set_xlabel("x", fontsize=7, color=_FG)
+        ax.set_ylabel("y", fontsize=7, color=_FG)
+        ax.tick_params(labelsize=6, colors=_FG)
+        ax.set_facecolor(_BG_AX)
+        for spine in ax.spines.values():
+            spine.set_color(_FG)
         ax.grid(True, color="gray", alpha=0.2, linewidth=0.5)
 
     # Add colorbar to last used axis
     sm = plt.cm.ScalarMappable(cmap="plasma")
     sm.set_array(q_vals)
-    fig.colorbar(sm, ax=axes.ravel().tolist(), label="Q value", shrink=0.6, pad=0.02)
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), label="Q value", shrink=0.6, pad=0.02)
+    cbar.set_label("Q value", color=_FG)
+    cbar.ax.tick_params(colors=_FG)
+    cbar.outline.set_edgecolor(_FG)
 
     # Hide unused panels
     for idx in range(n_panels, n_rows * n_cols):
@@ -131,7 +143,7 @@ def plot_episode_trajectories(
         axes[row][col].set_visible(False)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=120, bbox_inches="tight", facecolor="#0d0d1a")
+    fig.savefig(output_path, dpi=120, facecolor=_BG_FIG)
     plt.close(fig)
     logger.info("Saved trajectory vis: %s", output_path)
 
