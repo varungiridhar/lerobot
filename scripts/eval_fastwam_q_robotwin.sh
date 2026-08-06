@@ -9,7 +9,11 @@ WRAPPER_DIR="${REPO}/tmp_robotwin_wrappers"
 mkdir -p "${REPO}/logs" "$WRAPPER_DIR"
 
 FASTWAM_CKPT=/storage/project/r-agarg35-0/shared/fastwam/hf_checkpoint_robotwin
-Q_CKPT=/storage/project/r-agarg35-0/vgiridhar6/robotwin/outputs/train/qf_robotwin_ddp_20260526_220319/checkpoints/005000/pretrained_model
+# Q checkpoint 45k: best of the 15k/30k/45k sweep across 50 RoboTwin tasks
+# (84.0% with 5 diffusion steps vs 82.8% no-Q baseline; see outputs/eval/robotwin_overview.csv).
+# Read from the user-owned backup rather than the training output, which is not
+# guaranteed to persist — the 5k checkpoint this line used to point at is already gone.
+Q_CKPT=/storage/home/hcoda1/7/igeorgiev3/r-agarg35-0/q_checkpoints_backup/qf_robotwin_ddp_20260526_220319/045000/pretrained_model
 ROBOTWIN_ROOT=/storage/project/r-agarg35-0/vgiridhar6/robotwin/RoboTwin
 CUROBO_SRC=${ROBOTWIN_ROOT}/envs/curobo/src
 
@@ -118,7 +122,7 @@ for COND in "${CONDITIONS[@]}"; do
         # Build task loop body
         TASK_LOOP=""
         for TASK in "${BATCH_TASKS[@]}"; do
-            OUTDIR="${REPO}/outputs/eval/robotwin_${COND}_${TASK}"
+            OUTDIR="${REPO}/outputs/eval/robotwin_${COND}/${TASK}"
             if [ "$USE_PLANNING" = "false" ]; then
                 TASK_LOOP+="
     echo '>>> ${TASK}'
