@@ -61,6 +61,7 @@ def save_episodes_lerobot(
     action_dim: int = 7,
     fps: float = ONLINE_DATASET_FPS,
     camera_keys: tuple[str, ...] = _CAMERA_KEYS,
+    image_shape: "tuple[int, int, int] | None" = None,
 ) -> None:
     """Save a list of episode dicts to a LeRobotDataset at episodes_dir.
 
@@ -77,7 +78,31 @@ def save_episodes_lerobot(
     import numpy as np
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    features = dict(ONLINE_DATASET_FEATURES)
+    # Build the image features from camera_keys rather than the module-level LIBERO
+    # default, otherwise a non-LIBERO env writes frames whose keys do not match the
+    # declared schema and LeRobotDataset.add_frame raises "Feature mismatch".
+    # Online images MUST be stored at the same resolution as the offline dataset they
+    # are batched with: finetune_q concatenates the two, and a DataLoader cannot
+    # collate tensors of different sizes ("Trying to resize storage that is not
+    # resizable"). Default to the resolution the episodes were actually captured at,
+    # which is the env's native size and therefore matches the offline demos.
+    if image_shape is None:
+        first_img = next(
+            (ep[k] for ep in episode_dicts for k in camera_keys if k in ep), None
+        )
+        image_shape = (
+            (int(first_img.shape[-2]), int(first_img.shape[-1]), 3)
+            if first_img is not None else ONLINE_IMAGE_SHAPE
+        )
+
+    features = {k: v for k, v in ONLINE_DATASET_FEATURES.items() if not k.startswith("observation.images.")}
+    features = {k: dict(v) for k, v in features.items()}
+    for key in camera_keys:
+        features[key] = {
+            "dtype": "image",
+            "shape": image_shape,
+            "names": ["height", "width", "channel"],
+        }
     features["action"]["shape"] = (action_dim,)
 
     episodes_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -104,7 +129,7 @@ def save_episodes_lerobot(
                 if key in ep:
                     img = ep[key][t]  # (3, H, W) float32 [0,1]
                     img = torch.flip(img, dims=[1, 2])  # flip H, W to match offline convention
-                    target_h, target_w = ONLINE_IMAGE_SHAPE[:2]
+                    target_h, target_w = image_shape[:2]
                     if img.shape[-2] != target_h or img.shape[-1] != target_w:
                         import torch.nn.functional as F
                         img = F.interpolate(img.unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(0)
