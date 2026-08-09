@@ -65,9 +65,16 @@ TRAIN_ACCOUNT=${TRAIN_ACCOUNT:-gts-agarg35-ideasci23_dgx}
 TRAIN_PARTITION=${TRAIN_PARTITION:-gpu-h200}
 EVAL_ACCOUNT=${EVAL_ACCOUNT:-gts-agarg35-ideas_l40s}
 QOS=${QOS:-inferno}
-# Full 50-task eval after each fine-tune. EVAL_AFTER_TRAIN=0 disables it; each round
-# is 50 tasks x EVAL_EPISODES episodes, so the default is ~1000 episodes per iteration.
-EVAL_AFTER_TRAIN=${EVAL_AFTER_TRAIN:-1}
+# Merged eval+collection. Each task runs N_EVAL_PER_TASK held-out episodes (seeds fixed
+# across iterations, never trained on -> the comparable metric) followed by
+# N_TRAIN_PER_TASK episodes (advancing seeds, saved for finetuning). One rollout pass
+# serves both purposes, so the separate 50-task eval sweep is no longer needed.
+N_EVAL_PER_TASK=${N_EVAL_PER_TASK:-10}
+N_TRAIN_PER_TASK=${N_TRAIN_PER_TASK:-10}
+# Separate post-finetune eval sweep. Now off by default: the next iteration's merged
+# rollout evaluates this checkpoint on held-out seeds anyway, so running it too would
+# duplicate ~1000 episodes per iteration.
+EVAL_AFTER_TRAIN=${EVAL_AFTER_TRAIN:-0}
 EVAL_EPISODES=${EVAL_EPISODES:-20}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-3}   # tasks per eval job
 
@@ -141,7 +148,7 @@ if [ "$COLLECT_SHARDS" -gt 1 ] && [ "$MODE" = "orchestrate" ]; then
             -A "$COLLECT_ACCOUNT" -q "$QOS" -p "$COLLECT_PARTITION" --gres="$COLLECT_GRES" \
             --cpus-per-gpu=4 --mem-per-gpu=64G -t 4:00:00 -J "si_rt_c${k}" \
             -o logs/%j.out -e logs/%j.err \
-            --export=ALL,MODE=collect,SHARD="${k}/${COLLECT_SHARDS}",ITERATION=$ITERATION,Q_CKPT=$Q_CKPT,OUTPUT_DIR=$OUTPUT_DIR,N_EPISODES=$N_EPISODES,PLANNER_TYPE=$PLANNER_TYPE,N_SAMPLES=$N_SAMPLES,N_ELITES=$N_ELITES,DIFFUSION_STEPS=$DIFFUSION_STEPS,SEED=$SEED,WANDB_PROJECT=,COLLECT_SHARDS=$COLLECT_SHARDS \
+            --export=ALL,MODE=collect,SHARD="${k}/${COLLECT_SHARDS}",ITERATION=$ITERATION,Q_CKPT=$Q_CKPT,OUTPUT_DIR=$OUTPUT_DIR,N_EPISODES=$N_EPISODES,PLANNER_TYPE=$PLANNER_TYPE,N_SAMPLES=$N_SAMPLES,N_ELITES=$N_ELITES,DIFFUSION_STEPS=$DIFFUSION_STEPS,SEED=$SEED,WANDB_PROJECT=,COLLECT_SHARDS=$COLLECT_SHARDS,N_EVAL_PER_TASK=$N_EVAL_PER_TASK,N_TRAIN_PER_TASK=$N_TRAIN_PER_TASK \
             "$0")
         SHARD_IDS+=("$JID")
         echo "  shard ${k}/${COLLECT_SHARDS} -> job ${JID}"
@@ -189,9 +196,37 @@ if [ "$MODE" = "finetune" ]; then
     fi
 fi
 
+# Pool the shards' held-out eval results into a single per-iteration figure. Each shard
+# scored its own ~6 tasks; this is the number to compare against the pre-SI baseline.
+if [ "$MODE" = "finetune" ]; then
+    python - "$OUTPUT_DIR" "$ITERATION" <<'PYAGG'
+import json, sys, glob, math
+out, it = sys.argv[1], int(sys.argv[2])
+files = sorted(glob.glob(f"{out}/iter_{it:03d}_shard*/heldout_eval.json"))
+n = s = 0
+for f in files:
+    d = json.load(open(f))
+    k = d.get("n_eval", 0)
+    p = d.get("eval_pc_success")
+    if k and p is not None and not math.isnan(p):
+        n += k; s += p * k / 100.0
+if n:
+    pooled = 100.0 * s / n
+    print(f"HELD-OUT EVAL (iteration {it}, pooled over {len(files)} shards): "
+          f"{s:.0f}/{n} = {pooled:.1f}%")
+    json.dump({"iteration": it, "heldout_pc_success": pooled, "n_heldout": n,
+               "n_shards": len(files)},
+              open(f"{out}/iter_{it:03d}_heldout.json", "w"), indent=2)
+else:
+    print(f"No held-out eval results found for iteration {it} "
+          f"(expected if this iteration predates the merged eval stage).")
+PYAGG
+fi
+
 MODE_FLAGS=""
 case "$MODE" in
-    collect)  MODE_FLAGS="--collect_only --task_shard ${SHARD}" ;;
+    collect)  MODE_FLAGS="--collect_only --task_shard ${SHARD} \
+        --n_eval_per_task ${N_EVAL_PER_TASK} --n_train_per_task ${N_TRAIN_PER_TASK}" ;;
     finetune) MODE_FLAGS="--skip_collect" ;;
 esac
 

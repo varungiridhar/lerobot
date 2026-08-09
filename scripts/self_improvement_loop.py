@@ -38,6 +38,11 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Redirect HuggingFace cache away from the 20 GB home-dir quota.
 os.environ.setdefault("HF_HOME", "/storage/project/r-agarg35-0/shared/huggingface_cache")
 
+# Training seeds start this far past the held-out eval seeds. Large enough that the two
+# blocks can never overlap for any plausible task count or iteration index, which is what
+# keeps the benchmark uncontaminated.
+EVAL_SEED_STRIDE = 1_000_000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Episode collection
@@ -170,7 +175,10 @@ def collect_episodes(
     save_camera_keys: "tuple[str, ...] | None" = None,
     save_image_shape: "tuple[int, int, int] | None" = None,
     latent_pool_path: "Path | None" = None,
-) -> float:
+    n_eval_per_task: int = 0,
+    n_train_per_task: "int | None" = None,
+    eval_seed_base: int = 42,
+) -> dict:
     """Run episodes across all task envs and save them as a LeRobotDataset.
 
     ``shard``: optional ``(k, n)`` — collect only tasks where ``index % n == k``.
@@ -183,8 +191,18 @@ def collect_episodes(
     and closed straight after. RoboTwin needs this — holding all 50 SAPIEN sims
     open at once exhausts the job's memory, whereas a LIBERO suite's 10 envs fit.
 
-    Distributes n_episodes evenly across tasks. Saves to episodes_dir in LeRobot
-    format (parquet + PNG images) for lazy per-frame loading. Returns success rate.
+    ``n_eval_per_task`` / ``n_train_per_task``: episodes per task, run in ONE pass.
+    Held-out eval episodes use seeds fixed across iterations and are never saved, so the
+    success rate stays a clean cross-iteration metric. Training episodes use advancing
+    seeds and are the only ones written to disk. This replaces running a separate eval
+    sweep over the same policy: one rollout serves both purposes.
+
+    When ``n_eval_per_task`` is 0 the function behaves as before, splitting
+    ``n_episodes`` evenly across tasks and saving all of them.
+
+    Saves to episodes_dir in LeRobot format (parquet + PNG images) for lazy per-frame
+    loading. Returns {"eval_pc_success", "train_pc_success", "n_eval", "n_train"};
+    eval_pc_success is NaN when no held-out episodes were requested.
     """
     from lerobot.policies.q_function.online_dataset import save_episodes_lerobot
 
@@ -198,6 +216,9 @@ def collect_episodes(
     # sharded run collects exactly the same episodes as an unsharded one.
     n_tasks = len(all_task_envs)
     eps_per_task = max(1, n_episodes // n_tasks)
+    if n_train_per_task is None:
+        n_train_per_task = eps_per_task if n_eval_per_task == 0 else eps_per_task
+    per_task = n_eval_per_task + n_train_per_task
     if shard is not None:
         k, n = shard
         task_envs = [(tg, tid, e) for i, (tg, tid, e) in enumerate(all_task_envs) if i % n == k]
@@ -209,18 +230,24 @@ def collect_episodes(
         task_envs = all_task_envs
         shard_index = {tg: i for i, (tg, _, _) in enumerate(all_task_envs)}
 
-    log.info(f"Collecting {n_episodes} episodes across {n_tasks} task envs ({eps_per_task} per task) ...")
+    log.info(f"Rollout over {len(task_envs)} tasks: {n_eval_per_task} held-out eval + "
+             f"{n_train_per_task} training episodes each ({per_task * len(task_envs)} total)")
 
     all_episode_dicts: list[dict] = []
     all_successes: list[bool] = []
+    eval_successes: list[bool] = []
     failed_tasks: list[str] = []
     total_eps = 0
 
     for tg, tid, env in task_envs:
-        if shard is None and total_eps >= n_episodes:
+        # The legacy n_episodes cap applies only in legacy mode. With explicit
+        # per-task counts the caller has already said exactly how many episodes to
+        # run, and applying the cap here would silently truncate the rollout.
+        if shard is None and n_eval_per_task == 0 and total_eps >= n_episodes:
             break
         built_here = False
         task_success = 0
+        eval_task_success = 0
         # A crash in one task must not discard every episode collected so far. Some
         # RoboTwin tasks raise from their own check_success() when driven by a learned
         # policy (e.g. open_laptop reads self.arm_tag, which only the scripted demo
@@ -230,22 +257,45 @@ def collect_episodes(
             if env is None:
                 env = env_factory(tg)  # returns a VectorEnv for this task
                 built_here = True
-            for _ep_i in range(eps_per_task):
-                # Derived from the task's position in the full task list so the seed
-                # for a given (task, episode) is identical sharded or not.
-                seed = start_seed + shard_index[tg] * eps_per_task + _ep_i
+            # Two blocks of episodes per task in ONE rollout pass.
+            #
+            #   held-out : seeds fixed across every iteration -> the comparable metric.
+            #              NEVER saved for training, so the benchmark stays clean.
+            #   training : seeds advance each iteration -> fresh states, saved to disk.
+            #
+            # Training on the held-out seeds would let the loop fit the very states its
+            # score is computed on, and "iteration N improved" would be partly
+            # memorisation with no way to separate it out.
+            for _ep_i in range(n_eval_per_task + n_train_per_task):
+                is_eval = _ep_i < n_eval_per_task
+                if is_eval:
+                    # Independent of start_seed, hence identical every iteration.
+                    seed = eval_seed_base + shard_index[tg] * n_eval_per_task + _ep_i
+                else:
+                    # Offset past the held-out block so the two never collide.
+                    j = _ep_i - n_eval_per_task
+                    seed = (start_seed + EVAL_SEED_STRIDE
+                            + shard_index[tg] * n_train_per_task + j)
                 ep_dict = _run_episode(
                     env=env, policy=policy,
                     env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
                     preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
                 )
                 success = ep_dict["success"]
-                all_successes.append(success)
-                all_episode_dicts.append(ep_dict)
+                if is_eval:
+                    eval_successes.append(success)
+                    eval_task_success += int(success)
+                else:
+                    all_successes.append(success)
+                    all_episode_dicts.append(ep_dict)
+                    task_success += int(success)
                 total_eps += 1
-                if success:
-                    task_success += 1
-            log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
+            parts = []
+            if n_eval_per_task:
+                parts.append(f"eval {eval_task_success}/{n_eval_per_task}")
+            if n_train_per_task:
+                parts.append(f"train {task_success}/{n_train_per_task}")
+            log.info(f"  Task {tg}/{tid}: " + "  ".join(parts))
         except Exception as e:
             failed_tasks.append(tg)
             log.warning(f"  Task {tg}/{tid}: SKIPPED after {task_success} episodes — "
@@ -300,8 +350,13 @@ def collect_episodes(
 
     n_success = sum(all_successes)
     pc_success = 100.0 * n_success / max(len(all_successes), 1)
-    log.info(f"  Total: {len(all_episode_dicts)} episodes ({n_success} success, {len(all_successes)-n_success} failure), success={pc_success:.1f}%")
-    return pc_success
+    eval_pc = (100.0 * sum(eval_successes) / len(eval_successes)) if eval_successes else float("nan")
+    log.info(f"  Training set: {len(all_episode_dicts)} episodes saved, {pc_success:.1f}% success")
+    if eval_successes:
+        log.info(f"  HELD-OUT EVAL: {sum(eval_successes)}/{len(eval_successes)} = {eval_pc:.1f}% "
+                 f"(fixed seeds, never trained on)")
+    return {"eval_pc_success": eval_pc, "train_pc_success": pc_success,
+            "n_eval": len(eval_successes), "n_train": len(all_episode_dicts)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -648,12 +703,24 @@ def self_improvement_loop(args):
         )
         log.info(f"wandb run: {_wandb.run.get_url()}")
 
-    # ── Set up FastWAM + env + preprocessors ─────────────────────────────────
-    (policy, planner, envs, preprocessor, postprocessor, env_preprocessor,
-     env_postprocessor, env_factory) = _setup_policy_and_env(args, device)
-
-    # Q policy reference (lives inside planner.ctx)
-    q_policy = planner.ctx.q_policy
+    # ── Set up policy + env, unless this job only finetunes ──────────────────
+    # A --skip_collect job runs no rollouts, so FastWAM (6B params) and the sim env
+    # are pure overhead: loading FastWAM costs ~4 min, ~12 GiB of VRAM, and leaves the
+    # allocator fragmented. Offloading it to CPU afterwards was not enough — an 80 GiB
+    # H100 still OOM'd once Q's params, grads, Adam state, target network and batch-48
+    # DINOv2 activations were stacked on top. Load only the Q function.
+    if args.skip_collect:
+        from lerobot.policies.q_function.modeling_q_function import QFunctionPolicy
+        log.info("--skip_collect: loading Q only (no FastWAM, no env).")
+        q_policy = QFunctionPolicy.from_pretrained(args.q_ckpt).to(device).eval()
+        policy = planner = envs = None
+        preprocessor = postprocessor = None
+        env_preprocessor = env_postprocessor = env_factory = None
+    else:
+        (policy, planner, envs, preprocessor, postprocessor, env_preprocessor,
+         env_postprocessor, env_factory) = _setup_policy_and_env(args, device)
+        # Q policy reference (lives inside planner.ctx)
+        q_policy = planner.ctx.q_policy
     is_dsrl = args.planner_type == "dsrl"
 
     # ── Negative-Q paradigm override (controlled toggle) ─────────────────────
@@ -706,6 +773,8 @@ def self_improvement_loop(args):
 
         # ── 1. Collect episodes ──────────────────────────────────────────────
         pc_success = float("nan")
+        heldout_pc = float("nan")
+        n_heldout = 0
         if not args.skip_collect:
             shard = None
             if args.task_shard:
@@ -719,7 +788,7 @@ def self_improvement_loop(args):
             iter_out = output_dir / f"iter_{iteration:03d}_shard{shard[0]:02d}" if shard else iter_dir
             iter_out.mkdir(parents=True, exist_ok=True)
             episodes_dir = iter_out / "online_episodes"
-            pc_success = collect_episodes(
+            stats = collect_episodes(
                 policy=policy,
                 envs=envs,
                 env_preprocessor=env_preprocessor,
@@ -744,9 +813,20 @@ def self_improvement_loop(args):
                 # to 224 internally, so this only affects storage, not what Q sees.
                 save_image_shape=_offline_image_shape(args),
                 latent_pool_path=(iter_out / "latent_pool.npz") if is_dsrl else None,
+                n_eval_per_task=args.n_eval_per_task,
+                n_train_per_task=args.n_train_per_task,
+                eval_seed_base=args.eval_seed_base,
             )
+            pc_success = stats["train_pc_success"]
+            heldout_pc = stats["eval_pc_success"]
+            n_heldout = stats["n_eval"]
             if args.collect_only:
-                log.info(f"--collect_only: wrote {episodes_dir}, success={pc_success:.1f}%. Done.")
+                log.info(f"--collect_only: wrote {episodes_dir} "
+                         f"({stats['n_train']} train eps, {pc_success:.1f}% success; "
+                         f"{stats['n_eval']} held-out eval eps, {heldout_pc:.1f}%). Done.")
+                # Held-out results live beside the episodes so the finetune job can
+                # aggregate them across shards without re-running anything.
+                (iter_out / "heldout_eval.json").write_text(json.dumps(stats, indent=2))
                 return
         else:
             log.info("--skip_collect: finetuning on previously collected episodes.")
@@ -770,7 +850,7 @@ def self_improvement_loop(args):
         # is reloaded to GPU before the next iteration's collection. q_policy is
         # reached via a plain attribute (planner._planner.ctx.q_policy), NOT a
         # registered submodule of `policy`, so policy.to("cpu") never moves it.
-        offloaded = device.type == "cuda"
+        offloaded = device.type == "cuda" and policy is not None
         if offloaded:
             policy.to("cpu")
             torch.cuda.empty_cache()
@@ -869,6 +949,9 @@ def self_improvement_loop(args):
             if use_wandb:
                 import wandb as _wandb
                 log_dict = {
+                    "heldout/pc_success": heldout_pc,
+                    "heldout/n_episodes": n_heldout,
+                    "collect/train_pc_success": pc_success,
                     "collect/pc_success": pc_success,
                     "collect/n_collected": args.n_episodes,
                     "finetune/mean_loss": mean_loss,
@@ -885,7 +968,9 @@ def self_improvement_loop(args):
         elif use_wandb:
             import wandb as _wandb
             _wandb.log(
-                {"collect/pc_success": pc_success, "collect/n_collected": args.n_episodes, "finetune/mean_loss": mean_loss},
+                {"heldout/pc_success": heldout_pc, "heldout/n_episodes": n_heldout,
+                 "collect/train_pc_success": pc_success, "collect/pc_success": pc_success,
+                 "collect/n_collected": args.n_episodes, "finetune/mean_loss": mean_loss},
                 step=global_step,
             )
 
@@ -893,6 +978,16 @@ def self_improvement_loop(args):
             "iteration": iteration,
             "n_collected": args.n_episodes,
             "n_online_frames": len(online_ds),
+            # THE headline number: success on held-out episodes whose seeds are fixed
+            # across iterations and never trained on. This is the only figure that is
+            # comparable between iterations — compare it against the pre-SI baseline.
+            "heldout_pc_success": heldout_pc,
+            "n_heldout": n_heldout,
+            # Success on the TRAINING episodes. Their seeds advance every iteration, so
+            # this moves with task difficulty as well as policy quality: useful for
+            # spotting collapse, not valid as a trend.
+            "train_pc_success": pc_success,
+            # Deprecated alias kept so older readers of loop_summary.jsonl keep working.
             "pc_success": pc_success,
             "eval_pc_success": eval_pc_success,
             "finetune_loss": mean_loss,
@@ -905,8 +1000,9 @@ def self_improvement_loop(args):
 
         (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
         log.info(
-            f"Iteration {iteration} done: collect={pc_success:.1f}% eval={eval_pc_success} "
-            f"loss={mean_loss:.4f} elapsed={metrics['elapsed_s']:.1f}s"
+            f"Iteration {iteration} done: HELD-OUT={heldout_pc:.1f}% (n={n_heldout}) "
+            f"train={pc_success:.1f}% loss={mean_loss:.4f} "
+            f"elapsed={metrics['elapsed_s']:.1f}s"
         )
 
     if use_wandb:
@@ -934,6 +1030,15 @@ def parse_args():
     # finetunes. Mirrors how the RoboTwin eval suite splits tasks across jobs.
     p.add_argument("--task_shard", default=None, metavar="K/N",
                    help="Collect only tasks where index %% N == K (e.g. 0/8).")
+    # Merged eval+collection: each task runs n_eval held-out episodes (seeds fixed
+    # across iterations, never saved) followed by n_train episodes (advancing seeds,
+    # saved for finetuning). One rollout pass yields both the metric and the data.
+    p.add_argument("--n_eval_per_task", type=int, default=0,
+                   help="Held-out episodes per task; 0 disables the merged eval.")
+    p.add_argument("--n_train_per_task", type=int, default=None,
+                   help="Training episodes per task (default: n_episodes // n_tasks).")
+    p.add_argument("--eval_seed_base", type=int, default=42,
+                   help="Seed base for held-out episodes; keep fixed across iterations.")
     p.add_argument("--collect_only", action="store_true",
                    help="Collect episodes and exit before finetuning.")
     p.add_argument("--skip_collect", action="store_true",
