@@ -225,6 +225,102 @@ Cost profile is favourable: collection uses the same 16 decodes/step as the Q-Pl
 step instead of 16** — no per-step search at all. The latent fit needs no diffusion runs,
 since every `pi_dp(s,w)` was already computed and stored during collection.
 
+## 7c. How to run the RoboTwin self-improvement loop
+
+Verified on the PACE cluster, 2026-08-09. Collection and eval on L40s, training on
+H100/H200.
+
+### Launch
+
+```bash
+cd /storage/project/r-agarg35-0/igeorgiev3/lerobot
+COLLECT_SHARDS=8 bash scripts/run_self_improvement_robotwin.sh
+```
+
+That is the whole thing. It submits 8 collection shards plus a finetune job gated on
+them, and from there the loop is self-driving: each iteration collects, finetunes,
+submits a full 50-task eval, and chains the next iteration. No babysitting.
+
+Do NOT `sbatch` the script for a sharded run — run it with `bash`. In orchestrate mode
+it is a submitter, not a job; `sbatch` would burn a GPU allocation doing nothing but
+calling `sbatch` again. (`sbatch scripts/run_self_improvement_robotwin.sh` is only
+correct for the unsharded `COLLECT_SHARDS=1` path.)
+
+### What runs where
+
+| stage | account | partition | jobs |
+|-------|---------|-----------|------|
+| collection | `gts-agarg35-ideas_l40s` | `gpu-l40s` | `COLLECT_SHARDS` (default 1, use 8) |
+| finetune | `gts-agarg35-ideasci23_dgx` | `gpu-h200` -> lands on `gpu-h100` | 1, after all shards |
+| eval (50 tasks) | `gts-agarg35-ideas_l40s` | `gpu-l40s` | 17 (3 tasks each) |
+
+All on `inferno`. The finetune says `gpu-h200` but the DGX account cannot reach H200 and
+SLURM places it on `gpu-h100` — that is expected, not a misconfiguration. For a real
+H200 use `TRAIN_ACCOUNT=gts-agarg35 TRAIN_PARTITION=gpu-h200`.
+
+Collection needs only **28.4 GiB** (measured, FastWAM + Q), so it fits any modern card.
+If L40s is contended, widen it — but note the account must match the partition:
+
+```bash
+COLLECT_SHARDS=8 COLLECT_ACCOUNT=gts-agarg35 \
+  COLLECT_PARTITION=gpu-l40s,gpu-a100,gpu-h100 COLLECT_GRES=gpu:1 \
+  bash scripts/run_self_improvement_robotwin.sh
+```
+
+`gts-agarg35-ideas_l40s` reaches ONLY `gpu-l40s`; asking it for another partition
+silently falls back to L40s rather than erroring. A multi-partition list also needs the
+generic `gpu:1` gres, since a typed `gpu:l40s:1` pins the job back to L40s.
+
+### Knobs worth knowing
+
+| var | default | note |
+|-----|---------|------|
+| `COLLECT_SHARDS` | 1 | 8 gives ~1.2 h collection vs ~3.2 h sequential |
+| `MAX_ITERATIONS` | 10 | |
+| `N_EPISODES` | 100 | on-policy episodes per iteration, spread over tasks |
+| `FINETUNE_STEPS` | 200 | |
+| `EVAL_AFTER_TRAIN` | 1 | 0 skips the 50-task eval (~1000 episodes/iteration) |
+| `EVAL_EPISODES` | 20 | per task |
+| `Q_CKPT` | 45k backup | starting critic |
+| `DRY_RUN` | 0 | 1 prints the submission plan and submits nothing |
+
+Always `DRY_RUN=1` first — it shows exactly which accounts and partitions the shards and
+finetune would use.
+
+### Timings and cost
+
+Collection ~1.2 h wall on 8 shards. Finetune minutes. Eval ~1000 episodes per iteration.
+Online episodes accumulate as a growing buffer at ~21 GB/iteration, so budget ~210 GB
+for a 10-iteration run.
+
+### Monitoring
+
+```bash
+squeue -u $USER -o "%.10i %.10j %.9T %.7M %R"
+ls -d outputs/self_improvement/si_robotwin_ck045k_s3/iter_000_shard*/online_episodes | wc -l
+python scripts/summarize_eval.py 'outputs/eval/robotwin_si_rt_iter*' --table
+```
+
+Per iteration you get `iter_NNN_shardKK/online_episodes` (episodes),
+`iter_NNN/q_checkpoint`, `iter_NNN/metrics.json`, and an appended `loop_summary.jsonl`.
+
+**The number that decides whether to keep going: 82.6%**, the pre-SI score of this exact
+config (`outputs/eval/robotwin_bcdiff_s3_ck045k`). Binomial SE on 940 episodes is ~1.2pp,
+so iteration 0 needs to clear ~84% to mean anything.
+
+### Failure modes and what to do
+
+- **Shards pending for hours.** Normal when `gpu-l40s` is busy; 4 of its 10 nodes have
+  been drained since July, leaving 48 of 80 GPUs. Check `sinfo -p gpu-l40s -h -o "%n %t"`
+  and `squeue -u $USER --start`. Widen partitions (above) rather than waiting days.
+- **A shard fails.** The barrier is `afterany`, so the finetune still runs; it refuses if
+  fewer than half the shards produced data and warns otherwise. Resubmitting the same
+  command re-collects only the missing shards — completed ones are skipped.
+- **`open_laptop` / `place_object_scale` / `put_object_cabinet` skipped.** Expected, see
+  trap 1. The loop trains on 47 of 50 tasks.
+- **Chain stops.** Look at the finetune job's log first; the chain only advances on a
+  clean finetune exit, which is intentional.
+
 ## 8. Open questions, roughly in order of value
 
 1. **Is this Q function informative at all?** Three independent attempts (checkpoint
