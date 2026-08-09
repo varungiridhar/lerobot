@@ -67,6 +67,11 @@ def _run_episode(
     policy.reset()
     observation, info = env.reset(seed=[seed] if seed is not None else None)
 
+    # DSRL records one latent per planning step and needs to know which env step it was
+    # taken at, so the record can be matched to a saved dataset frame later.
+    planner = getattr(policy, "_planner", None)
+    latent_planner = planner if hasattr(planner, "pop_episode_latents") else None
+
     all_obs_tensors: list[dict] = []
     all_actions: list = []
     all_successes: list = []
@@ -86,6 +91,9 @@ def _run_episode(
         obs_tensor = add_envs_task(env, obs_tensor)
         obs_tensor = env_preprocessor(obs_tensor)
         obs_tensor = preprocessor(obs_tensor)
+
+        if latent_planner is not None:
+            latent_planner.note_env_step(step)
 
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
@@ -127,7 +135,23 @@ def _run_episode(
             ep_dict["task"] = task_attr
 
     ep_dict["next.success"] = torch.tensor(all_successes, dtype=torch.bool)
+    if latent_planner is not None:
+        ep_dict["latent_records"] = latent_planner.pop_episode_latents()
     return ep_dict
+
+
+def _offline_image_shape(args) -> "tuple[int, int, int] | None":
+    """(H, W, C) of the offline dataset's images, or None if it cannot be read."""
+    import json
+    from pathlib import Path as _P
+    info = _P(args.original_dataset_root) / "meta" / "info.json"
+    if not info.exists():
+        return None
+    feats = json.loads(info.read_text()).get("features", {})
+    for k, v in feats.items():
+        if k.startswith("observation.images.") and "shape" in v:
+            return tuple(v["shape"])
+    return None
 
 
 def collect_episodes(
@@ -140,45 +164,139 @@ def collect_episodes(
     n_episodes: int,
     episodes_dir: Path,
     start_seed: int = 0,
+    env_factory=None,
+    shard: "tuple[int, int] | None" = None,
+    camera_key_map: "dict[str, str] | None" = None,
+    save_camera_keys: "tuple[str, ...] | None" = None,
+    save_image_shape: "tuple[int, int, int] | None" = None,
+    latent_pool_path: "Path | None" = None,
 ) -> float:
     """Run episodes across all task envs and save them as a LeRobotDataset.
+
+    ``shard``: optional ``(k, n)`` — collect only tasks where ``index % n == k``.
+    Lets N SLURM jobs collect disjoint task subsets in parallel, the same way the
+    RoboTwin eval suite shards. Each shard writes its own dataset dir; the
+    ``iter_*/online_episodes`` glob in OnlineQDataset reunites them at finetune time.
+
+    ``env_factory``: optional ``(task_name) -> envs_dict`` callable. When given,
+    ``envs`` is ignored and each task's env is built immediately before its episodes
+    and closed straight after. RoboTwin needs this — holding all 50 SAPIEN sims
+    open at once exhausts the job's memory, whereas a LIBERO suite's 10 envs fit.
 
     Distributes n_episodes evenly across tasks. Saves to episodes_dir in LeRobot
     format (parquet + PNG images) for lazy per-frame loading. Returns success rate.
     """
     from lerobot.policies.q_function.online_dataset import save_episodes_lerobot
 
-    task_envs = [(tg, tid, env) for tg, group in envs.items() for tid, env in group.items()]
-    n_tasks = len(task_envs)
+    if env_factory is not None:
+        # (task_group, task_id, None) — the env is built inside the loop below.
+        all_task_envs = [(t, 0, None) for t in env_factory.tasks]
+    else:
+        all_task_envs = [(tg, tid, env) for tg, group in envs.items() for tid, env in group.items()]
+
+    # eps_per_task is computed over ALL tasks, then the shard takes its slice, so a
+    # sharded run collects exactly the same episodes as an unsharded one.
+    n_tasks = len(all_task_envs)
     eps_per_task = max(1, n_episodes // n_tasks)
+    if shard is not None:
+        k, n = shard
+        task_envs = [(tg, tid, e) for i, (tg, tid, e) in enumerate(all_task_envs) if i % n == k]
+        # Seeds are derived from the task's index in the FULL list (below), not from a
+        # running counter, so every shard reproduces the seeds it would have used.
+        shard_index = {tg: i for i, (tg, _, _) in enumerate(all_task_envs) if i % n == k}
+        log.info(f"Shard {k}/{n}: {len(task_envs)} of {n_tasks} tasks")
+    else:
+        task_envs = all_task_envs
+        shard_index = {tg: i for i, (tg, _, _) in enumerate(all_task_envs)}
 
     log.info(f"Collecting {n_episodes} episodes across {n_tasks} task envs ({eps_per_task} per task) ...")
 
     all_episode_dicts: list[dict] = []
     all_successes: list[bool] = []
+    failed_tasks: list[str] = []
     total_eps = 0
 
     for tg, tid, env in task_envs:
-        if total_eps >= n_episodes:
+        if shard is None and total_eps >= n_episodes:
             break
+        built_here = False
         task_success = 0
-        for _ep_i in range(eps_per_task):
-            seed = start_seed + total_eps
-            ep_dict = _run_episode(
-                env=env, policy=policy,
-                env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
-            )
-            success = ep_dict["success"]
-            all_successes.append(success)
-            all_episode_dicts.append(ep_dict)
-            total_eps += 1
-            if success:
-                task_success += 1
-        log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
+        # A crash in one task must not discard every episode collected so far. Some
+        # RoboTwin tasks raise from their own check_success() when driven by a learned
+        # policy (e.g. open_laptop reads self.arm_tag, which only the scripted demo
+        # play_once() ever assigns), and each eval task normally runs in its own
+        # process, so this only became fatal once all 50 shared one.
+        try:
+            if env is None:
+                env = env_factory(tg)  # returns a VectorEnv for this task
+                built_here = True
+            for _ep_i in range(eps_per_task):
+                # Derived from the task's position in the full task list so the seed
+                # for a given (task, episode) is identical sharded or not.
+                seed = start_seed + shard_index[tg] * eps_per_task + _ep_i
+                ep_dict = _run_episode(
+                    env=env, policy=policy,
+                    env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
+                )
+                success = ep_dict["success"]
+                all_successes.append(success)
+                all_episode_dicts.append(ep_dict)
+                total_eps += 1
+                if success:
+                    task_success += 1
+            log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
+        except Exception as e:
+            failed_tasks.append(tg)
+            log.warning(f"  Task {tg}/{tid}: SKIPPED after {task_success} episodes — "
+                        f"{type(e).__name__}: {e}")
+        finally:
+            if built_here and env is not None:
+                try:
+                    env.close()
+                except Exception as e:  # a close failure must not abort collection
+                    log.warning(f"  failed to close env for {tg}: {e}")
+
+    if failed_tasks:
+        # Surfaced explicitly: a silently shrinking task set would look like a real
+        # change in success rate across iterations.
+        log.warning(f"  {len(failed_tasks)} task(s) skipped due to env errors: {', '.join(failed_tasks)}")
+    if not all_episode_dicts:
+        raise RuntimeError("collect_episodes gathered 0 episodes — every task errored")
+
+    # The env emits its own camera names (RoboTwin: head_camera/left_camera/
+    # right_camera); the Q function indexes by its own (cam_high/cam_left_wrist/
+    # cam_right_wrist). Rename before saving so OnlineQDataset can read the result.
+    if camera_key_map:
+        for ep in all_episode_dicts:
+            for src, dst in camera_key_map.items():
+                if src in ep:
+                    ep[dst] = ep.pop(src)
 
     action_dim = int(all_episode_dicts[0]["action"].shape[1]) if all_episode_dicts else 7
-    save_episodes_lerobot(all_episode_dicts, episodes_dir, action_dim=action_dim)
+    save_kwargs = {"action_dim": action_dim}
+    if save_camera_keys:
+        save_kwargs["camera_keys"] = save_camera_keys
+    if save_image_shape:
+        save_kwargs["image_shape"] = save_image_shape
+    save_episodes_lerobot(all_episode_dicts, episodes_dir, **save_kwargs)
+
+    # DSRL only: the per-planning-step latent pool, ordered to match the episodes just
+    # written (save_episodes_lerobot consumes all_episode_dicts in this same order).
+    if latent_pool_path is not None:
+        from lerobot.policies.dsrl.planning_dsrl import save_latent_pool
+
+        planner = getattr(policy, "_planner", None)
+        img_hw = getattr(planner, "img_hw", None)
+        if img_hw is None:
+            raise RuntimeError(
+                "DSRL collection produced no planner image size — the planner was never called."
+            )
+        save_latent_pool(
+            [ep.get("latent_records", []) for ep in all_episode_dicts],
+            latent_pool_path,
+            img_hw=img_hw,
+        )
 
     n_success = sum(all_successes)
     pc_success = 100.0 * n_success / max(len(all_successes), 1)
@@ -374,7 +492,8 @@ def finetune_q(
 def _setup_policy_and_env(args, device: torch.device):
     """Build FastWAM policy, Q planner, env, and all processors."""
     from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.envs.configs import LiberoEnv
+    from lerobot.envs.configs import LiberoEnv, RoboTwinEnv
+    from lerobot.utils.constants import OBS_IMAGES
     from lerobot.envs.factory import make_env, make_env_pre_post_processors
     from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
     from lerobot.policies.fastwam.planning import FastWAMPlanner
@@ -383,9 +502,48 @@ def _setup_policy_and_env(args, device: torch.device):
 
     set_seed(args.seed)
 
-    env_cfg = LiberoEnv(task=args.task, observation_height=224, observation_width=224)
-    log.info(f"Creating LIBERO env: {args.task}")
-    envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
+    if args.env_type == "robotwin":
+        # A LIBERO suite name ("libero_10") expands to all its tasks in one make_env
+        # call; RoboTwin has no suite concept, so build one env per task and merge.
+        # The collection loop below already iterates over every (group, id, env).
+        tasks = [t.strip() for t in args.task.split(",") if t.strip()]
+        if not tasks:
+            raise ValueError("--task must list at least one RoboTwin task")
+        if not args.robotwin_root:
+            raise ValueError("--robotwin_root is required when --env_type robotwin")
+        log.info(f"RoboTwin: {len(tasks)} tasks, envs built lazily per task")
+
+        class _RoboTwinEnvFactory:
+            """Builds one task's env on demand; collection closes it when done."""
+
+            def __init__(self, task_list, robotwin_root):
+                self.tasks = task_list
+                self._root = robotwin_root
+
+            def __call__(self, task):
+                cfg = RoboTwinEnv(task=task, robotwin_root=self._root)
+                group = make_env(cfg, n_envs=1, use_async_envs=False)
+                # make_env returns {task_group: {task_id: VectorEnv}}; unwrap to the env.
+                inner = next(iter(group.values()))
+                return next(iter(inner.values()))
+
+        env_factory = _RoboTwinEnvFactory(tasks, args.robotwin_root)
+        # _run_episode captures observations before the env preprocessor runs, so the
+        # saved keys are RoboTwin's raw camera names. Map them onto the Q function's.
+        env_factory.camera_key_map = {
+            f"{OBS_IMAGES}.head_camera": f"{OBS_IMAGES}.cam_high",
+            f"{OBS_IMAGES}.left_camera": f"{OBS_IMAGES}.cam_left_wrist",
+            f"{OBS_IMAGES}.right_camera": f"{OBS_IMAGES}.cam_right_wrist",
+        }
+        # One env up front: make_policy and the env processors need a concrete cfg,
+        # and they depend on the env type rather than the individual task.
+        env_cfg = RoboTwinEnv(task=tasks[0], robotwin_root=args.robotwin_root)
+        envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
+    else:
+        env_factory = None
+        env_cfg = LiberoEnv(task=args.task, observation_height=224, observation_width=224)
+        log.info(f"Creating LIBERO env: {args.task}")
+        envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
 
     # PreTrainedConfig.from_pretrained dispatches on the 'type' field and returns FastWAMConfig.
     log.info("Loading FastWAM policy ...")
@@ -407,9 +565,11 @@ def _setup_policy_and_env(args, device: torch.device):
     # Build Q planner config and attach planner.
     from lerobot.policies.act_simple.planning import PlanningConfig
 
+    # "dsrl" is not one of PlanningConfig's action-space planners; it only borrows the
+    # config for the Q checkpoint path and the denoising-step count.
     planning_cfg = PlanningConfig(
         q_checkpoint_path=args.q_ckpt,
-        planner_type=args.planner_type,
+        planner_type="bc_diffusion_mppi" if args.planner_type == "dsrl" else args.planner_type,
         n_samples=args.n_samples,
         n_elites=args.n_elites,
         noise_std=0.3,
@@ -420,16 +580,46 @@ def _setup_policy_and_env(args, device: torch.device):
     if args.noise_smooth_sigma_t is not None:
         planning_cfg.noise_smooth_sigma_t = args.noise_smooth_sigma_t
 
-    planner = FastWAMPlanner.from_checkpoints(
-        cfg=planning_cfg,
-        bc_post=postprocessor,
-        bc_chunk_size=int(policy_cfg.chunk_size),
-        device=device,
-    )
-    policy.attach_planner(planner)
-    log.info("FastWAM + Q planner ready.")
+    if args.planner_type == "dsrl":
+        from lerobot.policies.dsrl.planning_dsrl import DSRLPlanner
 
-    return policy, planner, envs, preprocessor, postprocessor, env_preprocessor, env_postprocessor
+        # Resume: a chained job restarts the process, so pick up the newest saved agent
+        # rather than starting from an untrained one (which would silently revert to BC).
+        agent_path = None
+        prior = sorted(Path(args.output_dir).glob("iter_*/dsrl_agent.pt"))
+        if prior:
+            agent_path = prior[-1]
+        # n_pool + the executed sample = n_samples decodes per planning step, i.e. the same
+        # diffusion budget per step as the Q-Planning arm it is being compared against.
+        planner = DSRLPlanner.from_checkpoints(
+            cfg=planning_cfg,
+            bc_post=postprocessor,
+            bc_chunk_size=int(policy_cfg.chunk_size),
+            device=device,
+            bc_action_dim=int(policy_cfg.action_dim),
+            dsrl_cfg_overrides={
+                "tiled": not args.dsrl_full_latent,
+                "b_w": args.dsrl_b_w,
+                "hidden": args.dsrl_hidden,
+                "n_critics": args.dsrl_n_critics,
+                "explore_std": args.dsrl_explore_std,
+            },
+            n_pool=max(0, args.n_samples - 1),
+            agent_path=agent_path,
+        )
+        log.info("FastWAM + DSRL latent-steering planner ready.")
+    else:
+        planner = FastWAMPlanner.from_checkpoints(
+            cfg=planning_cfg,
+            bc_post=postprocessor,
+            bc_chunk_size=int(policy_cfg.chunk_size),
+            device=device,
+        )
+        log.info("FastWAM + Q planner ready.")
+    policy.attach_planner(planner)
+
+    return (policy, planner, envs, preprocessor, postprocessor,
+            env_preprocessor, env_postprocessor, env_factory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,12 +649,12 @@ def self_improvement_loop(args):
         log.info(f"wandb run: {_wandb.run.get_url()}")
 
     # ── Set up FastWAM + env + preprocessors ─────────────────────────────────
-    policy, planner, envs, preprocessor, postprocessor, env_preprocessor, env_postprocessor = (
-        _setup_policy_and_env(args, device)
-    )
+    (policy, planner, envs, preprocessor, postprocessor, env_preprocessor,
+     env_postprocessor, env_factory) = _setup_policy_and_env(args, device)
 
     # Q policy reference (lives inside planner.ctx)
     q_policy = planner.ctx.q_policy
+    is_dsrl = args.planner_type == "dsrl"
 
     # ── Negative-Q paradigm override (controlled toggle) ─────────────────────
     # The in-loop finetune calls q_policy.forward(batch), which adds the
@@ -515,18 +705,51 @@ def self_improvement_loop(args):
         t0 = time.time()
 
         # ── 1. Collect episodes ──────────────────────────────────────────────
-        episodes_dir = iter_dir / "online_episodes"
-        pc_success = collect_episodes(
-            policy=policy,
-            envs=envs,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=args.n_episodes,
-            episodes_dir=episodes_dir,
-            start_seed=start_seed,
-        )
+        pc_success = float("nan")
+        if not args.skip_collect:
+            shard = None
+            if args.task_shard:
+                k, n = (int(x) for x in args.task_shard.split("/"))
+                if not 0 <= k < n:
+                    raise ValueError(f"--task_shard K/N needs 0 <= K < N, got {args.task_shard}")
+                shard = (k, n)
+            # Shards write to sibling iter_<i>_shard<k> dirs. OnlineQDataset globs
+            # "iter_*/online_episodes", so the finetune step reunites them with no
+            # merge step — but only if the shard dir keeps that exact leaf name.
+            iter_out = output_dir / f"iter_{iteration:03d}_shard{shard[0]:02d}" if shard else iter_dir
+            iter_out.mkdir(parents=True, exist_ok=True)
+            episodes_dir = iter_out / "online_episodes"
+            pc_success = collect_episodes(
+                policy=policy,
+                envs=envs,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                n_episodes=args.n_episodes,
+                episodes_dir=episodes_dir,
+                env_factory=env_factory,
+                start_seed=start_seed,
+                shard=shard,
+                # Both suites drive off the Q function's own camera keys: LIBERO's
+                # happen to equal online_dataset's module default, RoboTwin's do not.
+                # The rename map is set by the env factory and is None for LIBERO,
+                # whose raw env keys already match.
+                camera_key_map=getattr(env_factory, "camera_key_map", None),
+                save_camera_keys=tuple(q_policy.config.camera_keys),
+                # Match the offline demos' stored resolution exactly. The env renders
+                # at a lower resolution than the demos were recorded at (RoboTwin:
+                # D435 320x240 vs Large_D435 640x480), and finetune_q batches the two
+                # datasets together, so a mismatch fails collate. Q resizes everything
+                # to 224 internally, so this only affects storage, not what Q sees.
+                save_image_shape=_offline_image_shape(args),
+                latent_pool_path=(iter_out / "latent_pool.npz") if is_dsrl else None,
+            )
+            if args.collect_only:
+                log.info(f"--collect_only: wrote {episodes_dir}, success={pc_success:.1f}%. Done.")
+                return
+        else:
+            log.info("--skip_collect: finetuning on previously collected episodes.")
         start_seed += args.n_episodes
 
         # ── 2. Build online dataset (growing buffer across all iterations) ──────
@@ -571,6 +794,41 @@ def self_improvement_loop(args):
             use_wandb=use_wandb,
         )
 
+        # ── 3b. DSRL: distil the updated Q^A into Q^W, then fit the latent actor ──────
+        # Runs while FastWAM is still offloaded: every pi_dp(s, w) decode this needs was
+        # already done during collection, so only Q^A and two small MLPs are resident.
+        dsrl_metrics = None
+        if is_dsrl:
+            from lerobot.policies.dsrl.latent_dataset import build_dsrl_training_data
+
+            log.info("DSRL: rebuilding latent targets against the updated Q ...")
+            t_dsrl = time.time()
+            feats, w_pool, q_pool = build_dsrl_training_data(
+                output_dir=output_dir,
+                ctx=planner.ctx,
+                device=device,
+                batch_states=args.dsrl_target_batch,
+                max_states=args.dsrl_max_states,
+            )
+            planner.agent.to(device)
+            dsrl_metrics = planner.agent.fit(
+                feats=feats, w_pool=w_pool, q_pool=q_pool,
+                steps=args.dsrl_steps, batch_size=args.dsrl_batch_size,
+            )
+            dsrl_metrics["elapsed_s"] = time.time() - t_dsrl
+            planner.agent.save(iter_dir / "dsrl_agent.pt")
+            log.info(
+                "DSRL: actor_Q=%.4f vs prior mean %.4f / prior best-of-%d %.4f  "
+                "(critic_mse=%.5f, %d states, %.0fs)",
+                dsrl_metrics["actor_q"], dsrl_metrics["q_prior_mean"],
+                int(dsrl_metrics["n_pool"]), dsrl_metrics["q_prior_max_mean"],
+                dsrl_metrics["critic_mse"], int(dsrl_metrics["n_states"]),
+                dsrl_metrics["elapsed_s"],
+            )
+            if use_wandb:
+                import wandb as _wandb
+                _wandb.log({f"dsrl/{k}": v for k, v in dsrl_metrics.items()}, step=global_step)
+
         # ── 4. Q weights updated in-place — planner.ctx.q_policy is already updated ──
         if offloaded:
             torch.cuda.empty_cache()
@@ -585,6 +843,10 @@ def self_improvement_loop(args):
 
             log.info(f"Running eval ({args.eval_n_episodes} episodes) for clips ...")
             videos_dir = iter_dir / "eval_videos"
+            # Eval is the deployed policy: deterministic actor, no exploration noise, and
+            # no prior pool — one decode per planning step instead of n_samples.
+            if is_dsrl:
+                planner.set_mode("eval")
             with torch.no_grad():
                 eval_info = eval_policy_all(
                     envs=envs,
@@ -598,6 +860,8 @@ def self_improvement_loop(args):
                     videos_dir=videos_dir,
                     start_seed=args.seed + 100_000 + iteration * 1000,
                 )
+            if is_dsrl:
+                planner.set_mode("collect")
             overall = eval_info["overall"]
             eval_pc_success = overall.get("pc_success", None)
             log.info(f"  Eval: pc_success={eval_pc_success:.1f}%")
@@ -634,6 +898,8 @@ def self_improvement_loop(args):
             "finetune_loss": mean_loss,
             "elapsed_s": time.time() - t0,
         }
+        if dsrl_metrics is not None:
+            metrics["dsrl"] = dsrl_metrics
         with open(summary_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
 
@@ -660,7 +926,20 @@ def parse_args():
     p.add_argument("--q_ckpt", required=True)
     p.add_argument("--original_dataset_repo_id", default="HuggingFaceVLA/libero")
     p.add_argument("--original_dataset_root", default="/storage/project/r-agarg35-0/shared/lerobot-data-2")
-    p.add_argument("--task", default="libero_10")
+    p.add_argument("--task", default="libero_10",
+                   help="LIBERO suite name, or a comma-separated RoboTwin task list.")
+    p.add_argument("--env_type", default="libero", choices=["libero", "robotwin"])
+    # Sharded collection: N jobs each run `--task_shard k/N --collect_only`, writing to
+    # iter_<i>_shard<k>/online_episodes; a final `--skip_collect` job globs them all and
+    # finetunes. Mirrors how the RoboTwin eval suite splits tasks across jobs.
+    p.add_argument("--task_shard", default=None, metavar="K/N",
+                   help="Collect only tasks where index %% N == K (e.g. 0/8).")
+    p.add_argument("--collect_only", action="store_true",
+                   help="Collect episodes and exit before finetuning.")
+    p.add_argument("--skip_collect", action="store_true",
+                   help="Skip collection; finetune on already-collected iter_*/online_episodes.")
+    p.add_argument("--robotwin_root", default=None,
+                   help="Path to the RoboTwin repo clone (required when --env_type robotwin).")
     p.add_argument("--n_iterations", type=int, default=5)
     p.add_argument("--n_episodes", type=int, default=20)
     p.add_argument("--finetune_steps", type=int, default=200)
@@ -681,7 +960,29 @@ def parse_args():
                    help="Cross-batch wrong-chunk (roll) negatives.")
     p.add_argument("--neg_use_temporal", action=argparse.BooleanOptionalAction, default=True,
                    help="Time-reversed-chunk negatives.")
-    p.add_argument("--planner_type", default="bc_diffusion_mppi")
+    p.add_argument("--planner_type", default="bc_diffusion_mppi",
+                   help="Action-space planner, or 'dsrl' for latent-noise steering "
+                        "(Wagenmaker et al. 2025) as a baseline.")
+    # ── DSRL (only used when --planner_type dsrl) ─────────────────────────────
+    # Defaults follow Table 11 of the DSRL paper (its pi0-on-LIBERO column).
+    p.add_argument("--dsrl_b_w", type=float, default=1.0,
+                   help="Latent action magnitude: w is bounded to [-b_w, b_w]. Lower = more "
+                        "conservative (nearer the centre of the sampler's noise prior).")
+    p.add_argument("--dsrl_full_latent", action="store_true",
+                   help="Learn over the full (h*A)-dim latent instead of a per-timestep "
+                        "latent tiled across the chunk (the paper's large-chunk recipe).")
+    p.add_argument("--dsrl_hidden", type=int, default=128)
+    p.add_argument("--dsrl_n_critics", type=int, default=10)
+    p.add_argument("--dsrl_explore_std", type=float, default=0.2,
+                   help="Gaussian exploration noise on the latent action during collection.")
+    p.add_argument("--dsrl_steps", type=int, default=5000,
+                   help="Latent actor/critic gradient steps per iteration (MLPs on cached "
+                        "features — seconds, not minutes).")
+    p.add_argument("--dsrl_batch_size", type=int, default=256)
+    p.add_argument("--dsrl_max_states", type=int, default=20000,
+                   help="Cap on states used to rebuild latent targets; bounds the DINOv2 cost.")
+    p.add_argument("--dsrl_target_batch", type=int, default=8,
+                   help="States per forward pass when rebuilding latent targets.")
     p.add_argument("--n_samples", type=int, default=16)
     p.add_argument("--n_elites", type=int, default=16)
     p.add_argument("--noise_smooth_sigma_t", type=float, default=None)
