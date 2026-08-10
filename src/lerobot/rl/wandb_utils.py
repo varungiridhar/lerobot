@@ -36,7 +36,10 @@ def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[st
         lst.append(f"dataset:{cfg.dataset.repo_id}")
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
-    return lst if return_list else "-".join(lst)
+    if return_list:
+        # wandb enforces 1-64 chars per run tag (long dataset repo_ids overflow).
+        return [t[:64] for t in lst]
+    return "-".join(lst)
 
 
 def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:

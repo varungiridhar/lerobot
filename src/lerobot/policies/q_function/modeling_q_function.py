@@ -653,7 +653,11 @@ class QFunctionPolicy(PreTrainedPolicy):
         # ── Ranking-margin loss on batch-internal synthetic negatives ────────
         if self.config.neg_margin_weight > 0:
             margin_loss, neg_metrics = self._negatives_margin_loss(
-                context, a_first, logits_online, batch.get(BUCKET_INDEX)
+                context, a_first, logits_online, batch.get(BUCKET_INDEX),
+                a_full=self._truncate_action(actions),
+                episode_frac=batch.get("q_episode_frac"),
+                episode_id=batch.get("q_episode_id"),
+                bootstrap_valid=batch.get("q_bootstrap_valid"),
             )
             if margin_loss is not None:
                 loss = loss + self.config.neg_margin_weight * margin_loss
@@ -668,6 +672,10 @@ class QFunctionPolicy(PreTrainedPolicy):
         a_first: Tensor,
         logits_online: Tensor,
         bucket_idx: Tensor | None,
+        a_full: Tensor | None = None,
+        episode_frac: Tensor | None = None,
+        episode_id: Tensor | None = None,
+        bootstrap_valid: Tensor | None = None,
     ) -> tuple[Tensor | None, dict[str, float]]:
         """Ranking margin: relu(δ + Q(s, a_neg) − Q(s, a_true)), demo buckets only.
 
@@ -703,6 +711,27 @@ class QFunctionPolicy(PreTrainedPolicy):
             negs.append(torch.roll(a_pos, shifts=1, dims=0))
             names.append("swap")
 
+        if cfg.neg_use_matched_swap and M > 1 and episode_frac is not None:
+            # Fraction-MATCHED swap: for each anchor, the batch chunk at the
+            # nearest episode fraction from a DIFFERENT episode — same task
+            # phase, wrong state. The hardest wrong-chunk negative; directly
+            # targets the G2 frame-matched swap probe.
+            frac = episode_frac.view(-1)[mask].to(a_pos.device)          # (M,)
+            dist = (frac.unsqueeze(0) - frac.unsqueeze(1)).abs()         # (M, M)
+            dist.fill_diagonal_(torch.inf)
+            if episode_id is not None:
+                eid = episode_id.view(-1)[mask].to(a_pos.device)
+                same_ep = eid.unsqueeze(0) == eid.unsqueeze(1)
+                same_ep.fill_diagonal_(False)
+                dist_cross = dist.masked_fill(same_ep, torch.inf)
+                # Fall back to same-episode pairing only for rows with no
+                # cross-episode partner in the batch (rare at batch >= 8).
+                has_cross = torch.isfinite(dist_cross).any(dim=1)
+                dist = torch.where(has_cross.unsqueeze(1), dist_cross, dist)
+            j = dist.argmin(dim=1)                                       # (M,)
+            negs.append(a_pos[j])
+            names.append("mswap")
+
         if cfg.neg_tube_sigmas:
             from lerobot.policies.act_simple.planning import _smooth_time
 
@@ -717,6 +746,27 @@ class QFunctionPolicy(PreTrainedPolicy):
         if cfg.neg_use_temporal:
             negs.append(torch.flip(a_pos, dims=[1]))
             names.append("trev")
+
+        if cfg.neg_use_shift and a_full is not None:
+            # "Right actions, wrong time": the true trajectory's chunk starting k
+            # frames later, free from the 2h action window. Where the shifted
+            # window would cross the episode end (≈ bootstrap_valid False, so the
+            # window is padding-heavy), fall back to the true chunk — that pair
+            # contributes ~0 margin instead of a corrupt negative.
+            h = self.config.h
+            a_full_m = a_full[mask]                                      # (M, 2h, A')
+            if bootstrap_valid is not None:
+                ok = bootstrap_valid.view(-1)[mask].to(a_pos.device).bool()
+            else:
+                ok = torch.ones(M, dtype=torch.bool, device=a_pos.device)
+            for k in cfg.neg_shift_frames:
+                k = int(k)
+                if k <= 0 or h + k > a_full_m.shape[1]:
+                    continue
+                shifted = a_full_m[:, k : k + h, :]
+                shifted = torch.where(ok.view(-1, 1, 1), shifted, a_pos)
+                negs.append(shifted)
+                names.append(f"shift{k}")
 
         if not negs:
             return None, {}

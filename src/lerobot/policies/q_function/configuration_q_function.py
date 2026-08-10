@@ -32,6 +32,11 @@ _DEFAULT_CAMERA_KEYS = (
 )
 
 
+# Sentinel bucket_overrides VALUE: per-episode buckets resolved from the dataset's
+# meta/episode_labels.json sidecar (see q_value_labels.py, which imports this).
+EPISODE_LABELS_SENTINEL = "episode_labels"
+
+
 @PreTrainedConfig.register_subclass("q_function")
 @dataclass
 class QFunctionConfig(PreTrainedConfig):
@@ -173,6 +178,16 @@ class QFunctionConfig(PreTrainedConfig):
     neg_tube_smooth_sigma_t: float = 2.0   # temporal smoothing ≙ the MPPI planner's
     neg_use_swap: bool = True       # wrong-chunk negatives: roll true chunks across the batch
     neg_use_temporal: bool = True   # time-reversed true chunk as a negative
+    # Fraction-matched swap: pair each anchor with the batch sample at the NEAREST
+    # episode fraction from a different episode (needs q_episode_frac/q_episode_id
+    # from QValueLabelDataset). Much harder than the random roll — same task phase,
+    # wrong episode/state — and directly targets the G2 frame-matched swap probe.
+    neg_use_matched_swap: bool = False
+    # Temporal-shift negatives: the true trajectory's chunk starting k frames LATER
+    # (free from the 2h action window) — "right actions, wrong time". Applied only
+    # where q_bootstrap_valid (window stays within the episode).
+    neg_use_shift: bool = False
+    neg_shift_frames: tuple[int, ...] = (8, 16)
     # Margin loss applies only to samples from these buckets (demos). Play
     # samples already carry ≈0 targets; ranking below them is meaningless.
     neg_buckets: tuple[str, ...] = ("q5",)
@@ -229,7 +244,12 @@ class QFunctionConfig(PreTrainedConfig):
                 raise ValueError(
                     f"quality_scalars missing entries for buckets: {sorted(missing_scalars)}"
                 )
-            unknown_override_buckets = set(self.bucket_overrides.values()) - set(self.terminal_bonuses)
+            # The sentinel resolves to per-episode buckets (q5/play) from the dataset's
+            # episode_labels.json sidecar — those resolved buckets are re-validated
+            # against terminal_bonuses at QValueLabelDataset construction time.
+            unknown_override_buckets = (
+                set(self.bucket_overrides.values()) - set(self.terminal_bonuses) - {EPISODE_LABELS_SENTINEL}
+            )
             if unknown_override_buckets:
                 raise ValueError(
                     f"bucket_overrides reference buckets not in terminal_bonuses: "

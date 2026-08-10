@@ -30,6 +30,19 @@ and quality scalar. Missing entries raise at construction time.
 No implicit bucket inference from repo_id — pass everything explicitly so
 the assignment is auditable from the launch script alone.
 
+Per-episode success labels (real-robot datasets)
+------------------------------------------------
+A repo may map to the sentinel bucket ``"episode_labels"`` instead of a real
+bucket name. The wrapper then reads ``<root>/meta/episode_labels.json`` (the
+leLab operator sidecar, ``{"<ep_idx>": {"success": bool, "outcome": str}}``)
+and assigns buckets per *episode*: success → ``EPISODE_LABEL_SUCCESS_BUCKET``
+(``"q5"``), failure → ``EPISODE_LABEL_FAILURE_BUCKET`` (``"play"``). Failed
+episodes thus become zero-return TD trajectories (real negatives) under the
+usual ``terminal_bonuses={"q5": 1.0, "play": 0.0}``. The train/test holdout
+is stratified per (repo, resolved bucket), so both success and failure
+episodes appear in the held-out split. Every episode index must be present
+in the sidecar; missing entries raise at construction time.
+
 Multi-dataset episode boundaries
 --------------------------------
 ``MultiLeRobotDataset`` does not expose a global ``episode_data_index``. We
@@ -54,6 +67,46 @@ log = logging.getLogger(__name__)
 # Canonical bucket-name ordering for the ``q_bucket_index`` field logged with
 # each batch. New bucket labels can be added at the tail.
 DEFAULT_BUCKET_ORDER: tuple[str, ...] = ("q5", "q3_termjitter", "play")
+
+
+# Sentinel bucket_overrides value: resolve buckets per episode from the
+# dataset's ``meta/episode_labels.json`` sidecar instead of per repo.
+# Defined in the (import-light) configuration module so the deployment fork's
+# inference-only port can validate checkpoints without this training module.
+from lerobot.policies.q_function.configuration_q_function import EPISODE_LABELS_SENTINEL  # noqa: E402
+EPISODE_LABEL_SUCCESS_BUCKET = "q5"
+EPISODE_LABEL_FAILURE_BUCKET = "play"
+
+
+def _load_episode_label_buckets(sub_dataset) -> list[str]:
+    """Per-local-episode bucket list from the leLab ``episode_labels.json`` sidecar."""
+    labels_path = Path(sub_dataset.root) / "meta" / "episode_labels.json"
+    if not labels_path.exists():
+        raise FileNotFoundError(
+            f"bucket_overrides maps {sub_dataset.repo_id!r} to {EPISODE_LABELS_SENTINEL!r} "
+            f"but {labels_path} does not exist."
+        )
+    labels = json.loads(labels_path.read_text())
+    n_eps = int(sub_dataset.meta.total_episodes)
+    buckets: list[str] = []
+    missing = [ep for ep in range(n_eps) if str(ep) not in labels]
+    if missing:
+        raise ValueError(
+            f"{labels_path} is missing entries for episodes {missing[:10]}"
+            f"{'…' if len(missing) > 10 else ''} (dataset has {n_eps} episodes)."
+        )
+    for ep in range(n_eps):
+        entry = labels[str(ep)]
+        buckets.append(
+            EPISODE_LABEL_SUCCESS_BUCKET if bool(entry["success"]) else EPISODE_LABEL_FAILURE_BUCKET
+        )
+    n_fail = sum(b == EPISODE_LABEL_FAILURE_BUCKET for b in buckets)
+    log.info(
+        f"[q-labels] {sub_dataset.repo_id}: per-episode buckets from sidecar — "
+        f"{n_eps - n_fail} success ({EPISODE_LABEL_SUCCESS_BUCKET}), "
+        f"{n_fail} failure ({EPISODE_LABEL_FAILURE_BUCKET})"
+    )
+    return buckets
 
 
 def resolve_bucket(repo_id: str, bucket_overrides: dict[str, str]) -> str:
@@ -172,6 +225,8 @@ class QValueLabelDataset(Dataset):
             )
 
         repo_ids_for_split: list[str] | None = None
+        self._bucket_by_global_ep: list[str] | None = None
+        self._local_ep_buckets_by_ds: list[list[str] | None] | None = None
         if not self._all_success:
             repo_ids = _repo_ids_of(dataset)
             repo_ids_for_split = repo_ids
@@ -179,14 +234,34 @@ class QValueLabelDataset(Dataset):
                 resolve_bucket(r, self.bucket_overrides) for r in repo_ids
             ]
 
-            missing_bonuses = set(self._dataset_index_to_bucket) - set(self.terminal_bonuses.keys())
+            # Resolve the per-episode sidecar sentinel (see module docstring).
+            # _bucket_by_global_ep is the single source of truth for a frame's
+            # bucket; for plain per-repo assignments it is just the repo bucket
+            # repeated over that repo's episodes.
+            sub_datasets = (
+                list(dataset._datasets) if isinstance(dataset, MultiLeRobotDataset) else [dataset]
+            )
+            self._local_ep_buckets_by_ds = []
+            bucket_by_global_ep: list[str] = []
+            for ds_idx, sub in enumerate(sub_datasets):
+                repo_bucket = self._dataset_index_to_bucket[ds_idx]
+                if repo_bucket == EPISODE_LABELS_SENTINEL:
+                    local_buckets = _load_episode_label_buckets(sub)
+                else:
+                    local_buckets = [repo_bucket] * int(sub.meta.total_episodes)
+                self._local_ep_buckets_by_ds.append(local_buckets)
+                bucket_by_global_ep.extend(local_buckets)
+            self._bucket_by_global_ep = bucket_by_global_ep
+
+            resolved_buckets = set(bucket_by_global_ep)
+            missing_bonuses = resolved_buckets - set(self.terminal_bonuses.keys())
             if missing_bonuses:
                 raise ValueError(
                     f"terminal_bonuses missing entries for buckets present in the data: "
                     f"{sorted(missing_bonuses)}"
                 )
             if self.reward_mode == "time_to_go":
-                needed = {b for b in self._dataset_index_to_bucket if b != "play"}
+                needed = {b for b in resolved_buckets if b != "play"}
                 missing_scalars = needed - set(self.quality_scalars.keys())
                 if missing_scalars:
                     raise ValueError(
@@ -251,15 +326,34 @@ class QValueLabelDataset(Dataset):
             global_ep_idx = 0
             for ds_idx, sub in enumerate(sub_iter):
                 repo_id = repo_ids_for_split[ds_idx]
-                bucket = self._dataset_index_to_bucket[ds_idx]
                 ep_from_local, ep_to_local = _episode_bounds(sub)
                 local_n = int(ep_from_local.shape[0])
-                rng = _random.Random(hash((self.holdout_seed, repo_id, bucket)) & 0xFFFFFFFF)
-                order = list(range(local_n))
-                rng.shuffle(order)
-                n_test = max(1, int(round(local_n * self.holdout_fraction)))
-                n_test = min(n_test, local_n - 1)   # keep >=1 train ep per repo
-                test_local = set(order[:n_test])
+                local_buckets = self._local_ep_buckets_by_ds[ds_idx]
+                # Stratify per (repo, resolved bucket). For plain per-repo
+                # assignments there is exactly one group and this reduces to
+                # the original single-shuffle behavior (identical rng seed).
+                test_local: set[int] = set()
+                groups: dict[str, list[int]] = {}
+                for local_ep_id, b in enumerate(local_buckets):
+                    groups.setdefault(b, []).append(local_ep_id)
+                for bucket, ep_ids in groups.items():
+                    rng = _random.Random(hash((self.holdout_seed, repo_id, bucket)) & 0xFFFFFFFF)
+                    order = ep_ids.copy()
+                    rng.shuffle(order)
+                    n_test = max(1, int(round(len(ep_ids) * self.holdout_fraction)))
+                    n_test = min(n_test, len(ep_ids) - 1)   # keep >=1 train ep per group
+                    if n_test <= 0:
+                        log.warning(
+                            f"[q-split] repo={repo_id} bucket={bucket} has only "
+                            f"{len(ep_ids)} episode(s); nothing held out for this group."
+                        )
+                        continue
+                    test_local.update(order[:n_test])
+                    log.info(
+                        f"[q-split] repo={repo_id} bucket={bucket} "
+                        f"train_eps={len(ep_ids) - n_test} test_eps={n_test} "
+                        f"(holdout={self.holdout_fraction:.0%}, seed={self.holdout_seed})"
+                    )
                 for local_ep_id in range(local_n):
                     f = int(ep_from_local[local_ep_id].item())
                     t = int(ep_to_local[local_ep_id].item())
@@ -272,11 +366,6 @@ class QValueLabelDataset(Dataset):
                         self._frame_indices_train.extend(gids)
                     global_ep_idx += 1
                 offset += int(sub.num_frames)
-                log.info(
-                    f"[q-split] repo={repo_id} bucket={bucket} "
-                    f"train_eps={local_n - n_test} test_eps={n_test} "
-                    f"(holdout={self.holdout_fraction:.0%}, seed={self.holdout_seed})"
-                )
 
         # ── Optional pre-encoded feature cache ─────────────────────────────
         # When ``precache_root`` is provided, look for
@@ -335,7 +424,7 @@ class QValueLabelDataset(Dataset):
         base = self._frame_indices_train if self._frame_indices_train else list(range(len(self)))
         out: list[int] = []
         for idx in base:
-            bucket = self._dataset_index_to_bucket[int(self._dataset_idx_by_frame[idx].item())]
+            bucket = self._bucket_by_global_ep[int(self._ep_pos_by_frame[idx].item())]
             w = float(weights.get(bucket, 1.0))
             n = int(w) + (1 if rng.random() < (w - int(w)) else 0)
             out.extend([idx] * n)
@@ -435,8 +524,7 @@ class QValueLabelDataset(Dataset):
                     reward_pad[i] = True
             bucket_index = 0
         else:
-            ds_idx = int(self._dataset_idx_by_frame[idx].item())
-            bucket = self._dataset_index_to_bucket[ds_idx]
+            bucket = self._bucket_by_global_ep[ep_pos]
             terminal_bonus = float(self.terminal_bonuses[bucket])
             use_time_to_go = (self.reward_mode == "time_to_go") and (bucket != "play")
             scalar = self.quality_scalars.get(bucket, 1.0) if use_time_to_go else 0.0
@@ -457,6 +545,13 @@ class QValueLabelDataset(Dataset):
         item["q_reward_pad_first"] = reward_pad
         item["q_bootstrap_valid"] = torch.tensor(bool(bootstrap_valid))
         item["q_bucket_index"] = torch.tensor(bucket_index, dtype=torch.long)
+        # Episode phase + identity, consumed by the fraction-matched swap negative
+        # (modeling_q_function._negatives_margin_loss): pair each anchor with the
+        # batch sample at the nearest episode fraction from a DIFFERENT episode.
+        item["q_episode_frac"] = torch.tensor(
+            frame_in_ep / max(1, ep_length - 1), dtype=torch.float32
+        )
+        item["q_episode_id"] = torch.tensor(ep_pos, dtype=torch.long)
 
         # ── Pre-encoded features at delta indices [0, h] ───────────────────
         # We mirror the underlying dataset's observation_delta_indices=[0, h]
