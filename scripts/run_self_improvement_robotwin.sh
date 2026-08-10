@@ -198,29 +198,12 @@ fi
 
 # Pool the shards' held-out eval results into a single per-iteration figure. Each shard
 # scored its own ~6 tasks; this is the number to compare against the pre-SI baseline.
+# Pool this iteration's shard results into one record: overall (all episodes,
+# tighter estimate of current performance) and held-out (fixed seeds, the number
+# to trend across iterations). Also flags a missing shard, which would drop ~6
+# tasks from both rates and quietly break comparability.
 if [ "$MODE" = "finetune" ]; then
-    python - "$OUTPUT_DIR" "$ITERATION" <<'PYAGG'
-import json, sys, glob, math
-out, it = sys.argv[1], int(sys.argv[2])
-files = sorted(glob.glob(f"{out}/iter_{it:03d}_shard*/heldout_eval.json"))
-n = s = 0
-for f in files:
-    d = json.load(open(f))
-    k = d.get("n_eval", 0)
-    p = d.get("eval_pc_success")
-    if k and p is not None and not math.isnan(p):
-        n += k; s += p * k / 100.0
-if n:
-    pooled = 100.0 * s / n
-    print(f"HELD-OUT EVAL (iteration {it}, pooled over {len(files)} shards): "
-          f"{s:.0f}/{n} = {pooled:.1f}%")
-    json.dump({"iteration": it, "heldout_pc_success": pooled, "n_heldout": n,
-               "n_shards": len(files)},
-              open(f"{out}/iter_{it:03d}_heldout.json", "w"), indent=2)
-else:
-    print(f"No held-out eval results found for iteration {it} "
-          f"(expected if this iteration predates the merged eval stage).")
-PYAGG
+    python scripts/aggregate_heldout.py "$OUTPUT_DIR" "$ITERATION" "$COLLECT_SHARDS"
 fi
 
 MODE_FLAGS=""

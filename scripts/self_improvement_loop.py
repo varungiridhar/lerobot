@@ -351,12 +351,24 @@ def collect_episodes(
     n_success = sum(all_successes)
     pc_success = 100.0 * n_success / max(len(all_successes), 1)
     eval_pc = (100.0 * sum(eval_successes) / len(eval_successes)) if eval_successes else float("nan")
+    # Success over EVERY episode rolled out this iteration (held-out + training).
+    # Legitimate as a performance estimate: the training episodes are rolled out with
+    # the current Q *before* it is finetuned on them, so there is no leakage at
+    # measurement time. It is the tighter point estimate (2x the episodes); the
+    # held-out rate remains the metric to trend, because its seeds are identical every
+    # iteration and so seed variance cancels in a paired comparison.
+    _all = eval_successes + all_successes
+    overall_pc = (100.0 * sum(_all) / len(_all)) if _all else float("nan")
     log.info(f"  Training set: {len(all_episode_dicts)} episodes saved, {pc_success:.1f}% success")
     if eval_successes:
         log.info(f"  HELD-OUT EVAL: {sum(eval_successes)}/{len(eval_successes)} = {eval_pc:.1f}% "
                  f"(fixed seeds, never trained on)")
+    if _all:
+        log.info(f"  OVERALL (all {len(_all)} episodes, held-out + training): {overall_pc:.1f}%")
     return {"eval_pc_success": eval_pc, "train_pc_success": pc_success,
-            "n_eval": len(eval_successes), "n_train": len(all_episode_dicts)}
+            "overall_pc_success": overall_pc,
+            "n_eval": len(eval_successes), "n_train": len(all_episode_dicts),
+            "n_overall": len(_all)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -775,6 +787,8 @@ def self_improvement_loop(args):
         pc_success = float("nan")
         heldout_pc = float("nan")
         n_heldout = 0
+        overall_pc = float("nan")
+        n_overall = 0
         if not args.skip_collect:
             shard = None
             if args.task_shard:
@@ -820,6 +834,8 @@ def self_improvement_loop(args):
             pc_success = stats["train_pc_success"]
             heldout_pc = stats["eval_pc_success"]
             n_heldout = stats["n_eval"]
+            overall_pc = stats["overall_pc_success"]
+            n_overall = stats["n_overall"]
             if args.collect_only:
                 log.info(f"--collect_only: wrote {episodes_dir} "
                          f"({stats['n_train']} train eps, {pc_success:.1f}% success; "
@@ -951,6 +967,8 @@ def self_improvement_loop(args):
                 log_dict = {
                     "heldout/pc_success": heldout_pc,
                     "heldout/n_episodes": n_heldout,
+                    "overall/pc_success": overall_pc,
+                    "overall/n_episodes": n_overall,
                     "collect/train_pc_success": pc_success,
                     "collect/pc_success": pc_success,
                     "collect/n_collected": args.n_episodes,
@@ -969,6 +987,7 @@ def self_improvement_loop(args):
             import wandb as _wandb
             _wandb.log(
                 {"heldout/pc_success": heldout_pc, "heldout/n_episodes": n_heldout,
+                 "overall/pc_success": overall_pc, "overall/n_episodes": n_overall,
                  "collect/train_pc_success": pc_success, "collect/pc_success": pc_success,
                  "collect/n_collected": args.n_episodes, "finetune/mean_loss": mean_loss},
                 step=global_step,
@@ -983,6 +1002,10 @@ def self_improvement_loop(args):
             # comparable between iterations — compare it against the pre-SI baseline.
             "heldout_pc_success": heldout_pc,
             "n_heldout": n_heldout,
+            # All episodes this iteration. Tighter estimate of current performance;
+            # use heldout_pc_success for the cross-iteration trend.
+            "overall_pc_success": overall_pc,
+            "n_overall": n_overall,
             # Success on the TRAINING episodes. Their seeds advance every iteration, so
             # this moves with task difficulty as well as policy quality: useful for
             # spotting collapse, not valid as a trend.
@@ -1000,8 +1023,9 @@ def self_improvement_loop(args):
 
         (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
         log.info(
-            f"Iteration {iteration} done: HELD-OUT={heldout_pc:.1f}% (n={n_heldout}) "
-            f"train={pc_success:.1f}% loss={mean_loss:.4f} "
+            f"Iteration {iteration} done: OVERALL={overall_pc:.1f}% (n={n_overall}) "
+            f"HELD-OUT={heldout_pc:.1f}% (n={n_heldout}) train={pc_success:.1f}% "
+            f"loss={mean_loss:.4f} "
             f"elapsed={metrics['elapsed_s']:.1f}s"
         )
 
