@@ -314,6 +314,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_episode_s = []  # wall-clock seconds per episode
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -336,6 +337,10 @@ def eval_policy(
         episode_data: dict | None = None
 
     # we dont want progress bar when we use slurm, since it clutters the logs
+    # Planning vis: check once whether the policy has a planner that supports vis recording.
+    _planner = getattr(policy, "_planner", None)
+    _has_vis = _planner is not None and hasattr(_planner, "end_episode")
+
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
@@ -349,6 +354,7 @@ def eval_policy(
             seeds = range(
                 start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
             )
+        batch_start_t = time.time()
         rollout_data = rollout(
             env=env,
             policy=policy,
@@ -361,6 +367,11 @@ def eval_policy(
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             goal_provider=goal_provider,
         )
+        batch_ep_s = (time.time() - batch_start_t) / env.num_envs
+
+        # Finalise per-episode planning vis data (planner accumulated it during rollout).
+        if _has_vis:
+            _planner.end_episode()
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -378,6 +389,7 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        all_episode_s.extend([batch_ep_s] * env.num_envs)
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -423,6 +435,47 @@ def eval_policy(
                 )
                 thread.start()
                 threads.append(thread)
+
+                # Also save planning vis video (Q-value spotlight animation).
+                if _has_vis:
+                    vis_chunks = _planner.pop_completed_episode()
+                    if vis_chunks:
+                        from lerobot.policies.fastwam.planning_vis import make_planning_vis_video
+                        vis_path = videos_dir / f"eval_episode_{n_episodes_rendered}_planning_vis.mp4"
+                        video_paths.append(str(vis_path))
+                        chunk_frames = [c["frame"] for c in vis_chunks if c.get("frame") is not None]
+                        q_candidates = [c["q_candidates"] for c in vis_chunks]
+                        q_selected = [c["q_selected"] for c in vis_chunks]
+                        q_cfg = getattr(_planner.ctx.q_policy, "config", None)
+                        v_min = float(getattr(q_cfg, "v_min", 0.0))
+                        v_max = float(getattr(q_cfg, "v_max", 1.0))
+                        t_vis = threading.Thread(
+                            target=make_planning_vis_video,
+                            args=(chunk_frames, q_candidates, q_selected, vis_path),
+                            kwargs={"v_min": v_min, "v_max": v_max, "vis_chunks": vis_chunks, "fps": env.unwrapped.metadata.get("render_fps", 10)},
+                        )
+                        t_vis.start()
+                        threads.append(t_vis)
+
+                        # Save raw planning data (Q values + action candidates) as NPZ.
+                        npz_path = videos_dir / f"eval_episode_{n_episodes_rendered}_planning_data.npz"
+                        _save_planning_data_npz(vis_chunks, npz_path)
+
+                        # Save XY trajectory plots for bc_diffusion planners.
+                        if any("action_candidates" in c for c in vis_chunks):
+                            from lerobot.policies.fastwam.planning_vis_trajectories import (
+                                plot_episode_trajectories,
+                            )
+                            traj_path = videos_dir / f"eval_episode_{n_episodes_rendered}_traj_vis.png"
+                            diff_steps = getattr(getattr(_planner, "cfg", None), "num_diffusion_steps", None)
+                            t_traj = threading.Thread(
+                                target=plot_episode_trajectories,
+                                args=(vis_chunks, traj_path),
+                                kwargs={"episode_idx": n_episodes_rendered, "diffusion_steps": diff_steps},
+                            )
+                            t_traj.start()
+                            threads.append(t_traj)
+
                 n_episodes_rendered += 1
 
         progbar.set_postfix(
@@ -442,13 +495,15 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "episode_s": episode_s,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, episode_s) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_episode_s[:n_episodes],
                     strict=True,
                 )
             )
@@ -469,6 +524,38 @@ def eval_policy(
         info["video_paths"] = video_paths
 
     return info
+
+
+def _save_planning_data_npz(vis_chunks: list[dict], out_path) -> None:
+    """Save Q values and action candidates from vis_chunks to NPZ for offline analysis.
+
+    Keys in the saved file:
+    - ``q_candidates``: object array of shape (n_chunks,), each element is (N,) float32
+    - ``q_selected``: (n_chunks,) float32 — Q of the selected action per chunk
+    - ``action_candidates``: object array (n_chunks,), each (N, h, A) if available else None
+    - ``action_selected``: object array (n_chunks,), each (h, A) if available else None
+    """
+    import numpy as np
+    n = len(vis_chunks)
+    q_cands = np.empty(n, dtype=object)
+    q_sel = np.zeros(n, dtype=np.float32)
+    act_cands = np.empty(n, dtype=object)
+    act_sel = np.empty(n, dtype=object)
+    has_actions = False
+    for i, c in enumerate(vis_chunks):
+        q_cands[i] = c["q_candidates"].astype(np.float32)
+        q_sel[i] = float(c["q_selected"])
+        if "action_candidates" in c:
+            act_cands[i] = c["action_candidates"].astype(np.float32)
+            act_sel[i] = c["action_selected"].astype(np.float32)
+            has_actions = True
+    save_dict = {"q_candidates": q_cands, "q_selected": q_sel}
+    if has_actions:
+        save_dict["action_candidates"] = act_cands
+        save_dict["action_selected"] = act_sel
+    from pathlib import Path
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(out_path), **save_dict)
 
 
 def _compile_episode_data(
@@ -574,6 +661,34 @@ def eval_main(cfg: EvalPipelineConfig):
         except ValueError as e:
             logging.warning(f"Planning requested but no goal provider available: {e}. Falling back to BC.")
 
+    # Q-scored online planning for policies that expose ``attach_planner``
+    # (currently act_simple). All Q-loading, validation, and planner state
+    # lives in the Planner class — the policy just holds a reference.
+    # The ``use_planning`` field name + ``planning`` sub-config mirror the AWM
+    # head policy's pattern so the CLI form is identical.
+    if (
+        getattr(policy.config, "use_planning", False)
+        and hasattr(policy, "attach_planner")
+    ):
+        from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
+
+        if isinstance(policy, FastWAMPolicy):
+            from lerobot.policies.fastwam.planning import FastWAMPlanner as PlannerCls
+        else:
+            from lerobot.policies.act_simple.planning import Planner as PlannerCls  # type: ignore[assignment]
+
+        logging.info(
+            f"Q-planning enabled: loading Q-function from {policy.config.planning.q_checkpoint_path}"
+        )
+        planner = PlannerCls.from_checkpoints(
+            cfg=policy.config.planning,
+            bc_post=postprocessor,
+            bc_chunk_size=int(policy.config.chunk_size),
+            device=device,
+        )
+        policy.attach_planner(planner)
+        logging.info(f"Q-planning configured: {policy.config.planning}")
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -583,7 +698,7 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
@@ -788,6 +903,11 @@ def eval_policy_all(
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+            # Print per-task result immediately after it completes.
+            n_suc = sum(1 for s in metrics.get("successes", []) if s)
+            n_ep = len(metrics.get("successes", []))
+            pct = 100 * n_suc / max(n_ep, 1)
+            print(f"[task done] {tg} task_id={tid}: {n_suc}/{n_ep} ({pct:.0f}%)", flush=True)
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:

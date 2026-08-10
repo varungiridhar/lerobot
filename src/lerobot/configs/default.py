@@ -22,11 +22,15 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 
 @dataclass
 class DatasetConfig:
-    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
-    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
-    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
-    # datasets are provided.
-    repo_id: str
+    # Single-dataset repo id. For multi-dataset training, leave this unset and
+    # set ``repo_ids`` instead — draccus cannot reliably parse a list out of a
+    # ``str | list[str]`` union, so we keep them as separate fields.
+    # ``make_dataset`` prefers ``repo_ids`` when it is non-empty, otherwise it
+    # uses ``repo_id``. Exactly one must be provided at runtime.
+    repo_id: str | None = None
+    # Multi-dataset path: each dataset gets a `dataset_index` injected into its
+    # returned item. The index mapping is made according to the order provided.
+    repo_ids: list[str] | None = None
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
@@ -56,6 +60,10 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Cap on how many episodes get rendered to mp4. 0 disables video output entirely;
+    # set to ``n_episodes`` (or higher) to render every rollout. Render cost is modest
+    # but can dominate eval wall-time for fast policies — keep small unless needed.
+    max_episodes_rendered: int = 10
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

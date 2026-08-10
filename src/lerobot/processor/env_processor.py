@@ -295,6 +295,10 @@ class RoboTwinProcessorStep(ObservationProcessorStep):
         left = processed.pop(left_key)
         right = processed.pop(right_key)
         processed[f"{OBS_IMAGES}.image"] = build_robotwin_image(head, left, right)
+        # Expose individual cameras under Q-function key names so Q-planning can score them.
+        processed[f"{OBS_IMAGES}.cam_high"] = head
+        processed[f"{OBS_IMAGES}.cam_left_wrist"] = left
+        processed[f"{OBS_IMAGES}.cam_right_wrist"] = right
         return processed
 
     def transform_features(

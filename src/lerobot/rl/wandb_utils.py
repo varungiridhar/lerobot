@@ -36,7 +36,10 @@ def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[st
         lst.append(f"dataset:{cfg.dataset.repo_id}")
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
-    return lst if return_list else "-".join(lst)
+    if return_list:
+        # wandb enforces 1-64 chars per run tag (long dataset repo_ids overflow).
+        return [t[:64] for t in lst]
+    return "-".join(lst)
 
 
 def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
@@ -90,7 +93,12 @@ class WandBLogger:
             save_code=False,
             # TODO(rcadene): split train and eval, and run async eval with job_type="eval"
             job_type="train_eval",
-            resume="must" if cfg.resume else None,
+            # "allow" rather than "must": a --resume job may pass a fresh
+            # wandb.run_id to start a clean wandb run (the original run already
+            # logged steps past the checkpoint, and re-logging them violates
+            # wandb's monotonic-step rule). "must" crashes on a brand-new id;
+            # "allow" resumes an existing id and otherwise starts a new run.
+            resume="allow" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
         )
         run_id = wandb.run.id
@@ -143,7 +151,7 @@ class WandBLogger:
     def log_dict(
         self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
     ):
-        if mode not in {"train", "eval"}:
+        if mode not in {"train", "eval", "test"}:
             raise ValueError(mode)
         if step is None and custom_step_key is None:
             raise ValueError("Either step or custom_step_key must be provided.")

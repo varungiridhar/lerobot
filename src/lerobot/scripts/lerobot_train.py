@@ -84,6 +84,72 @@ def _log_wm_visualizations(policy, batch, step, output_dir, wandb_logger):
         wandb_logger.log_images(viz, step)
 
 
+def _log_q_visualizations(policy, dataset, preprocessor, step, wandb_logger, device):
+    """Log Q-function visualizations on held-out test episodes.
+
+    For a QFunctionPolicy, walks a sample of the dataset's held-out test
+    episodes and renders side-by-side Q-value videos. No-op for non-Q policies
+    or when the dataset has no test holdout (``test_split_ratio=0``).
+    """
+    from lerobot.policies.q_function.modeling_q_function import QFunctionPolicy
+
+    if not isinstance(policy, QFunctionPolicy):
+        return
+    from lerobot.policies.q_function.q_vis import log_q_test_visualizations
+
+    log_q_test_visualizations(
+        policy=policy,
+        dataset=dataset,
+        preprocessor=preprocessor,
+        step=step,
+        wandb_logger=wandb_logger,
+        device=device,
+    )
+
+
+@torch.no_grad()
+def _compute_test_metrics(
+    policy,
+    test_dl_iter,
+    n_batches: int,
+    preprocessor,
+    accelerator: Accelerator,
+) -> dict[str, float]:
+    """Forward ``n_batches`` held-out batches and average loss + sub-metrics.
+
+    Uses the same ``policy.forward(batch) -> (loss, dict)`` interface as the
+    train step (see ``update_policy``), so test metrics mirror train ones
+    one-for-one. Unwraps the DDP wrapper to avoid registering backward hooks
+    during the no-grad forward.
+    """
+    inner = accelerator.unwrap_model(policy)
+    was_training = inner.training
+    inner.eval()
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    try:
+        for _ in range(max(1, int(n_batches))):
+            batch = next(test_dl_iter)
+            batch = preprocessor(batch)
+            with accelerator.autocast():
+                loss, output_dict = inner.forward(batch)
+            sums["loss"] = sums.get("loss", 0.0) + float(loss.item())
+            counts["loss"] = counts.get("loss", 0) + 1
+            for k, v in (output_dict or {}).items():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    sums[k] = sums.get(k, 0.0) + float(v)
+                    counts[k] = counts.get(k, 0) + 1
+                elif torch.is_tensor(v) and v.numel() == 1:
+                    sums[k] = sums.get(k, 0.0) + float(v.item())
+                    counts[k] = counts.get(k, 0) + 1
+    finally:
+        if was_training:
+            inner.train()
+    return {k: sums[k] / counts[k] for k in sums}
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -202,15 +268,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from datetime import timedelta
+
+        from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # Env eval (eval_policy_all) and the Q-rollout viz run on the main
+        # process only; the other ranks idle at accelerator.wait_for_everyone().
+        # That barrier is a NCCL collective whose default timeout is 10 min — a
+        # BC-driven LIBERO eval easily exceeds that and the watchdog then aborts
+        # the waiting ranks (SIGABRT). Extend the process-group timeout so the
+        # barrier survives a long eval; SLURM's wall clock remains the real bound.
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, pg_kwargs],
             cpu=force_cpu,
         )
 
@@ -284,10 +359,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
-    # Create processors - only provide dataset_stats if not resuming from saved processors
+    # Create processors - only provide dataset_stats if not resuming from saved processors.
+    # q_function's processor pipeline carries custom batch<->transition functions
+    # (_q_batch_to_transition / _q_transition_to_batch) that smuggle the q_* reward
+    # keys + the task string through complementary_data. Those function references
+    # cannot be serialized, so PolicyProcessorPipeline.from_pretrained always
+    # restores the pipeline with the *standard* transition, which drops those keys
+    # -> KeyError('q_reward_chunk_first') at the first forward. The processor has no
+    # state beyond dataset-derived stats, so for q_function we always rebuild it
+    # from cfg/dataset rather than loading the (un-restorable) saved one.
+    processor_pretrained_path = cfg.policy.pretrained_path
+    if cfg.policy.type == "q_function":
+        processor_pretrained_path = None
+
     processor_kwargs = {}
     postprocessor_kwargs = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
@@ -295,7 +382,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.type == "sarm":
         processor_kwargs["dataset_meta"] = dataset.meta
 
-    if cfg.policy.pretrained_path is not None:
+    if processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
@@ -317,7 +404,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
+        pretrained_path=processor_pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
@@ -357,6 +444,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    # Environment processors are only needed for env-based eval (non-Q
+    # policies). Q-function training evaluates on held-out test episodes
+    # instead, so it never touches these.
+    env_preprocessor = None
+    env_postprocessor = None
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
@@ -375,6 +468,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    has_holdout = (
+        getattr(cfg, "test_split_ratio", 0.0) > 0.0
+        and hasattr(dataset, "has_holdout")
+        and getattr(dataset, "has_holdout", False)
+    )
+    train_dataset = dataset
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -384,12 +483,34 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
         )
+    elif has_holdout:
+        # Hold out the test frames by training over a Subset of just the train
+        # frames with standard shuffling -- NOT a custom SubsetRandomSampler.
+        # A custom sampler bypasses accelerate's even_batches DDP guarantee, so
+        # the two ranks get unequal batch counts per epoch and reach the epoch
+        # boundary at different global steps; the rank that wraps first runs the
+        # dataloader's synchronize_rng_states broadcast, which then deadlocks
+        # against the other rank's gradient all-reduce (NCCL collective desync).
+        # A plain Subset + shuffle uses the standard, even-batches sharding path.
+        # The complementary test frames feed a separate, rank-0-only loader below.
+        bucket_weights = dict(getattr(cfg.policy, "bucket_sample_weights", None) or {})
+        if bucket_weights:
+            train_indices = dataset.balanced_train_frame_indices(bucket_weights, seed=cfg.seed)
+            logging.info(
+                f"Bucket-balanced sampling: {len(train_indices)} frames/epoch "
+                f"(natural {len(dataset.train_frame_indices)}; weights={bucket_weights})"
+            )
+        else:
+            train_indices = dataset.train_frame_indices
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        shuffle = True
+        sampler = None
     else:
         shuffle = True
         sampler = None
 
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming,
@@ -399,11 +520,56 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # Test/holdout DataLoader (rank-0 only; not handed to accelerator.prepare).
+    # When the wrapper carved a holdout but test_freq is 0, we still skip the
+    # loader since no logging will happen.
+    test_dataloader = None
+    test_dl_iter = None
+    if (
+        has_holdout
+        and getattr(cfg, "test_freq", 0) > 0
+        and is_main_process
+        and not cfg.dataset.streaming
+    ):
+        from torch.utils.data import SubsetRandomSampler
+        test_dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=max(1, cfg.num_workers // 2),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            sampler=SubsetRandomSampler(dataset.test_frame_indices),
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+        logging.info(
+            "Test dataloader enabled: %d test frames (across %d test episodes), "
+            "test_freq=%d, test_n_batches=%d",
+            len(dataset.test_frame_indices),
+            len(getattr(dataset, "_test_episode_global_ids", [])),
+            cfg.test_freq,
+            cfg.test_n_batches,
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    # Disable accelerate's per-iteration RNG-sync on the train loader. Its
+    # DataLoaderShard.__iter__ runs `if self.rng_types is not None:
+    # synchronize_rng_states(...)` -- a cross-rank NCCL broadcast -- every time
+    # the loader is (re-)iterated. The train loop wraps the loader in cycle(),
+    # so that broadcast fires at every epoch boundary, and it deadlocks against
+    # the other rank's gradient all-reduce whenever the two ranks cross the
+    # boundary on different steps. Setting rng_types=None makes __iter__ skip
+    # the broadcast entirely, leaving only the per-step training collectives
+    # (which are inherently in lockstep). Each rank then shuffles independently,
+    # which is correct for data-parallel training.
+    if hasattr(dataloader, "rng_types"):
+        dataloader.rng_types = None
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -456,6 +622,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_test_step = (
+            getattr(cfg, "test_freq", 0) > 0
+            and test_dataloader is not None
+            and step % cfg.test_freq == 0
+            and is_main_process
+        )
 
         if is_log_step:
             logging.info(train_tracker)
@@ -476,10 +648,40 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        if is_test_step:
+            if test_dl_iter is None:
+                test_dl_iter = cycle(test_dataloader)
+            test_dict = _compute_test_metrics(
+                policy,
+                test_dl_iter,
+                cfg.test_n_batches,
+                preprocessor,
+                accelerator,
+            )
+            if wandb_logger:
+                wandb_logger.log_dict(test_dict, step, mode="test")
+            logging.info(
+                "Test metrics @ step %d: %s",
+                step,
+                ", ".join(f"{k}={v:.4f}" for k, v in sorted(test_dict.items())),
+            )
+
         if is_eval_step and is_main_process:
             # Log WM image reconstructions at eval frequency (no-op for non-AWM policies or state-only configs).
             _log_wm_visualizations(
                 accelerator.unwrap_model(policy), batch, step, cfg.output_dir, wandb_logger
+            )
+            # Log Q-function visualizations on held-out test episodes at eval
+            # frequency (no-op for non-QFunction policies or when there is no
+            # test holdout). The in-training Q scores each test episode's
+            # recorded action chunk + random perturbations of it.
+            _log_q_visualizations(
+                accelerator.unwrap_model(policy),
+                dataset,
+                preprocessor,
+                step,
+                wandb_logger,
+                device,
             )
 
         if cfg.save_checkpoint and is_saving_step:
@@ -502,7 +704,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             accelerator.wait_for_everyone()
 
-        if cfg.env and is_eval_step:
+        # Env-based eval runs for non-Q policies only. QFunctionPolicy is
+        # evaluated on held-out test episodes instead — _compute_test_metrics
+        # (scalar test loss at test_freq) and _log_q_visualizations (test-set
+        # Q-value videos at eval_freq) — so it never builds or steps an env.
+        if cfg.env and is_eval_step and cfg.policy.type != "q_function":
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
