@@ -125,8 +125,21 @@ echo "============================================="
 # Collection is single-threaded SAPIEN physics (measured: ~1 of 6 cores busy, GPU
 # mostly idle between chunk boundaries), so it parallelises across nodes almost
 # linearly — 47 tasks x ~4 min = ~3.2 h sequential vs ~25 min on 8 nodes.
-# COLLECT_SHARDS=1 (default) keeps the original single-job behaviour.
-COLLECT_SHARDS=${COLLECT_SHARDS:-1}
+# Host RAM, not GPU, is the binding constraint on a collection shard: peak RSS scales
+# with (tasks per shard x episodes per task x episode length). Measured 2026-08-10 with
+# ~6 tasks/shard and 20 episodes/task: peaks of 41.5 / 45.4 / 47.5 / 56.0 / 58.9 GB
+# against a 64 GB limit, and shard c1 was killed OUT_OF_MEMORY at 67 GB.
+#
+# Smaller shards also finish well inside the 4 h wall limit, which matters as much as
+# the memory: on 2026-08-10 shard c6 spent 3.7 h on rollouts, was killed mid dataset
+# write, and its half-written parquet then crashed the finetune and killed the chain.
+#
+# 16 shards puts ~3 tasks each (~30 GB, ~2 h). Raising --mem-per-gpu
+# instead would be worse: L40s nodes have 503 GB over 8 GPUs (~63 GB/GPU), so asking
+# for 128 GB consumes two GPUs' worth of memory and roughly halves how many of our
+# jobs a node can hold -- on a partition we already queue hours for. More, smaller
+# shards cut memory AND schedule more easily.
+COLLECT_SHARDS=${COLLECT_SHARDS:-16}
 MODE=${MODE:-orchestrate}
 # Collection shards run on L40s, which is where the spare capacity is: measured
 # 2026-08-07, gpu-l40s had 10 of 48 GPUs free while gpu-h100 (0/32) and gpu-h200
@@ -271,10 +284,14 @@ fi
 NEXT_ITERATION=$(( ITERATION + 1 ))
 if [ $EXIT_CODE -eq 0 ] && [ $NEXT_ITERATION -lt $MAX_ITERATIONS ]; then
     echo "Chaining iteration $NEXT_ITERATION (Q ckpt: $NEW_Q_CKPT) ..."
+    # COLLECT_SHARDS is passed EMPTY on purpose so the next iteration falls back to this
+    # script's current default. Merely omitting it would not work: --export=ALL also
+    # carries this job's own environment, so a run launched at 8 shards would re-seed 8
+    # into every later iteration and silently pin the whole chain to the old value.
     sbatch \
         -A "$TRAIN_ACCOUNT" -q "$QOS" -p "$TRAIN_PARTITION" \
         --dependency=afterok:$SLURM_JOB_ID \
-        --export=ALL,MODE=orchestrate,SHARD=,COLLECT_SHARDS=$COLLECT_SHARDS,ITERATION=$NEXT_ITERATION,Q_CKPT=$NEW_Q_CKPT,OUTPUT_DIR=$OUTPUT_DIR,MAX_ITERATIONS=$MAX_ITERATIONS,N_EPISODES=$N_EPISODES,FINETUNE_STEPS=$FINETUNE_STEPS,FINETUNE_LR=$FINETUNE_LR,BATCH_SIZE=$BATCH_SIZE,ONLINE_FRACTION=$ONLINE_FRACTION,GRAD_CLIP_NORM=$GRAD_CLIP_NORM,PLANNER_TYPE=$PLANNER_TYPE,N_SAMPLES=$N_SAMPLES,N_ELITES=$N_ELITES,DIFFUSION_STEPS=$DIFFUSION_STEPS,SEED=$SEED,WANDB_PROJECT=$WANDB_PROJECT,WANDB_ENTITY=$WANDB_ENTITY,WANDB_RUN_NAME=$WANDB_RUN_NAME,TRAIN_ACCOUNT=$TRAIN_ACCOUNT,TRAIN_PARTITION=$TRAIN_PARTITION,EVAL_ACCOUNT=$EVAL_ACCOUNT,QOS=$QOS,EVAL_AFTER_TRAIN=$EVAL_AFTER_TRAIN,EVAL_EPISODES=$EVAL_EPISODES,EVAL_BATCH_SIZE=$EVAL_BATCH_SIZE \
+        --export=ALL,MODE=orchestrate,SHARD=,COLLECT_SHARDS=,ITERATION=$NEXT_ITERATION,Q_CKPT=$NEW_Q_CKPT,OUTPUT_DIR=$OUTPUT_DIR,MAX_ITERATIONS=$MAX_ITERATIONS,N_EPISODES=$N_EPISODES,FINETUNE_STEPS=$FINETUNE_STEPS,FINETUNE_LR=$FINETUNE_LR,BATCH_SIZE=$BATCH_SIZE,ONLINE_FRACTION=$ONLINE_FRACTION,GRAD_CLIP_NORM=$GRAD_CLIP_NORM,PLANNER_TYPE=$PLANNER_TYPE,N_SAMPLES=$N_SAMPLES,N_ELITES=$N_ELITES,DIFFUSION_STEPS=$DIFFUSION_STEPS,SEED=$SEED,WANDB_PROJECT=$WANDB_PROJECT,WANDB_ENTITY=$WANDB_ENTITY,WANDB_RUN_NAME=$WANDB_RUN_NAME,TRAIN_ACCOUNT=$TRAIN_ACCOUNT,TRAIN_PARTITION=$TRAIN_PARTITION,EVAL_ACCOUNT=$EVAL_ACCOUNT,QOS=$QOS,EVAL_AFTER_TRAIN=$EVAL_AFTER_TRAIN,EVAL_EPISODES=$EVAL_EPISODES,EVAL_BATCH_SIZE=$EVAL_BATCH_SIZE \
         scripts/run_self_improvement_robotwin.sh
 fi
 
