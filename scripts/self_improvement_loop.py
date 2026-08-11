@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Self-improvement loop for FastWAM + Q-function planning.
 
-Collects on-policy rollouts with Q-planning, fine-tunes the Q-function on
-successful episodes combined with the original training data, then repeats.
+Collects on-policy rollouts with Q-planning, fine-tunes the Q-function on all
+collected episodes combined with the original training data, then repeats.
 Runs in a single process on one GPU.
 
 Usage:
@@ -19,10 +19,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import gc
 import json
 import logging
 import os
+import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -30,6 +34,10 @@ from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+# Native MuJoCo / EGL failures otherwise terminate the process with SIGABRT and
+# leave no Python-side location in the SLURM log.
+faulthandler.enable(all_threads=True)
 
 # ── Env / GPU setup ───────────────────────────────────────────────────────────
 
@@ -52,6 +60,7 @@ def _run_episode(
     preprocessor,
     postprocessor,
     seed: int | None = None,
+    rollout_diagnostics: bool = False,
 ) -> dict:
     """Run one episode and return a data dict regardless of success.
 
@@ -87,13 +96,39 @@ def _run_episode(
         obs_tensor = env_preprocessor(obs_tensor)
         obs_tensor = preprocessor(obs_tensor)
 
+        if rollout_diagnostics:
+            log.info("rollout seed=%s step=%d policy.select_action begin", seed, step)
+        policy_started = time.monotonic()
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
+        policy_elapsed = time.monotonic() - policy_started
         action = postprocessor(action)
         action_trans = env_postprocessor({ACTION: action})
         action_np = action_trans[ACTION].cpu().numpy()
+        if not np.isfinite(action_np).all():
+            raise FloatingPointError(f"Non-finite action at seed={seed} step={step}: {action_np!r}")
 
+        if rollout_diagnostics:
+            log.info(
+                "rollout seed=%s step=%d env.step begin policy_s=%.3f action_min=%.5f action_max=%.5f",
+                seed,
+                step,
+                policy_elapsed,
+                float(action_np.min()),
+                float(action_np.max()),
+            )
+        env_step_started = time.monotonic()
         observation, reward, terminated, truncated, step_info = env.step(action_np)
+        env_step_elapsed = time.monotonic() - env_step_started
+        if rollout_diagnostics:
+            log.info(
+                "rollout seed=%s step=%d env.step done env_s=%.3f terminated=%s truncated=%s",
+                seed,
+                step,
+                env_step_elapsed,
+                bool(np.any(terminated)),
+                bool(np.any(truncated)),
+            )
         if "final_info" in step_info:
             final_info = step_info["final_info"]
             successes = final_info["is_success"].tolist()
@@ -132,7 +167,7 @@ def _run_episode(
 
 def collect_episodes(
     policy,
-    envs,  # nested dict: {task_group: {task_id: VectorEnv}}
+    env_cfg,
     env_preprocessor,
     env_postprocessor,
     preprocessor,
@@ -140,17 +175,39 @@ def collect_episodes(
     n_episodes: int,
     episodes_dir: Path,
     start_seed: int = 0,
-) -> float:
+    successful_only: bool = False,
+    rollout_diagnostics: bool = False,
+) -> tuple[float, int]:
     """Run episodes across all task envs and save them as a LeRobotDataset.
 
     Distributes n_episodes evenly across tasks. Saves to episodes_dir in LeRobot
-    format (parquet + PNG images) for lazy per-frame loading. Returns success rate.
+    format (parquet + PNG images) for lazy per-frame loading. When
+    ``successful_only`` is true, failed collection episodes are counted in the
+    collection metric but omitted from Q replay. Standard Q self-improvement
+    leaves this false so failures provide zero-return targets.
+
+    Returns ``(collection_success_rate, n_replay_episodes)``.
     """
+    from lerobot.envs.factory import make_env
+    from lerobot.envs.libero import _get_suite, _select_task_ids
     from lerobot.policies.q_function.online_dataset import save_episodes_lerobot
 
-    task_envs = [(tg, tid, env) for tg, group in envs.items() for tid, env in group.items()]
-    n_tasks = len(task_envs)
-    eps_per_task = max(1, n_episodes // n_tasks)
+    suite_names = [suite.strip() for suite in str(env_cfg.task).split(",") if suite.strip()]
+    task_specs = []
+    for suite_name in suite_names:
+        suite = _get_suite(suite_name)
+        task_specs.extend(
+            (suite_name, task_id)
+            for task_id in _select_task_ids(len(suite.tasks), env_cfg.task_ids)
+        )
+
+    n_tasks = len(task_specs)
+    if n_episodes < n_tasks or n_episodes % n_tasks != 0:
+        raise ValueError(
+            f"n_episodes={n_episodes} must be a positive multiple of the {n_tasks} task envs "
+            "so every task receives the same collection budget."
+        )
+    eps_per_task = n_episodes // n_tasks
 
     log.info(f"Collecting {n_episodes} episodes across {n_tasks} task envs ({eps_per_task} per task) ...")
 
@@ -158,32 +215,69 @@ def collect_episodes(
     all_successes: list[bool] = []
     total_eps = 0
 
-    for tg, tid, env in task_envs:
+    for tg, tid in task_specs:
         if total_eps >= n_episodes:
             break
-        task_success = 0
-        for _ep_i in range(eps_per_task):
-            seed = start_seed + total_eps
-            ep_dict = _run_episode(
-                env=env, policy=policy,
-                env_preprocessor=env_preprocessor, env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor, postprocessor=postprocessor, seed=seed,
-            )
-            success = ep_dict["success"]
-            all_successes.append(success)
-            all_episode_dicts.append(ep_dict)
-            total_eps += 1
-            if success:
-                task_success += 1
-        log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
+        # LIBERO collection is sequential, so keeping one EGL context per task
+        # alive at once is unnecessary and has caused native read_pixels aborts.
+        # Create only the task being collected, then close it before moving on.
+        task_cfg = replace(env_cfg, task=tg, task_ids=[tid])
+        log.info("Creating isolated LIBERO env for task %s/%d", tg, tid)
+        task_envs = make_env(task_cfg, n_envs=1, use_async_envs=False)
+        env = task_envs[tg][tid]
+        try:
+            task_success = 0
+            for _ep_i in range(eps_per_task):
+                seed = start_seed + total_eps
+                log.info(
+                    "Starting rollout %d/%d task=%s/%d seed=%d",
+                    total_eps + 1,
+                    n_episodes,
+                    tg,
+                    tid,
+                    seed,
+                )
+                ep_dict = _run_episode(
+                    env=env,
+                    policy=policy,
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    seed=seed,
+                    rollout_diagnostics=rollout_diagnostics,
+                )
+                success = ep_dict["success"]
+                all_successes.append(success)
+                if success or not successful_only:
+                    all_episode_dicts.append(ep_dict)
+                total_eps += 1
+                if success:
+                    task_success += 1
+            log.info(f"  Task {tg}/{tid}: {task_success}/{eps_per_task} success")
+        finally:
+            env.close()
+            del env
+            del task_envs
+            gc.collect()
+            log.info("Closed isolated LIBERO env for task %s/%d", tg, tid)
 
-    action_dim = int(all_episode_dicts[0]["action"].shape[1]) if all_episode_dicts else 7
+    if not all_episode_dicts:
+        raise RuntimeError(
+            "Collection produced no replay episodes. With successful_only=true, "
+            "this means every rollout failed."
+        )
+    action_dim = int(all_episode_dicts[0]["action"].shape[1])
     save_episodes_lerobot(all_episode_dicts, episodes_dir, action_dim=action_dim)
 
     n_success = sum(all_successes)
     pc_success = 100.0 * n_success / max(len(all_successes), 1)
-    log.info(f"  Total: {len(all_episode_dicts)} episodes ({n_success} success, {len(all_successes)-n_success} failure), success={pc_success:.1f}%")
-    return pc_success
+    log.info(
+        f"  Total: {len(all_successes)} collected ({n_success} success, "
+        f"{len(all_successes)-n_success} failure), retained={len(all_episode_dicts)}, "
+        f"success={pc_success:.1f}%"
+    )
+    return pc_success, len(all_episode_dicts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,10 +466,10 @@ def finetune_q(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _setup_policy_and_env(args, device: torch.device):
-    """Build FastWAM policy, Q planner, env, and all processors."""
+    """Build FastWAM policy, Q planner, env config, and all processors."""
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.envs.configs import LiberoEnv
-    from lerobot.envs.factory import make_env, make_env_pre_post_processors
+    from lerobot.envs.factory import make_env_pre_post_processors
     from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
     from lerobot.policies.fastwam.planning import FastWAMPlanner
     from lerobot.policies.factory import make_policy, make_pre_post_processors
@@ -383,10 +477,19 @@ def _setup_policy_and_env(args, device: torch.device):
 
     set_seed(args.seed)
 
-    env_cfg = LiberoEnv(task=args.task, observation_height=224, observation_width=224)
-    log.info(f"Creating LIBERO env: {args.task}")
-    envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
-
+    env_cfg = LiberoEnv(
+        task=args.task,
+        observation_height=224,
+        observation_width=224,
+        episode_length=args.episode_length,
+        stride_init_states=False,
+        task_ids=args.task_ids,
+    )
+    log.info(
+        "Creating LIBERO env: %s (horizon=%d, init_state=0 repeated)",
+        args.task,
+        args.episode_length,
+    )
     # PreTrainedConfig.from_pretrained dispatches on the 'type' field and returns FastWAMConfig.
     log.info("Loading FastWAM policy ...")
     policy_cfg = PreTrainedConfig.from_pretrained(args.fastwam_ckpt)
@@ -429,7 +532,7 @@ def _setup_policy_and_env(args, device: torch.device):
     policy.attach_planner(planner)
     log.info("FastWAM + Q planner ready.")
 
-    return policy, planner, envs, preprocessor, postprocessor, env_preprocessor, env_postprocessor
+    return policy, planner, env_cfg, preprocessor, postprocessor, env_preprocessor, env_postprocessor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,7 +562,7 @@ def self_improvement_loop(args):
         log.info(f"wandb run: {_wandb.run.get_url()}")
 
     # ── Set up FastWAM + env + preprocessors ─────────────────────────────────
-    policy, planner, envs, preprocessor, postprocessor, env_preprocessor, env_postprocessor = (
+    policy, planner, env_cfg, preprocessor, postprocessor, env_preprocessor, env_postprocessor = (
         _setup_policy_and_env(args, device)
     )
 
@@ -494,31 +597,46 @@ def self_improvement_loop(args):
     else:
         log.info("Negatives OFF (baseline loop): neg_margin_weight=0")
 
-    # Q training preprocessor (with Q-key passthrough)
-    q_pre_train = _make_q_train_preprocessor(args.q_ckpt)
+    q_pre_train = None
+    original_q_ds = None
+    if not args.collection_only:
+        # Q training preprocessor (with Q-key passthrough)
+        q_pre_train = _make_q_train_preprocessor(args.q_ckpt)
 
-    # Original training dataset (loaded once, reused every iteration)
-    original_q_ds = _load_original_q_dataset(
-        repo_id=args.original_dataset_repo_id,
-        dataset_root=args.original_dataset_root,
-        q_policy=q_policy,
+        # Original training dataset (loaded once, reused every iteration)
+        original_q_ds = _load_original_q_dataset(
+            repo_id=args.original_dataset_repo_id,
+            dataset_root=args.original_dataset_root,
+            q_policy=q_policy,
+        )
+
+    start_seed = (
+        args.collection_start_seed
+        if args.collection_start_seed is not None
+        else args.seed + args.start_iteration * args.n_episodes
     )
-
-    start_seed = args.seed + args.start_iteration * args.n_episodes
     global_step = args.start_iteration * args.finetune_steps
 
     for i in range(args.n_iterations):
         iteration = args.start_iteration + i
         log.info(f"\n{'='*60}\nIteration {iteration}\n{'='*60}")
-        iter_dir = output_dir / f"iter_{iteration:03d}"
-        iter_dir.mkdir(parents=True, exist_ok=True)
+        final_iter_dir = output_dir / f"iter_{iteration:03d}"
+        iter_dir = output_dir / f"iter_{iteration:03d}_incomplete"
+        if final_iter_dir.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite completed iteration directory: {final_iter_dir}"
+            )
+        if iter_dir.exists():
+            log.warning("Removing incomplete iteration from an earlier interrupted attempt: %s", iter_dir)
+            shutil.rmtree(iter_dir)
+        iter_dir.mkdir(parents=True, exist_ok=False)
         t0 = time.time()
 
         # ── 1. Collect episodes ──────────────────────────────────────────────
         episodes_dir = iter_dir / "online_episodes"
-        pc_success = collect_episodes(
+        pc_success, n_replay_episodes = collect_episodes(
             policy=policy,
-            envs=envs,
+            env_cfg=env_cfg,
             env_preprocessor=env_preprocessor,
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
@@ -526,8 +644,37 @@ def self_improvement_loop(args):
             n_episodes=args.n_episodes,
             episodes_dir=episodes_dir,
             start_seed=start_seed,
+            successful_only=args.successful_only,
+            rollout_diagnostics=args.rollout_diagnostics,
         )
         start_seed += args.n_episodes
+
+        if args.collection_only:
+            metrics = {
+                "iteration": iteration,
+                "collection_only": True,
+                "n_collected": args.n_episodes,
+                "n_replay_episodes": n_replay_episodes,
+                "pc_success": pc_success,
+                "collection_seed_start": start_seed - args.n_episodes,
+                "collection_seed_end": start_seed - 1,
+                "task_ids": args.task_ids,
+                "episode_length": args.episode_length,
+                "planner_type": args.planner_type,
+                "n_samples": args.n_samples,
+                "diffusion_steps": args.diffusion_steps,
+                "elapsed_s": time.time() - t0,
+            }
+            (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+            iter_dir.rename(final_iter_dir)
+            with open(summary_path, "a") as f:
+                f.write(json.dumps(metrics) + "\n")
+            log.info(
+                "Collection-only probe complete: collect=%.1f%% elapsed=%.1fs",
+                pc_success,
+                metrics["elapsed_s"],
+            )
+            break
 
         # ── 2. Build online dataset (growing buffer across all iterations) ──────
         from lerobot.policies.q_function.online_dataset import OnlineQDataset
@@ -581,23 +728,30 @@ def self_improvement_loop(args):
         # ── 5. Eval with video clips ─────────────────────────────────────────
         eval_pc_success = None
         if args.eval_n_episodes > 0:
+            from lerobot.envs.factory import make_env
             from lerobot.scripts.lerobot_eval import eval_policy_all
 
             log.info(f"Running eval ({args.eval_n_episodes} episodes) for clips ...")
             videos_dir = iter_dir / "eval_videos"
-            with torch.no_grad():
-                eval_info = eval_policy_all(
-                    envs=envs,
-                    policy=policy,
-                    env_preprocessor=env_preprocessor,
-                    env_postprocessor=env_postprocessor,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    n_episodes=args.eval_n_episodes,
-                    max_episodes_rendered=min(args.eval_n_episodes, 4),
-                    videos_dir=videos_dir,
-                    start_seed=args.seed + 100_000 + iteration * 1000,
-                )
+            eval_envs = make_env(env_cfg, n_envs=1, use_async_envs=False)
+            try:
+                with torch.no_grad():
+                    eval_info = eval_policy_all(
+                        envs=eval_envs,
+                        policy=policy,
+                        env_preprocessor=env_preprocessor,
+                        env_postprocessor=env_postprocessor,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        n_episodes=args.eval_n_episodes,
+                        max_episodes_rendered=min(args.eval_n_episodes, 4),
+                        videos_dir=videos_dir,
+                        start_seed=args.seed + 100_000 + iteration * 1000,
+                    )
+            finally:
+                for task_group in eval_envs.values():
+                    for eval_env in task_group.values():
+                        eval_env.close()
             overall = eval_info["overall"]
             eval_pc_success = overall.get("pc_success", None)
             log.info(f"  Eval: pc_success={eval_pc_success:.1f}%")
@@ -628,16 +782,25 @@ def self_improvement_loop(args):
         metrics = {
             "iteration": iteration,
             "n_collected": args.n_episodes,
+            "n_replay_episodes": n_replay_episodes,
             "n_online_frames": len(online_ds),
             "pc_success": pc_success,
             "eval_pc_success": eval_pc_success,
             "finetune_loss": mean_loss,
+            "collection_seed_start": start_seed - args.n_episodes,
+            "collection_seed_end": start_seed - 1,
+            "episode_length": args.episode_length,
+            "init_state": 0,
+            "successful_only": args.successful_only,
+            "planner_type": args.planner_type,
+            "n_samples": args.n_samples,
+            "diffusion_steps": args.diffusion_steps,
             "elapsed_s": time.time() - t0,
         }
+        (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        iter_dir.rename(final_iter_dir)
         with open(summary_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
-
-        (iter_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
         log.info(
             f"Iteration {iteration} done: collect={pc_success:.1f}% eval={eval_pc_success} "
             f"loss={mean_loss:.4f} elapsed={metrics['elapsed_s']:.1f}s"
@@ -661,8 +824,38 @@ def parse_args():
     p.add_argument("--original_dataset_repo_id", default="HuggingFaceVLA/libero")
     p.add_argument("--original_dataset_root", default="/storage/project/r-agarg35-0/shared/lerobot-data-2")
     p.add_argument("--task", default="libero_10")
+    p.add_argument(
+        "--task_ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional LIBERO task IDs to collect; defaults to every task in the suite.",
+    )
+    p.add_argument("--episode_length", type=int, default=520)
     p.add_argument("--n_iterations", type=int, default=5)
     p.add_argument("--n_episodes", type=int, default=20)
+    p.add_argument(
+        "--collection_only",
+        action="store_true",
+        help="Collect and serialize rollouts, then exit without Q finetuning or evaluation.",
+    )
+    p.add_argument(
+        "--collection_start_seed",
+        type=int,
+        default=None,
+        help="Override the derived first rollout seed (used for targeted crash probes).",
+    )
+    p.add_argument(
+        "--rollout_diagnostics",
+        action="store_true",
+        help="Log policy and environment timing immediately before and after every rollout step.",
+    )
+    p.add_argument(
+        "--successful_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optional ablation that drops failed rollouts; standard Q replay retains all rollouts.",
+    )
     p.add_argument("--finetune_steps", type=int, default=200)
     p.add_argument("--finetune_lr", type=float, default=1e-5)
     p.add_argument("--batch_size", type=int, default=48)

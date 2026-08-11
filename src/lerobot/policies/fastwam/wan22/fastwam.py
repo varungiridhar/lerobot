@@ -15,6 +15,39 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 logger = logging.getLogger(__name__)
 
 
+def _apply_action_sample_weights(
+    action_loss_per_sample: torch.Tensor,
+    sample_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Apply per-sample DAWR weights without batch-sum normalization."""
+    loss_unweighted = action_loss_per_sample.mean()
+    if sample_weights is None:
+        return loss_unweighted, loss_unweighted, 1.0, 1.0
+
+    sample_weights = sample_weights.to(
+        device=action_loss_per_sample.device,
+        dtype=action_loss_per_sample.dtype,
+    ).flatten()
+    if sample_weights.shape != action_loss_per_sample.shape:
+        raise ValueError(
+            "sample_weights must contain one scalar per FastWAM sample: "
+            f"got {tuple(sample_weights.shape)} for losses "
+            f"{tuple(action_loss_per_sample.shape)}"
+        )
+    if not torch.isfinite(sample_weights).all() or torch.any(sample_weights < 0):
+        raise ValueError("sample_weights must be finite and non-negative.")
+    # Do not divide by the batch sum here. FastWAM is commonly trained with
+    # batch_size=1; sum-normalization would cancel DAWR's weight and silently
+    # reduce the update to ordinary behavior cloning.
+    loss_weighted = (action_loss_per_sample * sample_weights).mean()
+    return (
+        loss_weighted,
+        loss_unweighted,
+        float(sample_weights.detach().mean()),
+        float(sample_weights.detach().max()),
+    )
+
+
 class FastWAM(torch.nn.Module):
     """MoT world model with video/action experts."""
 
@@ -445,7 +478,12 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
-    def training_loss(self, sample, tiled: bool = False):
+    def training_loss(
+        self,
+        sample,
+        tiled: bool = False,
+        sample_weights: torch.Tensor | None = None,
+    ):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -558,12 +596,21 @@ class FastWAM(torch.nn.Module):
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
         )
-        loss_action = (action_loss_per_sample * action_weight).mean()
+        action_loss_per_sample = action_loss_per_sample * action_weight
+        (
+            loss_action,
+            loss_action_unweighted,
+            sample_weight_mean,
+            sample_weight_max,
+        ) = _apply_action_sample_weights(action_loss_per_sample, sample_weights)
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_action_unweighted": self.loss_lambda_action * float(loss_action_unweighted.detach().item()),
+            "sample_weight_mean": sample_weight_mean,
+            "sample_weight_max": sample_weight_max,
         }
         return loss_total, loss_dict
 

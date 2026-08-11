@@ -104,6 +104,7 @@ def rollout(
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     goal_provider: BaseGoalProvider | None = None,
+    reset_options: dict[str, Any] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -140,7 +141,7 @@ def rollout(
 
     # Reset the policy and environments.
     policy.reset()
-    observation, info = env.reset(seed=seeds)
+    observation, info = env.reset(seed=seeds, options=reset_options)
     if render_callback is not None:
         render_callback(env)
 
@@ -272,6 +273,7 @@ def eval_policy(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     goal_provider: BaseGoalProvider | None = None,
+    stride_init_states: bool = False,
 ) -> dict:
     """
     Args:
@@ -366,6 +368,11 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             goal_provider=goal_provider,
+            reset_options=(
+                {"episode_index_offset": batch_ix * env.num_envs}
+                if stride_init_states
+                else None
+            ),
         )
         batch_ep_s = (time.time() - batch_start_t) / env.num_envs
 
@@ -703,6 +710,7 @@ def eval_main(cfg: EvalPipelineConfig):
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             goal_provider=goal_provider,
+            stride_init_states=getattr(cfg.env, "stride_init_states", True),
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -746,6 +754,7 @@ def eval_one(
     return_episode_data: bool,
     start_seed: int | None,
     goal_provider: BaseGoalProvider | None = None,
+    stride_init_states: bool = False,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -764,6 +773,7 @@ def eval_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         goal_provider=goal_provider,
+        stride_init_states=stride_init_states,
     )
 
     per_episode = task_result["per_episode"]
@@ -791,6 +801,7 @@ def run_one(
     return_episode_data: bool,
     start_seed: int | None,
     goal_provider: BaseGoalProvider | None = None,
+    stride_init_states: bool = True,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -816,6 +827,9 @@ def run_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         goal_provider=goal_provider,
+        # Planning requires batch_size=1. For LIBERO, the caller chooses between
+        # distinct init states and the legacy fixed-init-state-0 protocol.
+        stride_init_states=task_group.startswith("libero") and stride_init_states,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -838,6 +852,7 @@ def eval_policy_all(
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
     goal_provider: BaseGoalProvider | None = None,
+    stride_init_states: bool = True,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -894,6 +909,7 @@ def eval_policy_all(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         goal_provider=goal_provider,
+        stride_init_states=stride_init_states,
     )
 
     if max_parallel_tasks <= 1:

@@ -365,8 +365,18 @@ class FastWAMPolicy(PreTrainedPolicy):
                 self._planner.record_step(_obs_frame_to_uint8(batch[cam_key]))
         return self._queue.popleft()  # (B, action_dim)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Training forward pass — delegates to FastWAM.training_loss."""
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        sample_weights: Tensor | None = None,
+    ) -> tuple[Tensor, dict]:
+        """Training forward pass, optionally weighting each action target.
+
+        ``sample_weights`` is intentionally an explicit argument instead of a
+        batch key.  This keeps policy preprocessing independent of the RL
+        objective and lets DAWR apply one scalar weight to every diffusion-loss
+        term belonging to the same state/action-chunk sample.
+        """
         video = self._prepare_video_for_training(batch)
         context, context_mask = self._encode_text(batch)
         proprio = self._get_proprio(batch)
@@ -386,7 +396,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             "action": action,
             "action_is_pad": action_is_pad,
         }
-        loss, loss_dict = self.model.training_loss(sample)
+        loss, loss_dict = self.model.training_loss(sample, sample_weights=sample_weights)
         return loss, {k: v.item() if isinstance(v, Tensor) else v for k, v in loss_dict.items()}
 
     # ------------------------------------------------------------------

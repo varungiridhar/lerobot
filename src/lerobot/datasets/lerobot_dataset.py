@@ -768,6 +768,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._lazy_loading = False
         self._recorded_frames = self.meta.total_frames
         self._writer_closed_for_reading = False
+        self._hf_column_datasets: dict[str, datasets.Dataset] = {}
 
         # Load actual data
         try:
@@ -1038,9 +1039,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         Query dataset for indices across keys, skipping video keys.
 
-        Uses row-first access [indices][key] to avoid decoding entire image columns.
-        Column-first access [key][indices] would cause HuggingFace to decode all
-        images in the dataset for image-type features, causing OOM on large datasets.
+        Selects one column before row access.  Row-first access
+        ``dataset[indices][key]`` decodes every feature for those rows, so a
+        32-step action query also decodes 64 inline camera images.  Direct
+        column materialization ``dataset[key]`` has the opposite problem: it
+        decodes that column for the entire dataset.  A one-column Dataset view
+        avoids both failure modes.
 
         Args:
             query_indices: Dict mapping keys to index lists to retrieve
@@ -1059,7 +1063,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
             try:
-                values = self.hf_dataset[relative_indices][key]
+                column_dataset = self._hf_column_datasets.get(key)
+                if column_dataset is None:
+                    column_dataset = self.hf_dataset.select_columns([key])
+                    self._hf_column_datasets[key] = column_dataset
+                values = column_dataset[relative_indices][key]
             except (KeyError, TypeError, IndexError):
                 col = self.hf_dataset[key]
                 values = [col[i] for i in relative_indices]
@@ -1099,6 +1107,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._close_writer()
                 self._writer_closed_for_reading = True
             self.hf_dataset = self.load_hf_dataset()
+            self._hf_column_datasets = {}
             self._lazy_loading = False
 
     def __len__(self):
@@ -1669,6 +1678,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Initialize tracking for incremental recording
         obj._lazy_loading = False
         obj._recorded_frames = 0
+        obj._hf_column_datasets = {}
         obj._writer_closed_for_reading = False
         return obj
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,45 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.processor import RobotObservation
+
+
+def _install_robosuite_render_context_guard() -> None:
+    """Keep Robosuite's GL context current for every MuJoCo render call.
+
+    Robosuite 1.4 acquires a process-wide lock in ``MjSim.render``, but it does
+    not make the corresponding GL context current *inside* that lock before
+    calling ``mjr_render`` and ``mjr_readPixels``. MuJoCo requires a current
+    context for every ``mjr_*`` rendering call. Rebinding at the environment
+    boundary is too early: another renderer can change the thread-local
+    context before the lock is acquired, leading to an unrecoverable native
+    abort in ``mjr_readPixels``.
+
+    Patch the two render-context entry points once per process. The wrappers
+    execute under Robosuite's existing render lock, so context selection and
+    rendering are atomic with respect to other Robosuite environments.
+    """
+    from robosuite.utils.binding_utils import MjRenderContext
+
+    def guard(method: Callable[..., Any]) -> Callable[..., Any]:
+        if getattr(method, "_lerobot_makes_context_current", False):
+            return method
+
+        @wraps(method)
+        def guarded(render_context: Any, *args: Any, **kwargs: Any) -> Any:
+            gl_context = getattr(render_context, "gl_ctx", None)
+            if gl_context is None or not hasattr(gl_context, "make_current"):
+                raise RuntimeError("Robosuite rendering requires an initialized GL context.")
+            gl_context.make_current()
+            return method(render_context, *args, **kwargs)
+
+        setattr(guarded, "_lerobot_makes_context_current", True)
+        return guarded
+
+    MjRenderContext.render = guard(MjRenderContext.render)
+    MjRenderContext.read_pixels = guard(MjRenderContext.read_pixels)
+
+
+_install_robosuite_render_context_guard()
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -145,7 +184,9 @@ class LiberoEnv(gym.Env):
         self.episode_length = episode_length
         # Load once and keep
         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
-        self._init_state_id = self.episode_index  # tie each sub-env to a fixed init state
+        self._init_state_id = (
+            self.episode_index % len(self._init_states) if self._init_states is not None else 0
+        )
 
         self._env = self._make_envs_task(task_suite, self.task_id)
         default_steps = 500
@@ -219,10 +260,28 @@ class LiberoEnv(gym.Env):
         )
 
     def render(self):
+        self._make_render_context_current()
         raw_obs = self._env.env._get_observations()
         image = self._format_raw_obs(raw_obs)["pixels"]["image"]
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
+
+    def _make_render_context_current(self) -> None:
+        """Bind this environment's EGL context before producing camera observations.
+
+        Robosuite creates one offscreen context per environment, but its legacy
+        ``MjRenderContext.render`` path does not reactivate that context before
+        ``mjr_render`` / ``mjr_readPixels``. With multiple LIBERO tasks alive in
+        one process, the current context can therefore belong to another task.
+        Rendering with that mismatched context is undefined and can abort inside
+        ``mjr_readPixels``.
+        """
+        sim = getattr(self._env, "sim", None)
+        render_context = getattr(sim, "_render_context_offscreen", None)
+        gl_context = getattr(render_context, "gl_ctx", None)
+        if gl_context is None or not hasattr(gl_context, "make_current"):
+            raise RuntimeError("LIBERO pixel observations require an initialized offscreen GL context.")
+        gl_context.make_current()
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
         task = task_suite.get_task(task_id)
@@ -234,6 +293,13 @@ class LiberoEnv(gym.Env):
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            # Rebuilding Robosuite's simulation on every episode also destroys
+            # and recreates its EGL context. Old render-context destructors can
+            # run after the replacement context is active and invalidate it,
+            # which manifests as a native abort in mjr_readPixels. LIBERO
+            # episodes are reset from saved simulator states below, so a soft
+            # reset is both sufficient and substantially safer.
+            "hard_reset": False,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -290,10 +356,26 @@ class LiberoEnv(gym.Env):
             "Please switch to an image-based obs_type (e.g. 'pixels', 'pixels_agent_pos')."
         )
 
-    def reset(self, seed=None, **kwargs):
+    def reset(self, seed=None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
+        if options is not None and "episode_index_offset" in options:
+            if self._init_states is None:
+                raise ValueError("episode_index_offset requires LIBERO init states to be enabled.")
+            episode_index_offset = options["episode_index_offset"]
+            if not isinstance(episode_index_offset, int | np.integer) or episode_index_offset < 0:
+                raise ValueError(
+                    "episode_index_offset must be a non-negative integer; "
+                    f"got {episode_index_offset!r}."
+                )
+            self._init_state_id = (
+                int(episode_index_offset) + self.episode_index
+            ) % len(self._init_states)
         self._env.seed(seed)
+        # Keep this environment's persistent context current throughout reset;
+        # another task environment may have been rendered most recently.
+        self._make_render_context_current()
         raw_obs = self._env.reset()
+        self._make_render_context_current()
         if self.init_states and self._init_states is not None:
             raw_obs = self._env.set_init_state(self._init_states[self._init_state_id])
 
@@ -301,6 +383,7 @@ class LiberoEnv(gym.Env):
         # Step the simulator with a no-op action for a few frames so everything settles.
         # Increasing this value can improve determinism and reproducibility across resets.
         for _ in range(self.num_steps_wait):
+            self._make_render_context_current()
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
 
         if self.control_mode == "absolute":
@@ -312,7 +395,7 @@ class LiberoEnv(gym.Env):
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
-        info = {"is_success": False}
+        info = {"is_success": False, "init_state_id": self._init_state_id}
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
@@ -321,6 +404,7 @@ class LiberoEnv(gym.Env):
                 f"Expected action to be 1-D (shape (action_dim,)), "
                 f"but got shape {action.shape} with ndim={action.ndim}"
             )
+        self._make_render_context_current()
         raw_obs, reward, done, info = self._env.step(action)
 
         is_success = self._env.check_success()
@@ -341,12 +425,24 @@ class LiberoEnv(gym.Env):
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
 
     def close(self):
-        self._env.close()
+        backend = getattr(self, "_env", None)
+        if backend is None:
+            return
+        try:
+            # Robosuite frees ``MjrContext`` before its EGL context. Both
+            # operations must happen while this environment's context is
+            # current, especially when several task environments have been
+            # used sequentially in one process.
+            self._make_render_context_current()
+            backend.close()
+        finally:
+            # Gymnasium may close vector environments more than once. Avoid a
+            # second pass through Robosuite's non-idempotent context teardown.
+            self._env = None
 
 
 def _make_env_fns(

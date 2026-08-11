@@ -213,6 +213,9 @@ def _resolve_instruction(robotwin_root: Path, task_name: str) -> str:
 class RoboTwinEnv(gym.Env):
     """Gymnasium wrapper around a single RoboTwin 2.0 task."""
 
+    # Gym uses this only when encoding rendered videos. A policy step calls
+    # RoboTwin.take_action(), whose TOPP trajectory spans a variable number of
+    # 250 Hz physics steps; render_fps is therefore not a control-rate claim.
     metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
 
     def __init__(

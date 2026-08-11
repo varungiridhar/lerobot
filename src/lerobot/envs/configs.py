@@ -262,6 +262,11 @@ class HILSerlRobotEnvConfig(EnvConfig):
 @dataclass
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
+    task_ids: list[int] | None = None
+    # With batch_size=1, advance through LIBERO's deterministic init states on
+    # successive episodes. Disable this to reproduce legacy evaluations that
+    # reset to init_state[0] for every episode.
+    stride_init_states: bool = True
     fps: int = 30
     episode_length: int | None = None
     obs_type: str = "pixels_agent_pos"
@@ -345,6 +350,7 @@ class LiberoEnv(EnvConfig):
             "render_mode": self.render_mode,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "task_ids": self.task_ids,
         }
 
 
@@ -419,6 +425,8 @@ class RoboTwinEnv(EnvConfig):
     """
 
     task: str = "beat_block_hammer"
+    # Rendered-video playback metadata only. RoboTwin take_action() executes a
+    # variable-length TOPP trajectory at a 250 Hz physics timestep.
     fps: int = 25
     episode_length: int | None = None  # resolved per-task from _eval_step_limit.yml
     robotwin_root: str | None = None
